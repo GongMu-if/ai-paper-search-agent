@@ -16,7 +16,7 @@ st.markdown("通过多轮自主检索与阅读，为您精准挖掘 Top 6 前沿
 # ==========================================
 with st.sidebar:
     st.header("检索配置")
-    user_topic = st.text_input("研究方向", value="end to end quadrotor")
+    user_topic = st.text_input("研究方向", value="")
 
     user_requirements = st.text_area(
         "具体筛选要求 (分点填写)",
