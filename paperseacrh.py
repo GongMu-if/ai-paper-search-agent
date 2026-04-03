@@ -63,7 +63,7 @@ Action: [执行工具或结束]
 
 Action格式：
 1. search_and_detail_papers(query="关键词")
-2. Finish[在此处使用 Markdown 格式详细列出你最终选出的 6 篇论文。每篇必须包含：1. 标题 2. Venue 3. DOI或S2_ID 4. 推荐理由。警告：绝对不允许照抄本句提示词！]
+2. Finish[在此处使用 Markdown 格式详细列出你最终选出的 6 篇论文。每篇必须包含：1. 标题 2. Venue 3. DOI或S2_ID 4. 推荐理由。只给出六篇论文的上述内容即可，其他思考过程不需要。警告：绝对不允许照抄本句提示词！]
 """
 
 
@@ -233,13 +233,13 @@ if st.session_state.app_state == "RUNNING":
                 continue
             action_str = action_match.group(1).strip()
             
-            # 3. 结束判断 (核心逻辑修改点)
+            # 3. 结束判断
             if action_str.startswith("Finish"):
                 final_answer = re.match(r"Finish\[(.*)\]", action_str, re.DOTALL)
                 if final_answer:
-                    st.session_state.final_result = final_answer.group(1)
+                    st.session_state.final_result = final_answer.group(1).strip()
                 else:
-                    st.session_state.final_result = output 
+                    st.session_state.final_result = re.sub(r"^Finish\s*\[?", "", action_str).rstrip("]").strip() 
                 
                 # 判断是否还有反馈机会
                 if not st.session_state.has_provided_feedback:
@@ -325,7 +325,6 @@ elif st.session_state.app_state == "COMPLETED":
             st.warning("提示：由于超过 30 分钟未响应，系统已为您自动确认最终结果。")
 
     st.markdown("### 最终确认的 Top 6 论文推荐")
-    st.info(st.session_state.final_result)
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
     
