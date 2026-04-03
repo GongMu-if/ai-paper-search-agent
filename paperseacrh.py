@@ -63,7 +63,7 @@ Action: [执行工具或结束]
 
 Action格式：
 1. search_and_detail_papers(query="关键词")
-2. Finish[最终选出的六篇论文及其推荐理由]
+2. Finish[在此处使用 Markdown 格式详细列出你最终选出的 6 篇论文。每篇必须包含：1. 标题 2. Venue 3. DOI或S2_ID 4. 推荐理由。警告：绝对不允许照抄本句提示词！]
 """
 
 
