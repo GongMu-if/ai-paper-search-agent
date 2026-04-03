@@ -31,13 +31,11 @@ with st.sidebar:
 
     start_button = st.button("开始检索", type="primary")
 
-
 # ==========================================
 # 2. 动态生成系统提示词
 # ==========================================
 def get_system_prompt(requirements, preprint_rule):
     current_year = datetime.datetime.now().year
-    # 根据用户选择动态生成预印本规则
     if preprint_rule == "排除预印本 (仅限正规期刊/会议)":
         preprint_prompt = "严禁选择 Venue 为 'Unknown Venue/Preprint' 的预印本论文。"
     else:
@@ -61,23 +59,25 @@ def get_system_prompt(requirements, preprint_rule):
 Thought: [你的思考逻辑，包括学习到的新关键词]
 Action: [执行工具或结束]
 
-Action格式：
-1. search_and_detail_papers(query="关键词")
-2. Finish[在此处使用 Markdown 格式详细列出你最终选出的 6 篇论文。每篇必须包含：1. 标题 2. Venue 3. DOI或S2_ID 4. 推荐理由。只给出六篇论文的上述内容即可，其他思考过程不需要。警告：绝对不允许照抄本句提示词！]
+Action格式支持以下两种：
+1. 继续搜索时输出：
+search_and_detail_papers(query="关键词")
+
+2. 已经选够6篇好论文结束时输出：
+Finish:
+在此处使用 Markdown 格式直接列出选出的 6 篇论文（必须包含 1.标题 2.Venue 3.DOI 4.推荐理由）。不要写多余的话。
 """
 
-
 # ==========================================
-# 3. 工具与 Agent 定义 (保持你的逻辑基本不变)
+# 3. 工具与 Agent 定义
 # ==========================================
 seen_paper_ids = set()
-#转码
+
 def reconstruct_abstract(inverted_index: dict) -> str:
     if not inverted_index: return ""
     word_index = [(pos, word) for word, positions in inverted_index.items() for pos in positions]
     word_index.sort(key=lambda x: x[0])
     return " ".join([word for _, word in word_index])
-
 
 def search_and_detail_papers(query: str) -> str:
     global seen_paper_ids
@@ -113,8 +113,7 @@ def search_and_detail_papers(query: str) -> str:
                     oa_url = f"https://api.openalex.org/works/https://doi.org/{doi}" if doi else f"https://api.openalex.org/works?filter=title.search:{title}"
                     oa_res = requests.get(oa_url, params={"mailto": email}, timeout=20)
                     if oa_res.status_code == 200:
-                        work_data = oa_res.json().get("results", [None])[
-                            0] if "results" in oa_res.json() else oa_res.json()
+                        work_data = oa_res.json().get("results", [None])[0] if "results" in oa_res.json() else oa_res.json()
                         if work_data and work_data.get("abstract_inverted_index"):
                             final_abstract = reconstruct_abstract(work_data["abstract_inverted_index"])
                             openalex_mark = " [via OpenAlex]"
@@ -124,8 +123,7 @@ def search_and_detail_papers(query: str) -> str:
             if not final_abstract or len(final_abstract.strip()) < 10: continue
 
             seen_paper_ids.add(paper_id)
-            results.append(
-                f"Title: {title}\n  - Venue: {venue}\n  - S2_ID: {paper_id} | DOI: {doi}{openalex_mark}\n  - Abstract: {final_abstract[:800]}...")
+            results.append(f"Title: {title}\n  - Venue: {venue}\n  - S2_ID: {paper_id} | DOI: {doi}{openalex_mark}\n  - Abstract: {final_abstract[:800]}...")
             if len(results) >= 30: break
 
         if not results: return f"Observation: 搜索到关于 '{query}' 的论文，但均为已读或无摘要，未能提供新信息。"
@@ -133,9 +131,7 @@ def search_and_detail_papers(query: str) -> str:
     except Exception as e:
         return f"Observation: 搜索出错 - {str(e)}"
 
-
 available_tools = {"search_and_detail_papers": search_and_detail_papers}
-
 
 class LLMClient:
     def __init__(self, sys_prompt, model="deepseek-chat", api_key="", base_url=""):
@@ -148,7 +144,6 @@ class LLMClient:
         for msg in prompt_history:
             messages.append({"role": "user", "content": msg})
 
-        # 增加重试机制防断线
         for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(
@@ -161,16 +156,15 @@ class LLMClient:
                 else:
                     raise e
 
-
 # ==========================================
-# 4. 主程序运行逻辑 (与 Web UI 绑定)
+# 4. 主程序运行逻辑
 # ==========================================
 API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 BASE_URL = "https://api.deepseek.com"
 
-# 初始化系统状态变量
+# --- 状态初始化 ---
 if "app_state" not in st.session_state:
-    st.session_state.app_state = "IDLE"  # 状态：IDLE, RUNNING, WAITING_FEEDBACK, COMPLETED
+    st.session_state.app_state = "IDLE"
 if "prompt_history" not in st.session_state:
     st.session_state.prompt_history = []
 if "agent" not in st.session_state:
@@ -183,7 +177,10 @@ if "has_provided_feedback" not in st.session_state:
     st.session_state.has_provided_feedback = False
 if "feedback_start_time" not in st.session_state:
     st.session_state.feedback_start_time = None
-    
+if "ui_logs" not in st.session_state:
+    st.session_state.ui_logs = []
+
+# --- 点击开始按钮 ---
 if start_button:
     if not user_topic:
         st.warning("请填写研究方向！")
@@ -195,14 +192,29 @@ if start_button:
         
         st.session_state.app_state = "RUNNING"
         st.session_state.loop_count = 0
-        st.session_state.has_provided_feedback = False # 每次全新检索重置机会
-        st.session_state.feedback_start_time = None # 重置时间
+        st.session_state.has_provided_feedback = False
+        st.session_state.feedback_start_time = None
+        st.session_state.ui_logs = [] 
         st.rerun()
 
-# ---------------- B. Agent 运行逻辑 ----------------
+# ==========================================
+# 5. UI 渲染区 (完美实现滚轮向下继承效果)
+# ==========================================
+
+# 第一部分：自上而下，永远先渲染历史思考过程
+if st.session_state.app_state != "IDLE":
+    st.markdown("### Agent 检索轨迹")
+    for log in st.session_state.ui_logs:
+        # 为了不让页面太长，过去的步骤自动折叠，标题清晰
+        with st.expander(log["title"], expanded=False):
+            st.markdown(log["content"])
+
+# 第二部分：紧接着在下方，根据当前状态渲染最新内容
 if st.session_state.app_state == "RUNNING":
-    st.info(f"Agent 正在自主检索文献，请稍候...")
-    log_container = st.container()
+    st.info("Agent 正在自主检索文献，请稍候...")
+    
+    # 用一个空的容器来实时显示当前正在进行的一步
+    current_step_container = st.container()
     
     with st.spinner("Agent 正在思考和执行工具..."):
         while True:
@@ -213,46 +225,48 @@ if st.session_state.app_state == "RUNNING":
                 loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
             else:
                 loop_reminder = (
-                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，"
-                    "请输出 Action: Finish[最终选出的Top6论文及推荐理由]。否则请继续 search_and_detail_papers。"
+                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，【警告】：新query必须是纯粹同义词，严禁加入方法论关键词！"
+                    "如果找齐了，请输出 Action: Finish: [推荐结果]。否则请继续 search_and_detail_papers。"
                 )
 
             st.session_state.prompt_history.append(loop_reminder)
             
-            # 1. 思考
+            # 1. 大模型生成回答
             output = st.session_state.agent.generate(st.session_state.prompt_history)
             st.session_state.prompt_history.append(output)
             
-            with log_container.expander(f"Agent 运行日志 (第 {i} 步)", expanded=False):
-                st.markdown(f"**Agent思考与决策:**\n```text\n{output}\n```")
+            # 2. 存入日志并实时在网页最下方画出来
+            log_entry = {
+                "title": f"Agent 运行日志 (第 {i} 步)", 
+                "content": f"**Agent思考与决策:**\n```text\n{output}\n```"
+            }
+            st.session_state.ui_logs.append(log_entry)
+            with current_step_container.expander(log_entry["title"], expanded=True):
+                st.markdown(log_entry["content"])
             
-            # 2. 解析
-            action_match = re.search(r"Action:\s*(.*)", output)
+            # 3. 解析动作
+            action_match = re.search(r"Action:\s*(.*)", output, re.DOTALL)
             if not action_match:
                 st.session_state.prompt_history.append("Observation: 错误：未找到Action格式，请严格按照要求输出。")
                 continue
+            
             action_str = action_match.group(1).strip()
             
-            # 3. 结束判断
+            # 4. 判断是否结束 (过滤掉所有前缀，只留纯 Markdown 结果)
             if action_str.startswith("Finish"):
-                final_answer = re.match(r"Finish\[(.*)\]", action_str, re.DOTALL)
-                if final_answer:
-                    st.session_state.final_result = final_answer.group(1).strip()
-                else:
-                    st.session_state.final_result = re.sub(r"^Finish\s*\[?", "", action_str).rstrip("]").strip() 
+                clean_result = re.sub(r"^Finish\s*[:：\[]?\s*", "", action_str).rstrip("]").strip()
+                st.session_state.final_result = clean_result 
                 
-                # 判断是否还有反馈机会
                 if not st.session_state.has_provided_feedback:
-                    # 还有机会，进入等待反馈状态
                     st.session_state.app_state = "WAITING_FEEDBACK"
+                    st.session_state.feedback_start_time = time.time()
                 else:
-                    # 已经反馈过一次了，直接强制结束，防止多次修改导致幻觉
                     st.session_state.app_state = "COMPLETED"
                 
-                st.rerun()
+                st.rerun() # 这里一刷新，代码就会流转到下面的 WAITING_FEEDBACK
                 break
             
-            # 4. 执行工具
+            # 5. 执行工具
             tool_match = re.search(r"(\w+)\((.*)\)", action_str)
             if tool_match:
                 tool_name, args_str = tool_match.group(1), tool_match.group(2)
@@ -273,23 +287,21 @@ if st.session_state.app_state == "RUNNING":
                 
             st.session_state.prompt_history.append(f"Observation: {observation}")
 
-# ---------------- C. 用户满意度测试 (仅限一次) ----------------
 elif st.session_state.app_state == "WAITING_FEEDBACK":
-    # 核心修改：超时检测逻辑
+    # --- 超时检测逻辑 ---
     if st.session_state.feedback_start_time:
         elapsed_time = time.time() - st.session_state.feedback_start_time
-        remaining_time = 1800 - elapsed_time # 1800秒 = 30分钟
+        remaining_time = 1800 - elapsed_time
         
         if remaining_time <= 0:
-            # 已经超过 30 分钟，自动切换到完成状态
             st.session_state.app_state = "COMPLETED"
             st.rerun()
         
-        # 可选：在界面显示倒计时
         mins_left = int(remaining_time // 60)
         st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
 
-    st.markdown("### 📑 阶段性检索结果展示")
+    # --- 紧接着思考过程的下方，渲染满意度测试 ---
+    st.markdown("### 阶段性检索结果展示")
     st.write("请审阅 Agent 挑选出的文献，判断是否符合您的要求：")
     
     with st.container(border=True):
@@ -315,10 +327,11 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
                     st.session_state.app_state = "RUNNING"
                     st.rerun()
 
-# ---------------- D. 任务彻底完成 ----------------
 elif st.session_state.app_state == "COMPLETED":
+    # --- 紧接着思考过程的下方，渲染最终完成界面 ---
     st.balloons()
     st.success("任务已完成！")
+    
     if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
         elapsed = time.time() - st.session_state.feedback_start_time
         if elapsed > 1800:
@@ -328,7 +341,7 @@ elif st.session_state.app_state == "COMPLETED":
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
     
-    st.write("") # 留点空隙
-    if st.button("开启全新检索"):
+    st.write("") 
+    if st.button("开启全新检索", type="primary"):
         st.session_state.clear()
         st.rerun()
