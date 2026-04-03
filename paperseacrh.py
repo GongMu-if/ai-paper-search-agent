@@ -213,7 +213,7 @@ if st.session_state.app_state == "RUNNING":
                 loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
             else:
                 loop_reminder = (
-                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，"
+                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，【警告】：新query必须是纯粹同义词，严禁加入方法论关键词！"
                     "请输出 Action: Finish[最终选出的Top6论文及推荐理由]。否则请继续 search_and_detail_papers。"
                 )
 
