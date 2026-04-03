@@ -49,7 +49,7 @@ def get_system_prompt(requirements, preprint_rule):
 # 你的工作流程：
 1. 通过`search_and_detail_papers`工具来获得相关论文的标题、摘要和Introduction。
 2. 每次搜索后，阅读标题、摘要和Introduction。如果符合用户的具体要求，将其记录在你的 Thought 中作为“备选池”累加。
-3. 每次阅读完一批论文后，学习同义词或近义词，作为下一次的 `search_and_detail_papers` 查询词。
+3. 每次阅读完一批论文后，学习同义词或近义词，作为下一次的 `search_and_detail_papers` 查询词。【警告】：新query必须是纯粹同义词，严禁加入用户要求中的关键词！
 4. 如果不符合或无法获取摘要：摒弃该论文。
 5. 最终在备选池中选出最好的六篇来作为结果。
 
@@ -213,7 +213,7 @@ if st.session_state.app_state == "RUNNING":
                 loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
             else:
                 loop_reminder = (
-                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，【警告】：新query必须是纯粹同义词，严禁加入方法论关键词！"
+                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，"
                     "请输出 Action: Finish[最终选出的Top6论文及推荐理由]。否则请继续 search_and_detail_papers。"
                 )
 
