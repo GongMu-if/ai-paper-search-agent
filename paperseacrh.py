@@ -166,97 +166,163 @@ class LLMClient:
 API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 BASE_URL = "https://api.deepseek.com"
 
+# 初始化系统状态变量
+if "app_state" not in st.session_state:
+    st.session_state.app_state = "IDLE"  # 状态：IDLE, RUNNING, WAITING_FEEDBACK, COMPLETED
+if "prompt_history" not in st.session_state:
+    st.session_state.prompt_history = []
+if "agent" not in st.session_state:
+    st.session_state.agent = None
+if "final_result" not in st.session_state:
+    st.session_state.final_result = ""
+if "loop_count" not in st.session_state:
+    st.session_state.loop_count = 0
+if "has_provided_feedback" not in st.session_state:
+    st.session_state.has_provided_feedback = False
+if "feedback_start_time" not in st.session_state:
+    st.session_state.feedback_start_time = None
+    
 if start_button:
     if not user_topic:
         st.warning("请填写研究方向！")
     else:
-        # 重置状态，防止多次点击污染数据
         seen_paper_ids.clear()
         sys_prompt = get_system_prompt(user_requirements, allow_preprint)
-        agent = LLMClient(sys_prompt=sys_prompt, api_key=API_KEY, base_url=BASE_URL)
+        st.session_state.agent = LLMClient(sys_prompt=sys_prompt, api_key=API_KEY, base_url=BASE_URL)
+        st.session_state.prompt_history = [f"用户请求: {user_topic}"]
+        
+        st.session_state.app_state = "RUNNING"
+        st.session_state.loop_count = 0
+        st.session_state.has_provided_feedback = False # 每次全新检索重置机会
+        st.session_state.feedback_start_time = None # 重置时间
+        st.rerun()
 
-        prompt_history = [f"用户请求: {user_topic}"]
-        cycle = 20
+# ---------------- B. Agent 运行逻辑 ----------------
+if st.session_state.app_state == "RUNNING":
+    st.info(f"Agent 正在自主检索文献，请稍候...")
+    log_container = st.container()
+    
+    with st.spinner("Agent 正在思考和执行工具..."):
+        while True:
+            st.session_state.loop_count += 1
+            i = st.session_state.loop_count
+            
+            if i == 1:
+                loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
+            else:
+                loop_reminder = (
+                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，"
+                    "请输出 Action: Finish[最终选出的Top6论文及推荐理由]。否则请继续 search_and_detail_papers。"
+                )
 
-        st.success(f"任务启动！研究方向：**{user_topic}**")
-
-        # 创建一个占位符，用于动态滚动显示日志
-        log_container = st.container()
-
-        with st.spinner("Agent正在深度挖掘文献，请耐心等待（约耗时 1-3 分钟）..."):
-            for i in range(cycle):
-                with log_container.expander(f"循环阶段 {i + 1}/{cycle}", expanded=True):
-
-                    if i == 0:
-                        loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
-                    elif i < cycle - 1:
-                        loop_reminder = (
-                            f"系统提示: 当前是第 {i + 1} 次循环。请继续执行search_and_detail_papers。\n"
-                            "【警告】：新query必须是纯粹同义词，严禁加入方法论关键词！\n"
-                            "【核心任务】：即使你现在已经找到了6篇不错的论文，你也必须继续搜索！"
-                            "请将新搜到的优质论文与你脑海中原有的备选论文进行对比，如果新论文的质量更高、更契合用户要求，请务必淘汰旧论文，将新论文更新进你的Top 6备选池中！"
-                        )
+            st.session_state.prompt_history.append(loop_reminder)
+            
+            # 1. 思考
+            output = st.session_state.agent.generate(st.session_state.prompt_history)
+            st.session_state.prompt_history.append(output)
+            
+            with log_container.expander(f"Agent 运行日志 (第 {i} 步)", expanded=False):
+                st.markdown(f"**Agent思考与决策:**\n```text\n{output}\n```")
+            
+            # 2. 解析
+            action_match = re.search(r"Action:\s*(.*)", output)
+            if not action_match:
+                st.session_state.prompt_history.append("Observation: 错误：未找到Action格式，请严格按照要求输出。")
+                continue
+            action_str = action_match.group(1).strip()
+            
+            # 3. 结束判断 (核心逻辑修改点)
+            if action_str.startswith("Finish"):
+                final_answer = re.match(r"Finish\[(.*)\]", action_str, re.DOTALL)
+                if final_answer:
+                    st.session_state.final_result = final_answer.group(1)
+                else:
+                    st.session_state.final_result = output 
+                
+                # 判断是否还有反馈机会
+                if not st.session_state.has_provided_feedback:
+                    # 还有机会，进入等待反馈状态
+                    st.session_state.app_state = "WAITING_FEEDBACK"
+                else:
+                    # 已经反馈过一次了，直接强制结束，防止多次修改导致幻觉
+                    st.session_state.app_state = "COMPLETED"
+                
+                st.rerun()
+                break
+            
+            # 4. 执行工具
+            tool_match = re.search(r"(\w+)\((.*)\)", action_str)
+            if tool_match:
+                tool_name, args_str = tool_match.group(1), tool_match.group(2)
+                raw_kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
+                if tool_name in available_tools:
+                    import inspect
+                    allowed_keys = inspect.signature(available_tools[tool_name]).parameters.keys()
+                    kwargs = {k: v for k, v in raw_kwargs.items() if k in allowed_keys}
+                    
+                    if "query" in kwargs:
+                        observation = available_tools[tool_name](**kwargs)
                     else:
-                        # 修复了你原来代码里的硬编码问题，替换为用户真实要求
-                        loop_reminder = (
-                            f"系统提示: 当前是最后一次循环。请总结备选池。\n"
-                            f"请严格基于用户的核心需求，直接输出Action: Finish[最终选出的Top6论文及推荐理由]。"
-                        )
+                        observation = "错误：必须提供query参数。"
+                else:
+                    observation = f"错误:未定义的工具 '{tool_name}'"
+            else:
+                observation = "错误:Action格式无法解析。"
+                
+            st.session_state.prompt_history.append(f"Observation: {observation}")
 
-                    prompt_history.append(loop_reminder)
+# ---------------- C. 用户满意度测试 (仅限一次) ----------------
+elif st.session_state.app_state == "WAITING_FEEDBACK":
+    # 核心修改：超时检测逻辑
+    if st.session_state.feedback_start_time:
+        elapsed_time = time.time() - st.session_state.feedback_start_time
+        remaining_time = 1800 - elapsed_time # 1800秒 = 30分钟
+        
+        if remaining_time <= 0:
+            # 已经超过 30 分钟，自动切换到完成状态
+            st.session_state.app_state = "COMPLETED"
+            st.rerun()
+        
+        # 可选：在界面显示倒计时
+        mins_left = int(remaining_time // 60)
+        st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
 
-                    # 1. 思考
-                    output = agent.generate(prompt_history)
-                    st.markdown(f"**Agent思考与决策:**\n```text\n{output}\n```")
-                    prompt_history.append(output)
+    st.markdown("### 阶段性检索结果")
+    st.info(st.session_state.final_result)
+    
+    st.divider()
+    st.markdown("#### 您对当前的文献组合满意吗？")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("满意，结束检索", use_container_width=True):
+            st.session_state.app_state = "COMPLETED"
+            st.rerun()
+            
+    with col2:
+        with st.popover("不满意，修改要求", use_container_width=True):
+            new_req = st.text_area("请指出不符合要求的地方：")
+            if st.button("提交新要求并继续"):
+                if new_req.strip():
+                    feedback_prompt = f"用户反馈: 【{new_req}】。请基于此继续筛选 Top 6。"
+                    st.session_state.prompt_history.append(feedback_prompt)
+                    st.session_state.has_provided_feedback = True 
+                    st.session_state.app_state = "RUNNING"
+                    st.rerun()
 
-                    # 2. 解析
-                    action_match = re.search(r"Action:\s*(.*)", output)
-                    if not action_match:
-                        prompt_history.append("Observation: 错误：未找到Action格式。")
-                        continue
-                    action_str = action_match.group(1).strip()
+# ---------------- D. 任务彻底完成 ----------------
+elif st.session_state.app_state == "COMPLETED":
+    st.balloons()
+    st.success("任务已完成！")
+    # 如果是因为超时自动完成的，可以加个提示
+    if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
+        elapsed = time.time() - st.session_state.feedback_start_time
+        if elapsed > 1800:
+            st.warning("提示：由于超过 30 分钟未响应，系统已为您自动确认最终结果。")
 
-                    # 3. 结束判断
-                    if action_str.startswith("Finish"):
-                        if i < cycle - 1:
-                            st.warning("模型试图提前结束，已被系统打回强制继续。")
-                            reject_msg = (
-                                f"Observation: 拒绝提前结束！系统强制要求必须完成 {cycle} 轮文献挖掘。\n"
-                                "你现在绝对不能输出Finish！我知道你可能觉得已经找到了6篇好论文，但你的任务是【寻找最优】而不是【凑齐数量】。\n"
-                                "请把目前的6篇暂存在Thought中，接下来的循环中，如果出现比当前这6篇更前沿、更权威的文献，你应该替换它们！"
-                            )
-                            prompt_history.append(f"Observation: 警告！不能在第{cycle}次循环前使用Finish。")
-                            continue
-                        else:
-                            final_answer = re.match(r"Finish\[(.*)\]", action_str, re.DOTALL)
-                            if final_answer:
-                                st.balloons()
-                                st.success("任务圆满达成！")
-                                st.markdown("### 最终推荐的Top6论文")
-                                st.info(final_answer.group(1))
-                            break
-
-                    # 4. 执行工具
-                    tool_match = re.search(r"(\w+)\((.*)\)", action_str)
-                    if tool_match:
-                        tool_name, args_str = tool_match.group(1), tool_match.group(2)
-                        raw_kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
-                        if tool_name in available_tools:
-                            import inspect
-
-                            allowed_keys = inspect.signature(available_tools[tool_name]).parameters.keys()
-                            kwargs = {k: v for k, v in raw_kwargs.items() if k in allowed_keys}
-
-                            if "query" in kwargs:
-                                st.markdown(f"正在向数据库检索关键词: `{kwargs['query']}` ...")
-                                observation = available_tools[tool_name](**kwargs)
-                            else:
-                                observation = "错误：必须提供query参数。"
-                        else:
-                            observation = f"错误:未定义的工具 '{tool_name}'"
-                    else:
-                        observation = "错误:Action格式无法解析。"
-
-                    prompt_history.append(f"Observation: {observation}")
-                    st.caption("观察结果已存入Agent记忆池。")
+    st.markdown("### 最终确认的 Top 6 论文推荐")
+    st.info(st.session_state.final_result)
+    
+    if st.button("开启全新检索"):
+        st.session_state.clear()
+        st.rerun()
