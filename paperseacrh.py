@@ -329,7 +329,6 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
 
 elif st.session_state.app_state == "COMPLETED":
     # --- 紧接着思考过程的下方，渲染最终完成界面 ---
-    st.balloons()
     st.success("任务已完成！")
     
     if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
