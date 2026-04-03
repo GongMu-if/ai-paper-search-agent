@@ -3,6 +3,7 @@ import requests
 from openai import OpenAI
 import time
 import streamlit as st
+import datetime
 
 # ==========================================
 # 0. 页面基本设置
@@ -35,6 +36,7 @@ with st.sidebar:
 # 2. 动态生成系统提示词
 # ==========================================
 def get_system_prompt(requirements, preprint_rule):
+    current_year = datetime.datetime.now().year
     # 根据用户选择动态生成预印本规则
     if preprint_rule == "排除预印本 (仅限正规期刊/会议)":
         preprint_prompt = "严禁选择 Venue 为 'Unknown Venue/Preprint' 的预印本论文。"
@@ -287,8 +289,11 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
         mins_left = int(remaining_time // 60)
         st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
 
-    st.markdown("### 阶段性检索结果")
-    st.info(st.session_state.final_result)
+    st.markdown("### 📑 阶段性检索结果展示")
+    st.write("请审阅 Agent 挑选出的文献，判断是否符合您的要求：")
+    
+    with st.container(border=True):
+        st.markdown(st.session_state.final_result)
     
     st.divider()
     st.markdown("#### 您对当前的文献组合满意吗？")
@@ -314,7 +319,6 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
 elif st.session_state.app_state == "COMPLETED":
     st.balloons()
     st.success("任务已完成！")
-    # 如果是因为超时自动完成的，可以加个提示
     if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
         elapsed = time.time() - st.session_state.feedback_start_time
         if elapsed > 1800:
@@ -322,7 +326,10 @@ elif st.session_state.app_state == "COMPLETED":
 
     st.markdown("### 最终确认的 Top 6 论文推荐")
     st.info(st.session_state.final_result)
+    with st.container(border=True):
+        st.markdown(st.session_state.final_result)
     
+    st.write("") # 留点空隙
     if st.button("开启全新检索"):
         st.session_state.clear()
         st.rerun()
