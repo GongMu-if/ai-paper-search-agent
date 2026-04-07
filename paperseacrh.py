@@ -5,6 +5,7 @@ import time
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import datetime
+import base64
 
 # ==========================================
 # 0. 页面基本设置
@@ -72,6 +73,28 @@ Finish:
 # ==========================================
 # 3. 工具与 Agent 定义
 # ==========================================
+MODAL_API_URL = st.secrets["MODAL_API_URL"]
+def analyze_pdf_with_modal(pdf_file_bytes):
+    """
+    将 PDF 发送到 Modal 云端进行解析
+    """
+    with st.spinner("🚀 正在唤醒云端 GPU 引擎，深度解析公式与版面..."):
+        try:
+            # 直接将二进制流发过去
+            response = requests.post(MODAL_API_URL, data=pdf_file_bytes)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result["status"] == "success":
+                    return result
+                else:
+                    st.error(f"解析失败: {result.get('message')}")
+            else:
+                st.error(f"服务器响应错误: {response.status_code}")
+        except Exception as e:
+            st.error(f"连接云端失败: {str(e)}")
+    return None
+    
 seen_paper_ids = set()
 
 def reconstruct_abstract(inverted_index: dict) -> str:
