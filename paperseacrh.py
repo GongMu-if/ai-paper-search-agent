@@ -355,7 +355,44 @@ elif st.session_state.app_state == "COMPLETED":
     st.markdown("### 最终确认的 Top 6 论文推荐")
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
+    st.divider()
+    st.header("论文深度解读 (Full-text Analysis)")
+    st.info("如果您已下载上述推荐论文的 PDF，请上传，系统将进行深度解析与解读。")
     
+    uploaded_pdf = st.file_uploader("上传论文 PDF 文件", type="pdf", key="deep_read_uploader")
+    
+    if uploaded_pdf:
+        # 获取文件内容
+        pdf_data = uploaded_pdf.read()
+        file_name = uploaded_pdf.name
+        
+        if st.button("开始深度解析", type="secondary"):
+            with st.status("正在进行 Magic-PDF 深度解析...", expanded=True) as status:
+                st.write("正在识别版面布局与公式...")
+                md_path, result_info = process_paper_with_magic(pdf_data, file_name)
+                
+                if md_path:
+                    status.update(label="解析完成！", state="complete", expanded=False)
+                    st.success(f"论文《{file_name}》解析成功！")
+                    
+                    # 结果展示预览
+                    tab1, tab2 = st.tabs(["Markdown 原文", "提取的图表"])
+                    with tab1:
+                        with open(md_path, "r", encoding="utf-8") as f:
+                            st.text_area("转换后的文本与 LaTeX 公式", f.read(), height=300)
+                    with tab2:
+                        imgs = [f for f in os.listdir(result_info) if f.endswith(('.png', '.jpg'))]
+                        if imgs:
+                            st.image([os.path.join(result_info, i) for i in imgs[:5]], caption=imgs[:5], width=300)
+                        else:
+                            st.write("未提取到有效图片。")
+                            
+                    # 将路径存入 session_state 供下一步的大模型解读使用
+                    st.session_state['parsed_md'] = md_path
+                    st.session_state['parsed_img_dir'] = result_info
+                else:
+                    status.update(label="解析失败", state="error")
+                    st.error(f"解析过程中出现错误: {result_info}")
     st.write("") 
     if st.button("开启全新检索", type="primary"):
         st.session_state.clear()
