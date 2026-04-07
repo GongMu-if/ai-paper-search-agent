@@ -80,7 +80,10 @@ def analyze_pdf_with_modal(pdf_file_bytes):
     with st.spinner("🚀 正在唤醒云端 GPU 引擎，深度解析公式与版面..."):
         try:
             # 直接将二进制流发过去
-            response = requests.post(MODAL_API_URL, data=pdf_file_bytes)
+            response = requests.post(
+            MODAL_API_URL, 
+            files={"file": pdf_file_bytes} 
+        )
             
             if response.status_code == 200:
                 result = response.json()
