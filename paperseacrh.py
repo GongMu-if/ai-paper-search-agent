@@ -385,37 +385,36 @@ elif st.session_state.app_state == "COMPLETED":
     uploaded_pdf = st.file_uploader("上传论文 PDF 文件", type="pdf", key="deep_read_uploader")
     
     if uploaded_pdf:
-        # 获取文件内容
+        # 1. 读取 PDF 数据
         pdf_data = uploaded_pdf.read()
-        file_name = uploaded_pdf.name
         
-        if st.button("开始深度解析", type="secondary"):
-            with st.status("正在进行 Magic-PDF 深度解析...", expanded=True) as status:
-                st.write("正在识别版面布局与公式...")
-                md_path, result_info = process_paper_with_magic(pdf_data, file_name)
+        if st.button("🚀 开始深度解析", type="primary"):
+            # 2. 调用 Modal 云端接口
+            result = analyze_pdf_with_modal(pdf_data)
+            
+            if result and result.get("status") == "success":
+                st.success("✅ 解析成功！")
                 
-                if md_path:
-                    status.update(label="解析完成！", state="complete", expanded=False)
-                    st.success(f"论文《{file_name}》解析成功！")
-                    
-                    # 结果展示预览
-                    tab1, tab2 = st.tabs(["Markdown 原文", "提取的图表"])
-                    with tab1:
-                        with open(md_path, "r", encoding="utf-8") as f:
-                            st.text_area("转换后的文本与 LaTeX 公式", f.read(), height=300)
-                    with tab2:
-                        imgs = [f for f in os.listdir(result_info) if f.endswith(('.png', '.jpg'))]
-                        if imgs:
-                            st.image([os.path.join(result_info, i) for i in imgs[:5]], caption=imgs[:5], width=300)
-                        else:
-                            st.write("未提取到有效图片。")
-                            
-                    # 将路径存入 session_state 供下一步的大模型解读使用
-                    st.session_state['parsed_md'] = md_path
-                    st.session_state['parsed_img_dir'] = result_info
+                # --- 3. 直接展示 Markdown 内容 (支持公式) ---
+                st.markdown("### 📄 论文正文解析")
+                st.markdown(result["markdown"])
+                
+                # 提供一个下载按钮，方便存进你的论文资料库
+                st.download_button("💾 下载解析好的 .md 文件", result["markdown"], file_name="analysis.md")
+                
+                # --- 4. 直接展示所有图片 ---
+                images = result.get("images", {})
+                if images:
+                    st.markdown("---")
+                    st.markdown("### 🖼️ 提取到的图表")
+                    # 直接按顺序往下铺图，不用搞分栏了，看着更清楚
+                    for img_name, img_base64 in images.items():
+                        st.image(base64.b64decode(img_base64), caption=img_name)
                 else:
-                    status.update(label="解析失败", state="error")
-                    st.error(f"解析过程中出现错误: {result_info}")
+                    st.info("💡 提示：该论文中未检测到可提取的图表。")
+            
+            else:
+                st.error("❌ 解析失败，请检查 Modal 后端是否报错或额度是否充足。")
     st.write("") 
     if st.button("开启全新检索", type="primary"):
         st.session_state.clear()
