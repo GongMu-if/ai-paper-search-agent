@@ -74,27 +74,36 @@ Finish:
 
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 def analyze_pdf_with_modal(pdf_file_bytes):
-    """
-    将 PDF 发送到 Modal 云端进行解析
-    """
+    """调用 Modal 云端接口解析 PDF"""
     with st.spinner("🚀 正在唤醒云端 GPU 引擎，深度解析公式与版面..."):
         try:
-            # 直接将二进制流发过去
-            response = requests.post(
-            MODAL_API_URL, 
-            data=pdf_file_bytes, # 注意这里是 data=，不是 files=
-        )
+            # 【核心修改】：必须构建一个包含(文件名, 数据, 类型)的元组，
+            # 这里的 "file" 这个 key，必须和后端 parse_pdf(file: UploadFile) 中的参数名完全一致！
+            files_payload = {
+                "file": ("paper.pdf", pdf_file_bytes, "application/pdf")
+            }
+            
+            # 使用 files= 发送，requests 会自动帮你生成正确的 multipart/form-data 标头
+            response = requests.post(MODAL_API_URL, files=files_payload)
             
             if response.status_code == 200:
                 result = response.json()
-                if result["status"] == "success":
+                if result.get("status") == "success":
                     return result
                 else:
-                    st.error(f"解析失败: {result.get('message')}")
+                    st.error(f"解析内部错误: {result.get('message')}")
+                    # 如果有 traceback，打印出来方便 Debug
+                    if "trace" in result:
+                        with st.expander("查看详细报错"):
+                            st.code(result["trace"])
             else:
+                # 把 422 的具体报错打印出来
                 st.error(f"服务器响应错误: {response.status_code}")
+                st.write(response.text) # 这一行是 Debug 的金钥匙
+                
         except Exception as e:
             st.error(f"连接云端失败: {str(e)}")
+            
     return None
 
 def render_analysis_ui(pdf_bytes):
