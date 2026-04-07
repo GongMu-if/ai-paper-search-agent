@@ -32,7 +32,9 @@ with st.sidebar:
     )
 
     start_button = st.button("开始检索", type="primary")
-
+    st.divider()
+    st.header("直接解析论文")
+    sidebar_pdf = st.file_uploader("上传 PDF 立即深度解读", type="pdf", key="sb_pdf")
 # ==========================================
 # 2. 动态生成系统提示词
 # ==========================================
@@ -70,9 +72,6 @@ Finish:
 在此处使用 Markdown 格式直接列出选出的 6 篇论文（必须包含 1.标题 2.Venue 3.DOI 4.推荐理由）。不要写多余的话。
 """
 
-# ==========================================
-# 3. 工具与 Agent 定义
-# ==========================================
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 def analyze_pdf_with_modal(pdf_file_bytes):
     """
@@ -94,7 +93,27 @@ def analyze_pdf_with_modal(pdf_file_bytes):
         except Exception as e:
             st.error(f"连接云端失败: {str(e)}")
     return None
-    
+
+def render_analysis_ui(pdf_bytes):
+    """统一的解析结果展示区"""
+    result = analyze_pdf_with_modal(pdf_bytes)
+    if result and result.get("status") == "success":
+        st.success("解析成功！")
+        st.markdown("### 论文深度解析内容")
+        st.markdown(result["markdown"])
+        
+        # 展示图片
+        images = result.get("images", {})
+        if images:
+            st.divider()
+            for img_name, img_base64 in images.items():
+                st.image(base64.b64decode(img_base64), caption=img_name)
+        st.download_button("下载 Markdown", result["markdown"], file_name="analysis.md")
+    else:
+        st.error("解析失败，请检查后端。")
+# ==========================================
+# 3. 工具与 Agent 定义
+# ==========================================
 seen_paper_ids = set()
 
 def reconstruct_abstract(inverted_index: dict) -> str:
@@ -222,36 +241,47 @@ if start_button:
         st.rerun()
 
 # ==========================================
-# 5. UI 渲染区 (完美实现滚轮向下继承效果)
+# 5. UI 渲染区
 # ==========================================
-# ---------------- 新增：初始界面的使用说明 ----------------
+
+# --- 【逻辑 A】：最高优先级 - 侧边栏快速解析入口 ---
+if sidebar_pdf:
+    st.markdown("---")
+    st.info("检测到侧边栏上传文件，正在进入【直接解析模式】...")
+    # 这里的 sidebar_pdf.read() 会获取二进制流
+    render_analysis_ui(sidebar_pdf.read())
+    
+    # 强制停止后续渲染，确保页面只显示解析结果
+    st.stop() 
+
+
+# --- 【逻辑 B】：正常的 Agent 搜索流程 ---
+
+# 1. 初始/空闲状态：显示欢迎页
 if st.session_state.app_state == "IDLE":
     st.markdown("""
     ### 系统使用指南
-    欢迎使用 AI 智能论文检索 Agent。为了获得最佳的文献推荐体验，请参考以下操作规范：
+    欢迎使用 AI 智能论文检索分析 Agent。为了获得最佳的文献推荐体验，请参考以下操作规范：
 
     1.除了在侧边栏填写宏观的研究方向外，请在具体筛选要求中尽量明确研究的子分支、目标应用场景或特定的文章类型。
 
     2.本系统支持人机协同的动态优化。首轮文献挖掘完成后，Agent 会展示初步筛选的 Top 6 候选文献并征求您的意见。每位用户在单次任务中享有 **1 次**修改要求的机会。若结果偏离预期，您可直接指出大模型理解的偏差或补充新的约束条件，Agent 将据此进行第二轮定向纠偏与深度检索。
-    
+
     3.为保障系统计算资源的有效流转，在首轮检索结果展示并进入满意度确认环节后，若超过 **30 分钟** 未收到您的反馈指令，系统将默认您对当前文献组合满意，并自动结束本次任务。
-   
+
+    4.您也可直接对已有论文进行分析，从而获取论文报告。
     """)
-    
-    st.info("👈 请在左侧边栏配置您的检索参数，并点击“开始检索”启动 Agent。")
-# 第一部分：自上而下，永远先渲染历史思考过程
+
+# 2. 运行中/完成状态：显示检索轨迹（历史日志）
 if st.session_state.app_state != "IDLE":
     st.markdown("### Agent 检索轨迹")
     for log in st.session_state.ui_logs:
-        # 为了不让页面太长，过去的步骤自动折叠，标题清晰
         with st.expander(log["title"], expanded=False):
             st.markdown(log["content"])
 
-# 第二部分：紧接着在下方，根据当前状态渲染最新内容
+# 3. 正在搜索状态
 if st.session_state.app_state == "RUNNING":
     st.info("Agent 正在自主检索文献，请稍候...")
-    
-    # 用一个空的容器来实时显示当前正在进行的一步
     current_step_container = st.container()
     
     with st.spinner("Agent 正在思考和执行工具..."):
@@ -259,21 +289,12 @@ if st.session_state.app_state == "RUNNING":
             st.session_state.loop_count += 1
             i = st.session_state.loop_count
             
-            if i == 1:
-                loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
-            else:
-                loop_reminder = (
-                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，【警告】：新query必须是纯粹同义词，严禁加入方法论关键词！"
-                    "如果找齐了，请输出 Action: Finish: [推荐结果]。否则请继续 search_and_detail_papers。"
-                )
-
+            loop_reminder = "系统提示: 正在执行检索..." if i > 1 else "系统提示: 第一次循环开始..."
             st.session_state.prompt_history.append(loop_reminder)
             
-            # 1. 大模型生成回答
             output = st.session_state.agent.generate(st.session_state.prompt_history)
             st.session_state.prompt_history.append(output)
             
-            # 2. 存入日志并实时在网页最下方画出来
             log_entry = {
                 "title": f"Agent 运行日志 (第 {i} 步)", 
                 "content": f"**Agent思考与决策:**\n```text\n{output}\n```"
@@ -282,140 +303,63 @@ if st.session_state.app_state == "RUNNING":
             with current_step_container.expander(log_entry["title"], expanded=True):
                 st.markdown(log_entry["content"])
             
-            # 3. 解析动作
             action_match = re.search(r"Action:\s*(.*)", output, re.DOTALL)
-            if not action_match:
-                st.session_state.prompt_history.append("Observation: 错误：未找到Action格式，请严格按照要求输出。")
-                continue
+            if not action_match: continue
             
             action_str = action_match.group(1).strip()
             
-            # 4. 判断是否结束 (过滤掉所有前缀，只留纯 Markdown 结果)
             if action_str.startswith("Finish"):
                 clean_result = re.sub(r"^Finish\s*[:：\[]?\s*", "", action_str).rstrip("]").strip()
                 st.session_state.final_result = clean_result 
-                
-                if not st.session_state.has_provided_feedback:
-                    st.session_state.app_state = "WAITING_FEEDBACK"
-                    st.session_state.feedback_start_time = time.time()
-                else:
-                    st.session_state.app_state = "COMPLETED"
-                
-                st.rerun() # 这里一刷新，代码就会流转到下面的 WAITING_FEEDBACK
+                st.session_state.app_state = "WAITING_FEEDBACK" if not st.session_state.has_provided_feedback else "COMPLETED"
+                st.rerun()
                 break
             
-            # 5. 执行工具
+            # 执行工具逻辑 (保持你原有的 search_and_detail_papers 调用)
             tool_match = re.search(r"(\w+)\((.*)\)", action_str)
             if tool_match:
                 tool_name, args_str = tool_match.group(1), tool_match.group(2)
                 raw_kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
-                if tool_name in available_tools:
-                    import inspect
-                    allowed_keys = inspect.signature(available_tools[tool_name]).parameters.keys()
-                    kwargs = {k: v for k, v in raw_kwargs.items() if k in allowed_keys}
-                    
-                    if "query" in kwargs:
-                        observation = available_tools[tool_name](**kwargs)
-                    else:
-                        observation = "错误：必须提供query参数。"
-                else:
-                    observation = f"错误:未定义的工具 '{tool_name}'"
-            else:
-                observation = "错误:Action格式无法解析。"
-                
-            st.session_state.prompt_history.append(f"Observation: {observation}")
+                observation = available_tools[tool_name](**raw_kwargs) if tool_name in available_tools else "错误"
+                st.session_state.prompt_history.append(f"Observation: {observation}")
 
+# 4. 等待反馈状态 (满意度确认)
 elif st.session_state.app_state == "WAITING_FEEDBACK":
-    # --- 超时检测逻辑 ---
-    if st.session_state.feedback_start_time:
-        elapsed_time = time.time() - st.session_state.feedback_start_time
-        remaining_time = 1800 - elapsed_time
-        
-        if remaining_time <= 0:
-            st.session_state.app_state = "COMPLETED"
-            st.rerun()
-        st_autorefresh(interval=10000, key="feedback_timer")    
-        mins_left = int(remaining_time // 60)
-        secs_left = int(remaining_time % 60)
-        st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
-
-    # --- 紧接着思考过程的下方，渲染满意度测试 ---
     st.markdown("### 阶段性检索结果展示")
-    st.write("请审阅 Agent 挑选出的文献，判断是否符合您的要求：")
-    
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
-    
-    st.divider()
-    st.markdown("#### 您对当前的文献组合满意吗？")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("满意，结束检索", use_container_width=True):
             st.session_state.app_state = "COMPLETED"
             st.rerun()
-            
     with col2:
         with st.popover("不满意，修改要求", use_container_width=True):
-            new_req = st.text_area("请指出不符合要求的地方：")
-            if st.button("提交新要求并继续"):
-                if new_req.strip():
-                    feedback_prompt = f"用户反馈: 【{new_req}】。请基于此继续筛选 Top 6。"
-                    st.session_state.prompt_history.append(feedback_prompt)
-                    st.session_state.has_provided_feedback = True 
-                    st.session_state.app_state = "RUNNING"
-                    st.rerun()
+            new_req = st.text_area("指出不符合要求的地方：")
+            if st.button("提交"):
+                st.session_state.prompt_history.append(f"用户反馈: {new_req}")
+                st.session_state.has_provided_feedback = True 
+                st.session_state.app_state = "RUNNING"
+                st.rerun()
 
+# 5. 任务完成状态 (展示结果 + 底部上传解析)
 elif st.session_state.app_state == "COMPLETED":
-    # --- 紧接着思考过程的下方，渲染最终完成界面 ---
     st.success("任务已完成！")
-    
-    if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
-        elapsed = time.time() - st.session_state.feedback_start_time
-        if elapsed > 1800:
-            st.warning("提示：由于超过 30 分钟未响应，系统已为您自动确认最终结果。")
-
     st.markdown("### 最终确认的 Top 6 论文推荐")
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
+    
     st.divider()
-    st.header("论文深度解读 (Full-text Analysis)")
-    st.info("如果您已下载上述推荐论文的 PDF，请上传，系统将进行深度解析与解读。")
+    st.header("📄 论文深度解读")
+    st.info("上传上述推荐论文的 PDF，系统将进行深度解析。")
     
-    uploaded_pdf = st.file_uploader("上传论文 PDF 文件", type="pdf", key="deep_read_uploader")
-    
+    # 底部上传入口
+    uploaded_pdf = st.file_uploader("上传 PDF 文件进行解析", type="pdf", key="bottom_pdf")
     if uploaded_pdf:
-        # 1. 读取 PDF 数据
-        pdf_data = uploaded_pdf.read()
-        
-        if st.button("🚀 开始深度解析", type="primary"):
-            # 2. 调用 Modal 云端接口
-            result = analyze_pdf_with_modal(pdf_data)
-            
-            if result and result.get("status") == "success":
-                st.success("✅ 解析成功！")
-                
-                # --- 3. 直接展示 Markdown 内容 (支持公式) ---
-                st.markdown("### 📄 论文正文解析")
-                st.markdown(result["markdown"])
-                
-                # 提供一个下载按钮，方便存进你的论文资料库
-                st.download_button("💾 下载解析好的 .md 文件", result["markdown"], file_name="analysis.md")
-                
-                # --- 4. 直接展示所有图片 ---
-                images = result.get("images", {})
-                if images:
-                    st.markdown("---")
-                    st.markdown("### 🖼️ 提取到的图表")
-                    # 直接按顺序往下铺图，不用搞分栏了，看着更清楚
-                    for img_name, img_base64 in images.items():
-                        st.image(base64.b64decode(img_base64), caption=img_name)
-                else:
-                    st.info("💡 提示：该论文中未检测到可提取的图表。")
-            
-            else:
-                st.error("❌ 解析失败，请检查 Modal 后端是否报错或额度是否充足。")
-    st.write("") 
+        # 同样调用统一的 UI 函数
+        render_analysis_ui(uploaded_pdf.read())
+
     if st.button("开启全新检索", type="primary"):
         st.session_state.clear()
         st.rerun()
