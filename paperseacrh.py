@@ -83,7 +83,6 @@ def analyze_pdf_with_modal(pdf_file_bytes):
             response = requests.post(
             MODAL_API_URL, 
             data=pdf_file_bytes, # 注意这里是 data=，不是 files=
-            headers={"Content-Type": "application/pdf"} # 明确告诉后端这是 PDF
         )
             
             if response.status_code == 200:
