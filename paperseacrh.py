@@ -3,7 +3,7 @@ import requests
 from openai import OpenAI
 import time
 import streamlit as st
-import datetime
+from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
 # 0. 页面基本设置
@@ -310,8 +310,9 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
         if remaining_time <= 0:
             st.session_state.app_state = "COMPLETED"
             st.rerun()
-        
+        st_autorefresh(interval=10000, key="feedback_timer")    
         mins_left = int(remaining_time // 60)
+        secs_left = int(remaining_time % 60)
         st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
 
     # --- 紧接着思考过程的下方，渲染满意度测试 ---
