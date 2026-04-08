@@ -13,8 +13,13 @@ st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout=
 st.title("📚 AI 智能论文检索 Agent")
 st.markdown("通过多轮自主检索与阅读，为您精准挖掘 Top 6 前沿文献。")
 
-API_KEY = st.secrets["DEEPSEEK_API_KEY"]
-BASE_URL = "https://api.deepseek.com"
+# 【这里统一定义了所有的 API 密钥和地址！】
+DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+QWEN_API_KEY = st.secrets["QWEN_API_KEY"]
+QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 
 # ==========================================
@@ -40,8 +45,10 @@ with st.sidebar:
     sidebar_pdf = st.file_uploader("上传 PDF 立即深度解读", type="pdf", key="sb_pdf")
 
 # ==========================================
-# 2. 提示词定义 (Text Agent & Search Agent)
+# 2. 提示词定义 (三大 Agent 专属提示词)
 # ==========================================
+
+# --- 文本专家提示词 ---
 TEXT_AGENT_PROMPT = """
 你是一个极其严谨的资深学术大牛（Text Agent）。你的任务是对提供的论文 Markdown 文本进行深度、全面的解构与综述。
 
@@ -53,28 +60,29 @@ TEXT_AGENT_PROMPT = """
 请严格按照以下 Markdown 结构输出你的分析结果，不要输出多余的寒暄：
 
 # 论文深度文本综述
-
 ## 1. 研究背景 (Background)
-[精读摘要和引言部分，总结本研究在什么宏观背景下开展。]
-
 ## 2. 现有研究的困境 (Current Issues)
-[明确指出目前的领域/前人的研究中存在什么具体的痛点、缺陷或未解之谜。]
-
 ## 3. 本文核心目标 (Problem Addressed)
-[精炼总结本文究竟要克服上述的哪些问题，提出了什么核心主张。]
-
 ## 4. 方法论与架构设计 (Methodology)
-[这是最重要的部分。请详细精读文章的中间部分。详细、连贯地剖析本文的整体研究架构、算法设计、实验流程或系统构建步骤。不要遗漏关键的技术细节。]
-
 ## 5. 作用效果与实验表现 (Effects & Results)
-[提取文章的实验部分，给出客观的效果分析。方法是否生效？在什么指标上取得了什么具体成果？]
-
 ## 6. 研究不足与局限性 (Limitations)
-[精准提取文章“结论与讨论(Conclusion/Discussion)”部分作者自己承认的不足、局限性或未来的改进方向。]
 """
 
+# --- 视觉专家提示词 (新加入) ---
+VISION_AGENT_PROMPT = """
+你是一个顶级的学术图表解析专家（Vision Agent）。
+你的任务是深度解读用户提供的学术论文截图（包括数据图、流程图、系统架构图等）。
+
+请严格按以下结构输出：
+1. 【图表定位】：这是什么类型的图？（如折线图、神经网络架构图），它在说明什么核心概念？
+2. 【数据/逻辑提取】：如果是数据图，指出明显的趋势、极值、对比差异；如果是流程图，按原理解释核心节点和流转逻辑。
+3. 【一句话结论】：总结这张图证明了什么。
+
+注意：如果图片看起来像是无意义的单行公式、极小的图标或排版噪音，请直接回复：“⚠️ 这是一张排版噪音图片，无实质学术信息。”
+"""
+
+# --- 搜索专家提示词生成器 ---
 def get_system_prompt(requirements, preprint_rule):
-    current_year = datetime.datetime.now().year
     if preprint_rule == "排除预印本 (仅限正规期刊/会议)":
         preprint_prompt = "严禁选择 Venue 为 'Unknown Venue/Preprint' 的预印本论文。"
     else:
@@ -82,33 +90,29 @@ def get_system_prompt(requirements, preprint_rule):
 
     return f"""
 你是一个科研论文搜索专家。你的任务是根据研究方向，在近一年内的论文中筛选六篇。
-
 # 你的工作流程：
 1. 通过`search_and_detail_papers`工具来获得相关论文的标题、摘要和Introduction。
-2. 每次搜索后，阅读标题、摘要和Introduction。如果符合用户的具体要求，将其记录在你的 Thought 中作为“备选池”累加。
-3. 每次阅读完一批论文后，学习同义词或近义词，作为下一次的 `search_and_detail_papers` 查询词。【警告】：新query必须是纯粹同义词，严禁加入用户要求中的关键词！
-4. 如果不符合或无法获取摘要：摒弃该论文。
-5. 最终在备选池中选出最好的六篇来作为结果。
+2. 将符合要求的记录在 Thought 中作为“备选池”累加。
+3. 学习同义词或近义词，作为下一次的查询词。【警告】：严禁加入用户要求中的关键词！
+4. 如果不符合或无摘要：摒弃该论文。
+5. 最终选出最好的六篇来作为结果。
 
 # 用户的具体筛选要求：
 {requirements}
 {preprint_prompt}
 
 # 输出格式要求：
-Thought: [你的思考逻辑，包括学习到的新关键词]
+Thought: [你的思考逻辑]
 Action: [执行工具或结束]
 
-Action格式支持以下两种：
-1. 继续搜索时输出：
-search_and_detail_papers(query="关键词")
-
-2. 已经选够6篇好论文结束时输出：
-Finish:
-在此处使用 Markdown 格式直接列出选出的 6 篇论文（必须包含 1.标题 2.Venue 3.DOI 4.推荐理由）。不要写多余的话。
+Action格式支持：
+1. search_and_detail_papers(query="关键词")
+2. Finish:
+在此处使用 Markdown 格式直接列出选出的 6 篇论文（1.标题 2.Venue 3.DOI 4.推荐理由）。不要多余的话。
 """
 
 # ==========================================
-# 3. 工具与通用大模型客户端
+# 3. 工具与通用大模型客户端 (升级支持图片)
 # ==========================================
 seen_paper_ids = set()
 
@@ -194,12 +198,36 @@ class LLMClient:
                     time.sleep(3)
                 else:
                     raise e
+                    
+    # 【新加入：专门给 Vision Agent 看图的方法】
+    def generate_with_images(self, user_prompt, base64_images):
+        messages = [{"role": "system", "content": self.sys_prompt}]
+        
+        content_list = [{"type": "text", "text": user_prompt}]
+        for b64 in base64_images:
+            content_list.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+            })
+        
+        messages.append({"role": "user", "content": content_list})
+
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model, messages=messages, temperature=0.2
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(3)
+                else:
+                    raise e
 
 # ==========================================
-# 4. 核心功能函数 (解析与渲染)
+# 4. 核心功能函数 (解析与渲染，含多模态调用)
 # ==========================================
 def analyze_pdf_with_modal(pdf_file_bytes):
-    """调用 Modal 云端接口解析 PDF"""
     with st.spinner("🚀 正在唤醒云端 GPU 引擎，深度解析公式与版面..."):
         try:
             files_payload = {"file": ("paper.pdf", pdf_file_bytes, "application/pdf")}
@@ -211,20 +239,14 @@ def analyze_pdf_with_modal(pdf_file_bytes):
                     return result
                 else:
                     st.error(f"解析内部错误: {result.get('message')}")
-                    if "trace" in result:
-                        with st.expander("查看详细报错"):
-                            st.code(result["trace"])
             else:
                 st.error(f"服务器响应错误: {response.status_code}")
-                st.write(response.text) 
                 
         except Exception as e:
             st.error(f"连接云端失败: {str(e)}")
-            
     return None
 
 def render_analysis_ui(pdf_bytes):
-    """统一的解析结果与多智能体展示区"""
     result = analyze_pdf_with_modal(pdf_bytes)
     
     if result and result.get("status") == "success":
@@ -246,7 +268,33 @@ def render_analysis_ui(pdf_bytes):
                 cols = st.columns(2)
                 for i, (img_name, img_base64) in enumerate(images_dict.items()):
                     with cols[i % 2]:
-                        st.image(base64.b64decode(img_base64), caption=img_name, use_container_width=True)
+                        with st.container(border=True):
+                            st.image(base64.b64decode(img_base64), caption=img_name, use_container_width=True)
+                            
+                            # 状态保持：为每张图准备一个报告存储位
+                            state_key = f"vision_report_{img_name}"
+                            if state_key not in st.session_state:
+                                st.session_state[state_key] = ""
+                            
+                            # 【核心交互：唤醒 Vision Agent (Qwen-VL)】
+                            if st.button(f"👁️ 唤醒 Vision Agent 解读图表", key=f"btn_{img_name}"):
+                                with st.spinner("Qwen-VL 视觉专家正在看图思考..."):
+                                    try:
+                                        vision_agent = LLMClient(
+                                            sys_prompt=VISION_AGENT_PROMPT, 
+                                            model="qwen-vl-max", # 阿里通义千问最强视觉模型
+                                            api_key=QWEN_API_KEY, 
+                                            base_url=QWEN_BASE_URL
+                                        )
+                                        user_req = f"请详细解读这张图片（它在原论文中的标识为 {img_name}）。"
+                                        report = vision_agent.generate_with_images(user_req, [img_base64])
+                                        st.session_state[state_key] = report
+                                    except Exception as e:
+                                        st.error(f"视觉解析失败: {e}")
+                            
+                            if st.session_state[state_key]:
+                                st.markdown("---")
+                                st.markdown(f"**🤖 专家解读：**\n{st.session_state[state_key]}")
             else:
                 st.info("ℹ️ 本篇论文未提取到图表信息。")
                 
@@ -260,12 +308,12 @@ def render_analysis_ui(pdf_bytes):
             if st.button("🚀 唤醒 Text Agent 开始精读", type="primary"):
                 with st.spinner("Text Agent 正在逐字精读、提炼方法论与实验细节，请耐心等待 (约 30-60 秒)..."):
                     try:
-                        text_agent = LLMClient(sys_prompt=TEXT_AGENT_PROMPT, api_key=API_KEY, base_url=BASE_URL)
+                        # 【核心交互：唤醒 Text Agent (DeepSeek)】
+                        text_agent = LLMClient(sys_prompt=TEXT_AGENT_PROMPT, model="deepseek-chat", api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
                         user_request = f"请精读以下论文的完整 Markdown 内容，并严格按要求给出深度综述：\n\n{md_content}"
                         
                         report = text_agent.generate([user_request])
                         st.session_state.text_agent_report = report
-                        
                     except Exception as e:
                         st.error(f"Text Agent 运行出错: {e}")
             
@@ -304,8 +352,8 @@ if start_button:
     else:
         seen_paper_ids.clear()
         sys_prompt = get_system_prompt(user_requirements, allow_preprint)
-        # 实例化 Search Agent
-        st.session_state.agent = LLMClient(sys_prompt=sys_prompt, api_key=API_KEY, base_url=BASE_URL)
+        # 【核心交互：唤醒 Search Agent (DeepSeek)】
+        st.session_state.agent = LLMClient(sys_prompt=sys_prompt, model="deepseek-chat", api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         st.session_state.prompt_history = [f"用户请求: {user_topic}"]
         
         st.session_state.app_state = "RUNNING"
