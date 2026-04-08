@@ -296,7 +296,7 @@ def render_analysis_ui(pdf_bytes):
                 with st.spinner(f"👁️ Vision Agent 正在逐一破解 {len(images_dict)} 张学术图表... (请稍候)"):
                     vision_agent = LLMClient(
                         sys_prompt=VISION_AGENT_PROMPT, 
-                        model="qwen-vl-max", 
+                        model="qwen3.6-plus", 
                         api_key=QWEN_API_KEY, 
                         base_url=QWEN_BASE_URL
                     )
