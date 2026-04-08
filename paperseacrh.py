@@ -385,7 +385,7 @@ with st.sidebar:
     user_requirements = st.text_area(
         "具体筛选要求", 
         value="", 
-        placeholder="建议分点填写,
+        placeholder="建议分点填写"
         help="要求越具体，Agent 挖掘的文献越精准。"
     )
     
