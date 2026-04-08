@@ -38,6 +38,37 @@ with st.sidebar:
 # ==========================================
 # 2. 动态生成系统提示词
 # ==========================================
+TEXT_AGENT_PROMPT = """
+你是一个极其严谨的资深学术大牛（Text Agent）。你的任务是对提供的论文 Markdown 文本进行深度、全面的解构与综述。
+
+【核心纪律】
+1. 绝对忠于原文：你的所有总结、分析和提取必须100%基于我提供的文本。严禁使用你自带的先验知识进行推理、延申或“脑补”。如果原文没写，请明确标出“原文未提及”。
+2. 细节为王：在分析“方法论”时，绝不能只给宏观概念，必须连贯、详细地还原文章的核心架构和技术细节。
+
+【工作流与输出格式】
+请严格按照以下 Markdown 结构输出你的分析结果，不要输出多余的寒暄：
+
+# 论文深度文本综述
+
+## 1. 研究背景 (Background)
+[精读摘要和引言部分，总结本研究在什么宏观背景下开展。]
+
+## 2. 现有研究的困境 (Current Issues)
+[明确指出目前的领域/前人的研究中存在什么具体的痛点、缺陷或未解之谜。]
+
+## 3. 本文核心目标 (Problem Addressed)
+[精炼总结本文究竟要克服上述的哪些问题，提出了什么核心主张。]
+
+## 4. 方法论与架构设计 (Methodology)
+[这是最重要的部分。请详细精读文章的中间部分。详细、连贯地剖析本文的整体研究架构、算法设计、实验流程或系统构建步骤。不要遗漏关键的技术细节。]
+
+## 5. 作用效果与实验表现 (Effects & Results)
+[提取文章的实验部分，给出客观的效果分析。方法是否生效？在什么指标上取得了什么具体成果？]
+
+## 6. 研究不足与局限性 (Limitations)
+[精准提取文章“结论与讨论(Conclusion/Discussion)”部分作者自己承认的不足、局限性或未来的改进方向。]
+"""
+
 def get_system_prompt(requirements, preprint_rule):
     current_year = datetime.datetime.now().year
     if preprint_rule == "排除预印本 (仅限正规期刊/会议)":
@@ -217,6 +248,60 @@ class LLMClient:
 API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 BASE_URL = "https://api.deepseek.com"
 
+def render_analysis_ui(pdf_bytes):
+    """统一的解析结果与多智能体展示区"""
+    result = analyze_pdf_with_modal(pdf_bytes)
+    
+    if result and result.get("status") == "success":
+        st.success("论文底层结构化解析成功！")
+        
+        md_content = result["markdown"]
+        images_dict = result.get("images", {})
+        
+        tab1, tab2, tab3 = st.tabs(["原始 Markdown", "提取的图表", "Text Agent 深度精读"])
+        
+        with tab1:
+            st.markdown("### 论文文本流提取结果")
+            st.markdown(md_content)
+            st.download_button("下载原始 Markdown", md_content, file_name="raw_analysis.md")
+            
+        with tab2:
+            st.markdown("### 论文多模态图表提取结果")
+            if images_dict:
+                cols = st.columns(2)
+                for i, (img_name, img_base64) in enumerate(images_dict.items()):
+                    with cols[i % 2]:
+                        st.image(base64.b64decode(img_base64), caption=img_name, use_container_width=True)
+            else:
+                st.info("本篇论文未提取到图表信息。")
+                
+        with tab3:
+            st.markdown("### 让大模型为您庖丁解牛")
+            st.info("点击下方按钮，系统将唤醒专属的 Text Agent，为您瞬间提取全篇最硬核的技术骨架。")
+            
+            if "text_agent_report" not in st.session_state:
+                st.session_state.text_agent_report = ""
+                
+            if st.button("唤醒 Text Agent 开始精读", type="primary"):
+                with st.spinner("Text Agent 正在逐字精读、提炼方法论与实验细节，请耐心等待 (约 30-60 秒)..."):
+                    try:
+                        text_agent = LLMClient(sys_prompt=TEXT_AGENT_PROMPT, api_key=API_KEY, base_url=BASE_URL)
+                        user_request = f"请精读以下论文的完整 Markdown 内容，并严格按要求给出深度综述：\n\n{md_content}"
+                        
+                        report = text_agent.generate([user_request])
+                        st.session_state.text_agent_report = report
+                        
+                    except Exception as e:
+                        st.error(f"Text Agent 运行出错: {e}")
+            
+            if st.session_state.text_agent_report:
+                st.divider()
+                st.markdown(st.session_state.text_agent_report)
+                st.download_button("下载 AI 精读报告", st.session_state.text_agent_report, file_name="AI_Review_Report.md", type="primary")
+                
+    else:
+        st.error("解析失败，请检查后端状态。")
+
 # --- 状态初始化 ---
 if "app_state" not in st.session_state:
     st.session_state.app_state = "IDLE"
@@ -363,7 +448,7 @@ elif st.session_state.app_state == "COMPLETED":
         st.markdown(st.session_state.final_result)
     
     st.divider()
-    st.header("📄 论文深度解读")
+    st.header("论文深度解读")
     st.info("上传上述推荐论文的 PDF，系统将进行深度解析。")
     
     # 底部上传入口
