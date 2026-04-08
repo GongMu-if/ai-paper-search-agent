@@ -364,9 +364,22 @@ def render_analysis_ui(pdf_bytes):
                 st.markdown(section)
 
         st.divider()
-        if st.button("导出报告为 PDF (Beta)"):
-            st.info("正在生成 PDF... (在生产环境下需配置中文字体文件)")
-            st.download_button("下载报告原文 (Markdown)", st.session_state.final_main_report, file_name="Report.md")
+        st.markdown("### 导出与下载")
+        col1, col2 = st.columns(2)
+        with col1:
+            # 1. Markdown 纯文本下载
+            st.download_button(
+                "下载报告原文 (Markdown)", 
+                st.session_state.final_main_report, 
+                file_name="Report.md",
+                use_container_width=True
+            )
+        with col2:
+            pdf_markdown = embed_base64_images(
+                st.session_state.final_main_report, 
+                st.session_state.temp_images
+            )
+            download_pdf_component(pdf_markdown)
 
 # ==========================================
 # 模块 7: 侧边栏及前端 UI 定义
