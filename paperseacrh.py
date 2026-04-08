@@ -84,7 +84,7 @@ def analyze_pdf_with_modal(pdf_file_bytes):
             }
             
             # 使用 files= 发送，requests 会自动帮你生成正确的 multipart/form-data 标头
-            response = requests.post(MODAL_API_URL, files=files_payload)
+            response = requests.post(MODAL_API_URL, files=files_payload, timeout=600)
             
             if response.status_code == 200:
                 result = response.json()
