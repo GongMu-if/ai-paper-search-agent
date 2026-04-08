@@ -49,6 +49,67 @@ with st.sidebar:
 # ==========================================
 # 2. 三大 Agent 核心提示词库
 # ==========================================
+MAIN_AGENT_PROMPT = """
+
+你是一个顶级的学术期刊主编。你的任务是将一份论文的文本综述和多张图表的视觉解析，合并为一篇专业、易读、深度的“论文透视报告”。目的是让读者直接通过报告读懂文章，而不是越短越好，一定要详尽。
+
+
+【目标受众】：对该领域有基础背景但未读过本文的科研人员。
+
+【撰写原则】：
+
+1. 图文并茂：在描述方法论和实验时，必须引用视觉解析中的关键发现（例如：正如 Fig 1 所示...）。
+
+2. 逻辑严密：从背景推导到方法，从数据推导到结论。
+
+3. 启发创新：在报告结尾提供具有实操性的未来研究方向。
+
+
+【报告结构要求】：
+
+# 🎓 论文全维度深度透视报告
+
+
+## 1. 核心综述 (Executive Summary)
+
+- 用简要但是全面的文字定义本文贡献。
+
+- 核心创新点（区别于前人工作的 Top 3 特性）。
+
+
+## 2. 问题背景与痛点 (Problem Landscape)
+
+- 详细还原领域背景。
+
+- 为什么这个问题在今天非解决不可？
+
+
+## 3. 技术方案全解 (Deep Dive: Methodology)
+
+- 结合文本和系统架构图（如果有），详细还原其研究架构。
+
+- **重点：** 详细解释其核心算法或实验设计的逻辑链路。
+
+
+## 4. 关键证据与结果 (Key Evidences)
+
+- 整合视觉模型对实验图表的解读。
+
+- 给出具体的性能数据提升说明。
+
+
+## 5. 局限性与“槽点” (Critical Thinking)
+
+- 作者没说透的地方，或者实验设计中的薄弱环节。
+
+
+## 6. 未来科研灵感 (Inspiration & Future Roadmap)
+
+- 基于本文，提出至少 3 个具体、可执行的未来研究方向。
+
+- 指出每个方向的潜在创新价值及预期难点。
+
+"""
 
 # --- Text Agent (文本精读专家) ---
 TEXT_AGENT_PROMPT = """
@@ -57,6 +118,7 @@ TEXT_AGENT_PROMPT = """
 【核心纪律】
 1. 绝对忠于原文：你的所有总结、分析和提取必须100%基于我提供的文本。严禁使用你自带的先验知识进行推理、延申或“脑补”。如果原文没写，请明确标出“原文未提及”。
 2. 细节为王：在分析“方法论”时，绝不能只给宏观概念，必须连贯、详细地还原文章的核心架构和技术细节。
+3. 内容描述一定要详尽，从而能够让后续主大模型得到对文章文本部分的全面解读，并不需要十分简短，一定要全面描述文章内容。
 
 【工作流与输出格式】
 请严格按照以下 Markdown 结构输出你的分析结果，不要输出多余的寒暄：
@@ -69,8 +131,8 @@ TEXT_AGENT_PROMPT = """
 ## 2. 现有研究的困境 (Current Issues)
 [明确指出目前的领域/前人的研究中存在什么具体的痛点、缺陷或未解之谜。]
 
-## 3. 本文核心目标 (Problem Addressed)
-[精炼总结本文究竟要克服上述的哪些问题，提出了什么核心主张。]
+## 3. 本文核心目标和创新点 (Problem Addressed)
+[精炼总结本文究竟要克服上述的哪些问题，提出了什么核心主张以及该文章的核心创新点。]
 
 ## 4. 方法论与架构设计 (Methodology)
 [这是最重要的部分。请详细精读文章的中间部分。详细、连贯地剖析本文的整体研究架构、算法设计、实验流程或系统构建步骤。不要遗漏关键的技术细节。]
@@ -264,69 +326,60 @@ def analyze_pdf_with_modal(pdf_file_bytes):
     return None
 
 def render_analysis_ui(pdf_bytes):
-    """全自动控制台：静默解析 -> 唤醒双 Agent -> 只展示最终报告"""
     file_hash = hash(pdf_bytes)
-
-    # 状态拦截：防止页面交互导致重复调用大模型消耗 API 费用
     if st.session_state.get("current_pdf_hash") != file_hash:
         st.session_state.current_pdf_hash = file_hash
-        st.session_state.final_text_report = ""
-        st.session_state.final_vision_reports = {}
-        st.session_state.parse_success = False
+        st.session_state.final_main_report = ""
+        st.session_state.temp_images = {}
 
-        # --- 阶段 1：静默拆解 ---
+        # 1. 静默拆解
         result = analyze_pdf_with_modal(pdf_bytes)
-        
         if result and result.get("status") == "success":
-            st.session_state.parse_success = True
             md_content = result["markdown"]
-            images_dict = result.get("images", {})
+            st.session_state.temp_images = result.get("images", {})
             
-            # --- 阶段 2：静默文本精读 (Text Agent) ---
-            with st.spinner("🧠 Text Agent 正在深度阅读并提炼技术骨架... (约30-60秒)"):
-                try:
-                    text_agent = LLMClient(sys_prompt=TEXT_AGENT_PROMPT, model="deepseek-chat", api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-                    user_request = f"请精读以下论文的完整 Markdown 内容，并严格按要求给出深度综述：\n\n{md_content}"
-                    st.session_state.final_text_report = text_agent.generate([user_request])
-                except Exception as e:
-                    st.session_state.final_text_report = f"Text Agent 运行出错: {e}"
-            
-            # --- 阶段 3：静默图表洞察 (Vision Agent) ---
-            if images_dict:
-                with st.spinner(f"👁️ Vision Agent 正在逐一破解 {len(images_dict)} 张学术图表... (请稍候)"):
-                    vision_agent = LLMClient(
-                        sys_prompt=VISION_AGENT_PROMPT, 
-                        model="qwen3.6-plus", 
-                        api_key=QWEN_API_KEY, 
-                        base_url=QWEN_BASE_URL
-                    )
-                    for img_name, img_base64 in images_dict.items():
-                        try:
-                            user_req = f"请详细解读这张图片（它在原论文中的标识为 {img_name}）。"
-                            report = vision_agent.generate_with_images(user_req, [img_base64])
-                            st.session_state.final_vision_reports[img_name] = report
-                        except Exception as e:
-                            st.session_state.final_vision_reports[img_name] = f"视觉解析出错: {e}"
-        else:
-            st.session_state.parse_success = False
+            # 2. 静默文本精读 (Text Agent)
+            with st.spinner("🧠 文本专家正在精读全篇文本..."):
+                text_agent = LLMClient(sys_prompt=TEXT_AGENT_PROMPT, api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+                text_report = text_agent.generate([f"请详尽解析此论文：\n{md_content}"])
 
-    # --- 最终渲染：只向用户交付高价值洞察 ---
-    if st.session_state.get("parse_success"):
-        st.success("🎉 论文全维度深度解读完成！")
+            # 3. 静默图表解读 (Vision Agent)
+            vision_summaries = ""
+            if st.session_state.temp_images:
+                with st.spinner(f"👁️ 视觉专家正在分析 {len(st.session_state.temp_images)} 张关键图表..."):
+                    vision_agent = LLMClient(sys_prompt=VISION_AGENT_PROMPT, model="qwen3.6-plus", api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+                    for name, b64 in st.session_state.temp_images.items():
+                        v_res = vision_agent.generate_with_images(f"解析图表 {name}", [b64])
+                        vision_summaries += f"\n--- 图表标识: {name} ---\n{v_res}\n"
+
+            # 4. 总策宣官融合 (Main Agent)
+            with st.spinner("🧙‍♂️ 总策宣官正在融合图文，生成终极报告..."):
+                main_agent = LLMClient(sys_prompt=MAIN_AGENT_PROMPT, api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+                combined_prompt = f"【文本综述】：\n{text_report}\n\n【视觉分析库】：\n{vision_summaries}"
+                st.session_state.final_main_report = main_agent.generate([combined_prompt])
+
+    # --- 渲染最终结果 ---
+    if st.session_state.final_main_report:
+        st.success("🏁 论文深度透视报告已生成！")
         
-        # 1. 渲染全局文本精读报告
-        st.markdown("### 🧠 论文全局文本精读报告")
-        st.markdown(st.session_state.final_text_report)
-        st.download_button("📥 下载 AI 文本精读报告", st.session_state.final_text_report, file_name="AI_Review_Report.md", type="primary")
-        
-        # 2. 渲染独立图表洞察卡片
-        if st.session_state.final_vision_reports:
-            st.divider()
-            st.markdown("### 👁️ 学术图表专家解读")
-            for img_name, report in st.session_state.final_vision_reports.items():
-                with st.container(border=True):
-                    st.markdown(f"**📍 图表标识：{img_name}**")
-                    st.markdown(report)
+        # 实时图文一体化渲染逻辑
+        report_sections = re.split(r'(\[REF_IMG: .*?\])', st.session_state.final_main_report)
+        for section in report_sections:
+            img_match = re.match(r'\[REF_IMG: (.*?)\]', section)
+            if img_match:
+                img_name = img_match.group(1).strip()
+                if img_name in st.session_state.temp_images:
+                    st.image(base64.b64decode(st.session_state.temp_images[img_name]), caption=f"引用图表: {img_name}", use_container_width=True)
+            else:
+                st.markdown(section)
+
+        # PDF 导出功能
+        st.divider()
+        if st.button("📥 导出报告为 PDF (Beta)"):
+            st.info("正在生成 PDF... (在生产环境下需配置中文字体文件)")
+            # 此处由于 Streamlit Cloud 环境中缺乏中文字体文件，生成 PDF 可能会乱码
+            # 建议用户下载 Markdown 格式，或在本地运行代码时指定字体
+            st.download_button("下载报告原文 (Markdown)", st.session_state.final_main_report, file_name="Report.md")
 
 # ==========================================
 # 5. 全局状态机与主程序运转闭环
