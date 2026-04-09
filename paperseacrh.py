@@ -32,9 +32,11 @@ seen_paper_ids = set()
 MAIN_AGENT_PROMPT = """
 你是一个顶级的学术期刊主编。你的任务是将一份来自文本专家的“论文深度文本综述”和来自视觉专家的“多张图表视觉解析”，无缝合并为一篇专业、易读、深度的“论文全维度透视报告”。你的目标是让读者直接通过你的报告彻底读懂文章的全部细节。内容必须极其详尽，拒绝简略。
 【撰写原则与核心纪律】
-1. 纯段落结构：在正文撰写中，禁止使用生硬的无序列表或数字编号打断阅读节奏。每一部分必须以逻辑严密、承上启下的段落形式呈现。
+1. 纯段落结构：在正文撰写中，禁止使用生硬的无序列表或数字编号打断阅读节奏。每一部分必须以逻辑严密、承上启下的段落形式呈现。绝不能将一整个章节写成一个巨大的自然段！必须在阐述不同概念、不同模块、不同实验结论时，进行合理的换行分段。利用段首主旨句引导阅读，确保排版疏密有致，富有呼吸感。
 2. 深度图文融合：绝不能仅仅是将文本和图片解析简单拼接。你必须将图片解析中的关键发现作为证据，自然地编织进文本的逻辑链条中。如果视觉图表中包含了文本中缺失的细节（例如模型架构中的隐藏层连接、未在正文提及的实验对比分支），你必须用它来补充文本描述。
-3. 原图精准插入：你必须在报告中最合适的文字节点，直接插入原文章中的图片。插入图片的格式为：![图片说明](图片链接或占位符)。例如，在描述整体架构时必须插入架构图，在分析核心实验结果时必须插入对应的折线图或对比图。
+3. 深度图文融合与原图插入：必须将图片和表格解析中的关键论据，自然嵌入文本逻辑中。在合适的学术段落处，直接插入对应的图片，格式严谨为：![图X：学术化图注](图片占位符)。
+4. 严谨客观的学术话语体系：禁止使用任何口语化、感情色彩浓烈的词汇（如“娓娓道来”、“没说透”、“绝不能”）。必须使用标准的学术论述用语（如“本文旨在”、“研究表明”、“机制剖析”、“局限性在于”）。
+5. 图表全局统一编号：你必须根据正文逻辑顺序列出图表。所有插入的图片和表格，必须重新规范命名，格式为“图1：XXX”、“表1：XXX”。严禁保留原系统生成的哈希长串或无意义的名称（如“pdf”）。
 
 【报告结构要求】
 请严格按照以下 Markdown 结构输出你的报告：
@@ -87,14 +89,14 @@ TEXT_AGENT_PROMPT = """
 
 VISION_AGENT_PROMPT = """
 你是一个顶级的学术图表解析专家（Vision Agent）。
-你的任务是深度解读用户提供的学术论文截图（包括数据图、流程图、系统架构图等）。
+你的任务是深度解读用户提供的学术论文截图（包括数据图、流程图、系统架构图、数据表格等）。
 
 请严格按以下结构输出：
-1. 【图表定位】：这是什么类型的图？（如折线图、神经网络架构图），它在说明什么核心概念？
-2. 【数据/逻辑提取】：如果是数据图，指出明显的趋势、极值、对比差异；如果是流程图，按原理解释核心节点和流转逻辑。
-3. 【一句话结论】：总结这张图证明了什么。
+1. 【图表学术定位】：这是什么类型的图表？（如收敛折线图、消融实验柱状图、网络拓扑图）。如果图表本身带有原文编号（如 Figure 1, Table II），请务必在此提取并指出。
+2. 【数据与机制提取】：若是数据图表，使用学术语言精准提取核心趋势、极值对比与显著性差异；若是架构/流程图，解释其核心节点的设计逻辑。
+3. 【学术推论】：总结该图表在全文逻辑链中提供了怎样的实证支撑。
 
-注意：如果图片看起来像是无意义的单行公式、极小的图标或排版噪音，请直接回复：“⚠️ 这是一张排版噪音图片，无实质学术信息。”
+注意：如果是无意义的单行公式、排版噪音或页眉页脚，请直接回复：“⚠️ 排版噪音，无实质学术信息。”
 """
 
 def get_system_prompt(requirements, preprint_rule):
@@ -194,10 +196,12 @@ def embed_base64_images(md_text, images_dict):
         alt_text = match.group(1)
         img_placeholder = match.group(2).strip()
         clean_placeholder = re.sub(r'[^a-zA-Z0-9]', '', img_placeholder).lower()
+        
         for img_name, b64 in images_dict.items():
-            clean_key = re.sub(r'[^a-zA-Z0-9]', '', img_name).lower()
-            if clean_key and (clean_key in clean_placeholder or clean_placeholder in clean_key):
-                return f"![{alt_text}](data:image/jpeg;base64,{b64})"
+            clean_key = re.sub(r'[^a-zA-Z0-9]', '', img_name).lower()、
+            if clean_key and (clean_key in clean_placeholder or clean_placeholder in clean_key):、
+                return f"![{alt_text}](data:image/jpeg;base64,{b64})\n<div style='text-align: center; font-size: 0.9em; color: #555;'><b>{alt_text}</b></div>"
+        
         return match.group(0) 
     return re.sub(r'!\[(.*?)\]\((.*?)\)', replace_img, md_text)
 
@@ -209,26 +213,36 @@ def download_pdf_component(md_text):
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
             body {{
-                font-family: 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, sans-serif;
-                color: #333; line-height: 1.6; padding: 20px;
+                font-family: 'Times New Roman', 'SimSun', serif; /* 修改为更符合学术规范的字体 */
+                color: #000; line-height: 1.6; padding: 20px;
             }}
-            img {{ max-width: 100%; height: auto; border-radius: 8px; margin: 15px 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            h1, h2, h3, h4 {{ color: #2C3E50; margin-top: 20px; }}
-            table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
-            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
-            th {{ background-color: #f8f9fa; font-weight: bold; }}
-            code {{ background-color: #f4f4f4; padding: 2px 5px; border-radius: 4px; }}
+            /* 核心修复：防止元素在分页处被截断 */
+            img, table, pre, code, blockquote {{
+                page-break-inside: avoid;
+                break-inside: avoid;
+            }}
+            h1, h2, h3, h4 {{
+                color: #000; margin-top: 24px;
+                page-break-after: avoid; /* 标题后不强制分页 */
+                break-after: avoid;
+            }}
+            p {{ page-break-inside: avoid; }}
+            
+            img {{ max-width: 100%; height: auto; margin: 20px auto; display: block; }}
+            table {{ border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 0.9em; }}
+            th, td {{ border: 1px solid #000; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; font-weight: bold; }}
+            
             .download-btn {{
                 display: block; width: 100%; padding: 12px;
-                background-color: #FF4B4B; color: white; border: none;
-                border-radius: 8px; font-size: 16px; cursor: pointer;
-                font-weight: bold; transition: 0.3s;
+                background-color: #4CAF50; color: white; border: none; /* 改为沉稳的绿色 */
+                border-radius: 4px; font-size: 16px; cursor: pointer; font-weight: bold;
             }}
-            .download-btn:hover {{ background-color: #FF3333; box-shadow: 0 4px 12px rgba(255,75,75,0.4); }}
+            .download-btn:hover {{ background-color: #45a049; }}
         </style>
     </head>
     <body>
-        <button class="download-btn" onclick="generatePDF()">点击下载完整图文 PDF 报告</button>
+        <button class="download-btn" onclick="generatePDF()">📥 导出标准版学术 PDF 报告</button>
         <div id="report-content" style="display: none;">
             {html_content}
         </div>
@@ -238,10 +252,11 @@ def download_pdf_component(md_text):
                 element.style.display = 'block'; 
                 var opt = {{
                     margin:       [15, 15, 15, 15],
-                    filename:     '论文全维度透视报告.pdf',
+                    filename:     '论文深度透视报告.pdf',
                     image:        {{ type: 'jpeg', quality: 0.98 }},
                     html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true }},
-                    jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }}
+                    jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }},
+                    pagebreak:    {{ mode: ['css', 'legacy'] }} // 核心修复：启用 CSS 分页规则
                 }};
                 html2pdf().set(opt).from(element).save().then(() => {{
                     element.style.display = 'none'; 
