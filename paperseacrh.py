@@ -198,7 +198,7 @@ def embed_base64_images(md_text, images_dict):
         clean_placeholder = re.sub(r'[^a-zA-Z0-9]', '', img_placeholder).lower()
         
         for img_name, b64 in images_dict.items():
-            clean_key = re.sub(r'[^a-zA-Z0-9]', '', img_name).lower()、
+            clean_key = re.sub(r'[^a-zA-Z0-9]', '', img_name).lower()
             if clean_key and (clean_key in clean_placeholder or clean_placeholder in clean_key):、
                 return f"![{alt_text}](data:image/jpeg;base64,{b64})\n<div style='text-align: center; font-size: 0.9em; color: #555;'><b>{alt_text}</b></div>"
         
