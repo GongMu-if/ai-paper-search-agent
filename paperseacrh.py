@@ -33,10 +33,11 @@ MAIN_AGENT_PROMPT = """
 你是一个顶级的学术期刊主编。你的任务是将一份来自文本专家的“论文深度文本综述”和来自视觉专家的“多张图表视觉解析”，无缝合并为一篇专业、易读、深度的“论文全维度透视报告”。你的目标是让读者直接通过你的报告彻底读懂文章的全部细节。内容必须极其详尽，拒绝简略。
 【撰写原则与核心纪律】
 1. 纯段落结构：在正文撰写中，禁止使用生硬的无序列表或数字编号打断阅读节奏。每一部分必须以逻辑严密、承上启下的段落形式呈现。绝不能将一整个章节写成一个巨大的自然段！必须在阐述不同概念、不同模块、不同实验结论时，进行合理的换行分段。利用段首主旨句引导阅读，确保排版疏密有致，富有呼吸感。
-2. 深度图文融合：绝不能仅仅是将文本和图片解析简单拼接。你必须将图片解析中的关键发现作为证据，自然地编织进文本的逻辑链条中。如果视觉图表中包含了文本中缺失的细节（例如模型架构中的隐藏层连接、未在正文提及的实验对比分支），你必须用它来补充文本描述。
+2. 深度图文融合：绝不能仅仅是将文本和图片解析简单拼接。你必须将图片解析中的关键发现作为证据，自然地编织进文本的逻辑链条中。如果视觉图表中包含了文本中缺失的细节（例如模型架构中的隐藏层连接、未在正文提及的实验对比分支），你必须用它来补充文本描述。我已经为你提供了当前所有可用的图表真实标识符列表。
 3. 深度图文融合与原图插入：必须将图片和表格解析中的关键论据，自然嵌入文本逻辑中。在合适的学术段落处，直接插入对应的图片，格式严谨为：![图X：学术化图注](图片占位符)。
 4. 严谨客观的学术话语体系：禁止使用任何口语化、感情色彩浓烈的词汇（如“娓娓道来”、“没说透”、“绝不能”）。必须使用标准的学术论述用语（如“本文旨在”、“研究表明”、“机制剖析”、“局限性在于”）。
 5. 图表全局统一编号：你必须根据正文逻辑顺序列出图表。所有插入的图片和表格，必须重新规范命名，格式为“图1：XXX”、“表1：XXX”。严禁保留原系统生成的哈希长串或无意义的名称（如“pdf”）。
+6. Markdown表格致命红线：所有表格前后必须各保留一个完整的空行！表标题（如“表1：XXX”）必须单独作为一行写在表格上方。绝对禁止将表标题和 Markdown 表头（`| 列名 |`）写在同一行，否则会导致系统崩溃！
 
 【报告结构要求】
 请严格按照以下 Markdown 结构输出你的报告：
@@ -219,20 +220,31 @@ def download_pdf_component(md_text):
         <style>
             body {{
                 font-family: 'Times New Roman', 'SimSun', serif; 
-                color: #000; line-height: 1.8; padding: 20px; text-align: justify;
+                color: #000; line-height: 1.8; padding: 20px; 
+                text-align: justify;
             }}
             
-            /* 核心修复：段落首行缩进 2 字符，取消强制不分页，让文字自然跨页流转 */
+            /* 核心修复：为段落增加 relative 定位和避让属性，帮助 html2canvas 识别文字边界 */
             p {{ 
                 text-indent: 2em; 
-                margin-bottom: 1em; 
+                margin-bottom: 1.2em; 
+                position: relative;
+                display: block;
             }}
             
-            /* 图片、表格、代码块等整体模块禁止被截断 */
-            img, table, pre, code, blockquote {{
+            /* 表格容器样式优化 */
+            table {{ 
+                border-collapse: collapse; width: 100%; margin: 25px 0; 
+                font-size: 0.9em; page-break-inside: avoid; break-inside: avoid;
+            }}
+            th, td {{ border: 1px solid #000; padding: 10px; text-align: center; }}
+            th {{ background-color: #f8f9fa; font-weight: bold; }}
+            
+            img, pre, code, blockquote {{
                 page-break-inside: avoid;
                 break-inside: avoid;
             }}
+            
             h1, h2, h3, h4 {{
                 color: #000; margin-top: 24px; margin-bottom: 16px;
                 page-break-after: avoid; 
@@ -240,11 +252,7 @@ def download_pdf_component(md_text):
             }}
             
             img {{ max-width: 100%; height: auto; margin: 20px auto; display: block; }}
-            table {{ border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 0.9em; }}
-            th, td {{ border: 1px solid #000; padding: 8px; text-align: left; }}
-            th {{ background-color: #f2f2f2; font-weight: bold; }}
             
-            /* 图注专用样式：取消缩进，加粗居中 */
             .img-caption {{
                 text-align: center; font-size: 0.9em; color: #555; text-indent: 0; 
                 margin-top: -10px; margin-bottom: 20px; font-weight: bold; display: block;
@@ -271,7 +279,8 @@ def download_pdf_component(md_text):
                     margin:       [15, 15, 15, 15],
                     filename:     '论文深度透视报告.pdf',
                     image:        {{ type: 'jpeg', quality: 0.98 }},
-                    html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true }},
+                    // 核心修复：增加 windowWidth 固定视口，防止计算文字折行时出现错位
+                    html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true, windowWidth: 1024 }},
                     jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }},
                     pagebreak:    {{ mode: ['css', 'legacy'] }}
                 }};
@@ -379,7 +388,13 @@ def render_analysis_ui(pdf_bytes):
 
             with st.spinner("总策宣官正在融合图文，生成终极报告..."):
                 main_agent = LLMClient(sys_prompt=MAIN_AGENT_PROMPT, api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-                combined_prompt = f"【文本综述】：\n{text_report}\n\n【视觉分析库】：\n{vision_summaries}"
+                
+                available_img_ids = "\n".join([f"- {k}" for k in st.session_state.temp_images.keys()])
+                if not available_img_ids:
+                    available_img_ids = "无可用图片"
+                
+                combined_prompt = f"【当前所有可用的图表真实标识符列表】（你必须从中复制以插入图片）：\n{available_img_ids}\n\n【文本综述】：\n{text_report}\n\n【视觉分析库】：\n{vision_summaries}"
+                
                 st.session_state.final_main_report = main_agent.generate([combined_prompt])
 
     if st.session_state.final_main_report:
