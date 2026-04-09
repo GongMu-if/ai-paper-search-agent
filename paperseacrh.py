@@ -85,6 +85,13 @@ TEXT_AGENT_PROMPT = """
 
 ## 5. 结论、不足与未来方向
 详尽地总结该文章的核心贡献以及在领域内取得的突破。根据原文作者的自述，客观描述该研究目前仍然存在的局限性与不足之处，并详细阐述作者在文中指出的未来研究方向。所有内容以自然段落呈现。
+
+## 6. 启发性进阶探索（主编视点）
+作为资深主编，基于本文的技术基座与局限性，为后续研究者提出至少三个具有前沿价值的创新拓展方向。对每一个创新点，必须详细论述以下维度（每个创新点独立分段）：
+- 核心突破口：该创新点旨在解决当前领域的什么未解问题？
+- 比较优势：相比于本论文提出的方法，该方案好在哪里（如效率、精度、可解释性）？
+- 技术路径：建议采用什么具体的方法论或算法架构来实现？
+- 潜在挑战与对策：实施过程中大概率会遇到什么技术障碍？应采取何种策略加以解决？
 """
 
 VISION_AGENT_PROMPT = """
@@ -195,12 +202,10 @@ def embed_base64_images(md_text, images_dict):
     def replace_img(match):
         alt_text = match.group(1)
         img_placeholder = match.group(2).strip()
-        clean_placeholder = re.sub(r'[^a-zA-Z0-9]', '', img_placeholder).lower()
         
         for img_name, b64 in images_dict.items():
-            clean_key = re.sub(r'[^a-zA-Z0-9]', '', img_name).lower()
-            if clean_key and (clean_key in clean_placeholder or clean_placeholder in clean_key):
-                return f"![{alt_text}](data:image/jpeg;base64,{b64})\n<div style='text-align: center; font-size: 0.9em; color: #555;'><b>{alt_text}</b></div>"
+            if img_placeholder in img_name or img_name in img_placeholder:
+                return f"![{alt_text}](data:image/jpeg;base64,{b64})\n<div class='img-caption'>{alt_text}</div>"
         
         return match.group(0) 
     return re.sub(r'!\[(.*?)\]\((.*?)\)', replace_img, md_text)
@@ -213,29 +218,41 @@ def download_pdf_component(md_text):
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
             body {{
-                font-family: 'Times New Roman', 'SimSun', serif; /* 修改为更符合学术规范的字体 */
-                color: #000; line-height: 1.6; padding: 20px;
+                font-family: 'Times New Roman', 'SimSun', serif; 
+                color: #000; line-height: 1.8; padding: 20px; text-align: justify;
             }}
-            /* 核心修复：防止元素在分页处被截断 */
+            
+            /* 核心修复：段落首行缩进 2 字符，取消强制不分页，让文字自然跨页流转 */
+            p {{ 
+                text-indent: 2em; 
+                margin-bottom: 1em; 
+            }}
+            
+            /* 图片、表格、代码块等整体模块禁止被截断 */
             img, table, pre, code, blockquote {{
                 page-break-inside: avoid;
                 break-inside: avoid;
             }}
             h1, h2, h3, h4 {{
-                color: #000; margin-top: 24px;
-                page-break-after: avoid; /* 标题后不强制分页 */
+                color: #000; margin-top: 24px; margin-bottom: 16px;
+                page-break-after: avoid; 
                 break-after: avoid;
             }}
-            p {{ page-break-inside: avoid; }}
             
             img {{ max-width: 100%; height: auto; margin: 20px auto; display: block; }}
             table {{ border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 0.9em; }}
             th, td {{ border: 1px solid #000; padding: 8px; text-align: left; }}
             th {{ background-color: #f2f2f2; font-weight: bold; }}
             
+            /* 图注专用样式：取消缩进，加粗居中 */
+            .img-caption {{
+                text-align: center; font-size: 0.9em; color: #555; text-indent: 0; 
+                margin-top: -10px; margin-bottom: 20px; font-weight: bold; display: block;
+            }}
+            
             .download-btn {{
                 display: block; width: 100%; padding: 12px;
-                background-color: #4CAF50; color: white; border: none; /* 改为沉稳的绿色 */
+                background-color: #4CAF50; color: white; border: none; 
                 border-radius: 4px; font-size: 16px; cursor: pointer; font-weight: bold;
             }}
             .download-btn:hover {{ background-color: #45a049; }}
@@ -256,7 +273,7 @@ def download_pdf_component(md_text):
                     image:        {{ type: 'jpeg', quality: 0.98 }},
                     html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true }},
                     jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }},
-                    pagebreak:    {{ mode: ['css', 'legacy'] }} // 核心修复：启用 CSS 分页规则
+                    pagebreak:    {{ mode: ['css', 'legacy'] }}
                 }};
                 html2pdf().set(opt).from(element).save().then(() => {{
                     element.style.display = 'none'; 
