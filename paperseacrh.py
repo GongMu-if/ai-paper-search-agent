@@ -218,86 +218,69 @@ def download_pdf_component(md_text):
     <head>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
-            /* 修复 1：去掉所有默认边距，防止与 PDF 引擎边距叠加 */
-            html, body {{
-                margin: 0;
-                padding: 0;
-                background-color: #ffffff;
-            }}
-            
             body {{
                 font-family: 'Times New Roman', 'SimSun', serif; 
-                color: #000; line-height: 1.6;
+                color: #000; line-height: 1.8; padding: 20px; 
                 text-align: justify;
             }}
             
-            /* 修复 2：设置一个明确的容器宽度，并居中，防止右移 */
-            #report-container {{
-                width: 800px; /* 固定宽度，方便 html2canvas 捕捉 */
-                margin: 0 auto;
-                padding: 0;
-            }}
-            
+            /* 核心修复：为段落增加 relative 定位和避让属性，帮助 html2canvas 识别文字边界 */
             p {{ 
                 text-indent: 2em; 
-                margin-bottom: 1em; 
-            }}
-            
-            /* 修复 3：调整图片大小，限制为页面宽度的 75%，并居中显示 */
-            img {{ 
+                margin-bottom: 1.2em; 
+                position: relative;
                 display: block;
-                max-width: 75%; /* 调小图片比例 */
-                height: auto; 
-                margin: 15px auto; /* 居中 */
             }}
             
+            /* 表格容器样式优化 */
             table {{ 
-                border-collapse: collapse; width: 100%; margin: 20px 0; 
-                font-size: 0.9em; page-break-inside: avoid;
+                border-collapse: collapse; width: 100%; margin: 25px 0; 
+                font-size: 0.9em; page-break-inside: avoid; break-inside: avoid;
             }}
-            th, td {{ border: 1px solid #000; padding: 8px; text-align: center; }}
-            th {{ background-color: #f2f2f2; font-weight: bold; }}
+            th, td {{ border: 1px solid #000; padding: 10px; text-align: center; }}
+            th {{ background-color: #f8f9fa; font-weight: bold; }}
+            
+            img, pre, code, blockquote {{
+                page-break-inside: avoid;
+                break-inside: avoid;
+            }}
+            
+            h1, h2, h3, h4 {{
+                color: #000; margin-top: 24px; margin-bottom: 16px;
+                page-break-after: avoid; 
+                break-after: avoid;
+            }}
+            
+            img {{ max-width: 100%; height: auto; margin: 20px auto; display: block; }}
             
             .img-caption {{
-                text-align: center; font-size: 0.85em; color: #444; 
-                text-indent: 0; margin-top: -10px; margin-bottom: 20px; font-weight: bold;
+                text-align: center; font-size: 0.9em; color: #555; text-indent: 0; 
+                margin-top: -10px; margin-bottom: 20px; font-weight: bold; display: block;
             }}
-            
-            h1, h2, h3 {{ page-break-after: avoid; break-after: avoid; }}
             
             .download-btn {{
                 display: block; width: 100%; padding: 12px;
                 background-color: #4CAF50; color: white; border: none; 
                 border-radius: 4px; font-size: 16px; cursor: pointer; font-weight: bold;
             }}
+            .download-btn:hover {{ background-color: #45a049; }}
         </style>
     </head>
     <body>
-        <button class="download-btn" onclick="generatePDF()">📥 导出标准学术 PDF 报告</button>
+        <button class="download-btn" onclick="generatePDF()">📥 导出标准版学术 PDF 报告</button>
         <div id="report-content" style="display: none;">
-            <div id="report-container">
-                {html_content}
-            </div>
+            {html_content}
         </div>
         <script>
             function generatePDF() {{
                 var element = document.getElementById('report-content');
                 element.style.display = 'block'; 
                 var opt = {{
-                    margin:       [15, 15, 15, 15], /* PDF 物理边距 */
-                    filename:     '论文全维度透视报告.pdf',
+                    margin:       [15, 15, 15, 15],
+                    filename:     '论文深度透视报告.pdf',
                     image:        {{ type: 'jpeg', quality: 0.98 }},
-                    html2canvas:  {{ 
-                        scale: 2, 
-                        useCORS: true, 
-                        // 核心修复：锁定视口和滚动位置，解决偏移问题
-                        width: 850,
-                        windowWidth: 850,
-                        scrollX: 0,
-                        scrollY: 0,
-                        x: 0,
-                        y: 0
-                    }},
+                    // 核心修复：增加 windowWidth 固定视口，防止计算文字折行时出现错位
+                    html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true, windowWidth: 1024 }},
                     jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }},
                     pagebreak:    {{ mode: ['css', 'legacy'] }}
                 }};
