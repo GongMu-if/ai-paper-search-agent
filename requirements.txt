@@ -4,3 +4,4 @@ openai
 Pillow
 beautifulsoup4
 mistune
+markdown
