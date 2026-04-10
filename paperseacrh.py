@@ -1,57 +1,109 @@
+# -*- coding: utf-8 -*-
+"""
+AI 论文检索 + 论文全维度深度解读 Agent（完整注释版）
+
+本版本重点修复两类问题：
+1. 长报告在审校或修订阶段被一次性重写，导致后半部分章节丢失。
+2. 浏览器端 html2pdf 截图式导出导致的分页裁切、页首文字显示异常、表格和图像留白过大。
+
+与旧版本相比，本版本做了以下核心改动：
+- 主报告改为“分章节生成 + 完整性校验 + 定向审校修补”，不再整篇 one-shot 重写。
+- PDF 改为服务器端 WeasyPrint 排版导出，不再使用浏览器截图转 PDF。
+- PDF 中普通图、宽图、表格型图片、长图分别单独控制尺寸。
+- 图表会在同一节内延后到更合适的位置，从而让文字优先填充页面，减少大块留白。
+- 正文字体采用“Times New Roman 优先 + 中文字体回退”的组合：
+  英文、数字优先用 Times New Roman；中文保留中文字体回退显示。
+
+新增依赖（请确保部署环境已安装）：
+- weasyprint
+- mistune
+- beautifulsoup4
+- Pillow
+"""
+
 # ==========================================
 # 模块 1: 依赖导入与页面基础配置
 # ==========================================
+
 import re
 import html as html_lib
-import requests
-from openai import OpenAI
 import time
-import streamlit as st
-import datetime
 import base64
-import markdown
+import datetime
+from io import BytesIO
 from string import Template
-import streamlit.components.v1 as components
+from typing import Dict, List, Tuple, Optional
 
+import requests
+import streamlit as st
+from openai import OpenAI
+from PIL import Image
+from bs4 import BeautifulSoup, Tag
+from weasyprint import HTML
+import mistune
+
+# 设置 Streamlit 页面基础信息。
 st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout="wide")
+
 
 # ==========================================
 # 模块 2: 全局变量与 API 密钥配置
 # ==========================================
+
+# DeepSeek：用于文本抽取、主报告撰写、研究路线设计、审校。
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
+# Qwen：用于多模态图表分析。
 QWEN_API_KEY = st.secrets["QWEN_API_KEY"]
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
+# Modal 云端 PDF 结构解析服务。
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 
+# 用于论文检索阶段去重，避免同一轮中重复读到同一篇论文。
 seen_paper_ids = set()
 
+# PDF 导出参数。
+# 这些值是本版本针对“图偏大、页首文字裁切、表格分页不稳、留白偏多”重新调过的一组更稳妥的默认值。
 PDF_EXPORT_CONFIG = {
-    "content_width_mm": 170,
+    # 正文版芯宽度。略窄于整页可用宽度，可给表格和图留出呼吸感。
+    "content_width_mm": 172,
+    # A4 页边距。
     "margin_top_mm": 12,
     "margin_right_mm": 14,
     "margin_bottom_mm": 12,
     "margin_left_mm": 14,
-    "body_font_size_px": 14,
-    "body_line_height": 1.88,
-    "figure_max_width_pct": 72,
-    "figure_max_height_mm": 105,
-    "wide_visual_max_width_pct": 88,
-    "wide_visual_max_height_mm": 110,
-    "table_visual_max_width_pct": 94,
-    "table_visual_max_height_mm": 220,
-    "tall_visual_max_width_pct": 66,
-    "tall_visual_max_height_mm": 170,
-    "table_font_size_px": 11,
-    "table_cell_padding_px": 5,
-    "html2canvas_scale": 2,
+    # 正文字号与行高。略紧凑，减少页间稀疏感。
+    "body_font_size_px": 13.5,
+    "body_line_height": 1.80,
+    # 普通图尺寸：进一步缩小，避免架构图过分霸占页面。
+    "figure_max_width_pct": 64,
+    "figure_max_height_mm": 92,
+    # 宽图尺寸：适当放大横向图，但仍控制在稳妥范围内。
+    "wide_visual_max_width_pct": 82,
+    "wide_visual_max_height_mm": 102,
+    # 表格型图片：尽量接近整页宽度，方便一页完整显示。
+    "table_visual_max_width_pct": 96,
+    "table_visual_max_height_mm": 236,
+    # 长图尺寸：收窄宽度，避免高图把一页切得很碎。
+    "tall_visual_max_width_pct": 60,
+    "tall_visual_max_height_mm": 150,
+    # 真 Markdown 表格的字号和内边距。
+    "table_font_size_px": 10,
+    "table_cell_padding_px": 4,
 }
+
+# 章节生成与审校相关配置。
+MAX_SECTION_RETRY = 2
+MAX_AUDIT_ROUNDS = 2
+
 
 # ==========================================
 # 模块 3: 核心 Agent 提示词库
 # ==========================================
+
+# 主报告 Agent：只负责第 1-7 节事实型主报告。
 MAIN_AGENT_PROMPT = """
 你是学术论文深度解读主编。你的任务不是把材料写得更华丽，而是生成一份“研究者可直接使用”的论文全维度报告：读者应当仅凭这份报告就能理解论文的问题、方法、证据、边界，并据此形成后续研究方案。
 
@@ -72,8 +124,8 @@ MAIN_AGENT_PROMPT = """
    ![图X：学术化图注](图片ID)
 8. 表格前后各保留一个空行；表标题必须单独作为一行。
 9. 语言风格保持学术、克制、清晰，不做口语化渲染。
-10. 对未来研究路线，必须给出可执行方案，而不是泛泛愿景。
-11. 当用户只要求你输出某一节或某几节时，你必须只输出对应部分，不要补出其他章节。
+10. 当用户只要求你输出某一节或某几节时，你必须只输出对应部分，不要补出其他章节。
+11. 请不要省略后续章节，不要输出“略”或“同理可得”。
 
 【默认报告结构】
 # 论文全维度深度透视报告
@@ -100,6 +152,7 @@ MAIN_AGENT_PROMPT = """
 区分“作者明确承认的局限”和“从实验设计中可以直接看出的未解决问题”，但后者也必须基于论文证据，而不是外部常识。
 """
 
+# 文本 Agent：只做事实抽取，不做 speculative 创新扩展。
 TEXT_AGENT_PROMPT = """
 你是论文事实抽取专家，不是评论员。你的任务是把论文文本拆成“可验证事实”和“可阅读解释”两层内容，供后续主报告模型调用。
 
@@ -147,6 +200,7 @@ TEXT_AGENT_PROMPT = """
 只写原文明确承认的局限，以及从原文实验设计中可以直接看出的尚未回答问题；不得引入外部观点。
 """
 
+# 视觉 Agent：把每张图或表转成可调用的证据卡。
 VISION_AGENT_PROMPT = """
 你是论文图表证据抽取专家。你会收到一张图或表，以及必要的论文上下文。你的目标不是泛泛“点评”，而是把它转成后续主报告可调用的证据卡。
 
@@ -176,6 +230,7 @@ VISION_AGENT_PROMPT = """
 随后再用一段不超过200字的自然语言，解释这张图/表为什么对理解论文重要。
 """
 
+# 研究路线 Agent：只负责第 8 节，不污染事实层。
 RESEARCH_AGENT_PROMPT = """
 你是后续研究路线设计专家。
 你只能基于以下材料提出研究路线：
@@ -195,6 +250,7 @@ RESEARCH_AGENT_PROMPT = """
 ## 8. 面向后续研究的可执行创新路线
 """
 
+# 审校 Agent：只做核查，不直接改写整篇。
 REPORT_AUDITOR_PROMPT = """
 你是学术报告审校员。请检查以下报告是否存在：
 1. 不被原始 markdown / FACT_BANK / FIGURE_CARD 支持的结论
@@ -202,6 +258,7 @@ REPORT_AUDITOR_PROMPT = """
 3. 漏掉的关键模块、关键实验、关键局限
 4. 将研究设想误写为原文结论
 5. 同一章节内容重复、前后矛盾或与图表证据不一致
+6. 缺失第1-8节中的任意一节
 
 输出格式：
 RESULT: PASS 或 FAIL
@@ -211,7 +268,13 @@ ISSUES:
 """
 
 
-def get_system_prompt(requirements, preprint_rule):
+# ==========================================
+# 模块 4: 论文检索系统提示词
+# ==========================================
+
+
+def get_system_prompt(requirements: str, preprint_rule: str) -> str:
+    """根据用户筛选要求，生成论文检索 Agent 的系统提示词。"""
     if preprint_rule == "仅限同行评审文献 (排除预印本)":
         preprint_prompt = "严禁选择 Venue 为 'Unknown Venue/Preprint' 的预印本论文。"
     else:
@@ -242,9 +305,12 @@ Action格式支持：
 
 
 # ==========================================
-# 模块 4: 工具函数与通用处理库
+# 模块 5: 论文检索工具函数
 # ==========================================
+
+
 def reconstruct_abstract(inverted_index: dict) -> str:
+    """把 OpenAlex 的倒排摘要恢复为自然文本。"""
     if not inverted_index:
         return ""
     word_index = [(pos, word) for word, positions in inverted_index.items() for pos in positions]
@@ -252,12 +318,15 @@ def reconstruct_abstract(inverted_index: dict) -> str:
     return " ".join([word for _, word in word_index])
 
 
+
 def search_and_detail_papers(query: str) -> str:
+    """调用 Semantic Scholar / OpenAlex 搜索近一年论文，并补全摘要。"""
     global seen_paper_ids
     api_key = st.secrets["S2_API_KEY"]
     email = "gaoym3@mails.neu.edu.cn"
     current_year = datetime.datetime.now().year
     start_year = max(current_year - 1, 2024)
+
     s2_url = (
         "https://api.semanticscholar.org/graph/v1/paper/search"
         f"?query={query}&limit=100&year={start_year}-{current_year}"
@@ -266,6 +335,7 @@ def search_and_detail_papers(query: str) -> str:
     headers = {"x-api-key": api_key}
 
     try:
+        # 轻微 sleep，降低被上游接口限流的概率。
         time.sleep(2)
         s2_response = requests.get(s2_url, headers=headers, timeout=20)
         s2_response.raise_for_status()
@@ -275,22 +345,23 @@ def search_and_detail_papers(query: str) -> str:
             return f"Observation: 未找到关于'{query}'的近一年论文。"
 
         results = []
-        for p in papers:
-            paper_id = p.get("paperId", "No ID")
+        for paper in papers:
+            paper_id = paper.get("paperId", "No ID")
             if paper_id in seen_paper_ids:
                 continue
 
-            title = p.get("title", "No Title")
-            doi = p.get("externalIds", {}).get("DOI", "")
-            venue = p.get("venue") or "Unknown Venue/Preprint"
+            title = paper.get("title", "No Title")
+            doi = paper.get("externalIds", {}).get("DOI", "")
+            venue = paper.get("venue") or "Unknown Venue/Preprint"
 
-            s2_abstract = p.get("abstract")
             final_abstract = ""
             openalex_mark = ""
+            s2_abstract = paper.get("abstract")
 
             if s2_abstract and s2_abstract.strip():
                 final_abstract = s2_abstract.strip()
             else:
+                # 若 Semantic Scholar 没摘要，则尝试从 OpenAlex 补全。
                 try:
                     if doi:
                         oa_url = f"https://api.openalex.org/works/https://doi.org/{doi}"
@@ -306,6 +377,7 @@ def search_and_detail_papers(query: str) -> str:
                 except Exception:
                     pass
 
+            # 没有可用摘要时，直接丢弃。
             if not final_abstract or len(final_abstract.strip()) < 10:
                 continue
 
@@ -327,10 +399,70 @@ def search_and_detail_papers(query: str) -> str:
         return f"Observation: 搜索出错 - {str(e)}"
 
 
+# 检索阶段目前只开放一个工具。
 available_tools = {"search_and_detail_papers": search_and_detail_papers}
 
 
+# ==========================================
+# 模块 6: Markdown / 图片 / HTML / PDF 通用工具
+# ==========================================
+
+# Mistune Markdown 渲染器。
+# 这里启用 table 插件，保证 Markdown 表格能稳定转成 HTML 表格。
+MARKDOWN_RENDERER = mistune.create_markdown(
+    renderer=mistune.HTMLRenderer(escape=False),
+    plugins=["table", "strikethrough"],
+)
+
+# 章节规范。
+# 每一节都单独生成，以避免长输出被模型截断。
+SECTION_SPECS = {
+    1: {
+        "title": "研究问题与核心贡献",
+        "task": "定义本文试图解决的核心问题，准确概括相对前人工作的主要创新，并说明这些创新分别改变了哪一个技术瓶颈。",
+        "min_chars": 180,
+    },
+    2: {
+        "title": "背景、研究缺口与前人路线",
+        "task": "还原研究背景、主流路线及其局限，说明本文的问题为什么值得解决，以及它切入的位置在哪里。",
+        "min_chars": 220,
+    },
+    3: {
+        "title": "方法总览与整体数据流",
+        "task": "结合原始文本和图表证据，说明系统从输入到输出的完整链路。若有总架构图，应在这里插入。",
+        "min_chars": 220,
+    },
+    4: {
+        "title": "关键模块逐层机制剖析",
+        "task": "按照模型真实工作顺序拆解关键模块，说明输入、变换、必要性、耦合关系与预期改善问题。若有模块结构图，应在对应段落处插入。",
+        "min_chars": 260,
+    },
+    5: {
+        "title": "实验设计、关键证据与论点验证",
+        "task": "交代数据集、评价指标、对照组、主实验和消融实验。每写一个结论，都要明确指出是哪组结果支持它，并解释这项结果验证了哪条方法主张。",
+        "min_chars": 260,
+    },
+    6: {
+        "title": "复现要点与方法适用边界",
+        "task": "总结复现时最不能忽视的输入条件、训练设置、模块依赖和评测前提，并说明方法适用于什么情形、不适用于什么情形。",
+        "min_chars": 180,
+    },
+    7: {
+        "title": "局限性与未解决问题",
+        "task": "区分作者明确承认的局限，以及从实验设计中可以直接看出的未解决问题，但后者也必须基于论文证据。",
+        "min_chars": 180,
+    },
+    8: {
+        "title": "面向后续研究的可执行创新路线",
+        "task": "给出 3 到 5 条可执行研究路线，每条都要说明缺口、关联模块、可改造方案、预期收益、验证方式和技术风险。",
+        "min_chars": 220,
+    },
+}
+
+
+
 def infer_image_mime(b64_data: str) -> str:
+    """根据 base64 前缀推断图片 MIME 类型。"""
     if b64_data.startswith("/9j/"):
         return "image/jpeg"
     if b64_data.startswith("iVBOR"):
@@ -340,7 +472,9 @@ def infer_image_mime(b64_data: str) -> str:
     return "image/png"
 
 
+
 def strip_code_fences(text: str) -> str:
+    """移除大模型常见的 ```markdown ... ``` 包裹。"""
     if not text:
         return ""
     text = text.strip()
@@ -348,7 +482,9 @@ def strip_code_fences(text: str) -> str:
     return match.group(1).strip() if match else text
 
 
+
 def normalize_markdown_tables(md_text: str) -> str:
+    """保证 Markdown 表格前后有空行，避免渲染器把表格吃坏。"""
     lines = md_text.splitlines()
     normalized = []
     in_table = False
@@ -375,16 +511,22 @@ def normalize_markdown_tables(md_text: str) -> str:
     return "\n".join(normalized)
 
 
+
 def normalize_report_markdown(md_text: str) -> str:
+    """把最终报告 Markdown 规范化，方便前端和 PDF 共用。"""
     text = strip_code_fences(md_text)
+    # 兼容旧式 [REF_IMG: xxx] 占位符，统一转成 Markdown 图片语法。
     text = re.sub(r"\[REF_IMG:\s*(.*?)\]", r"![\1](\1)", text)
+    # 确保图片前后都有空行。
     text = re.sub(r"[ \t]*(!\[[^\]]*\]\([^\)]+\))[ \t]*", r"\n\n\1\n\n", text)
     text = normalize_markdown_tables(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
+
 def build_source_pack(md_content: str, max_chars: int = 52000) -> str:
+    """对超长论文 markdown 做截断保留，但尽量按章节保留完整块。"""
     md_content = md_content.strip()
     if len(md_content) <= max_chars:
         return md_content
@@ -406,15 +548,19 @@ def build_source_pack(md_content: str, max_chars: int = 52000) -> str:
     return "\n\n".join(collected).strip() if collected else md_content[:max_chars]
 
 
-def sort_images_by_doc_order(md_content: str, images_dict: dict):
-    def sort_key(item):
+
+def sort_images_by_doc_order(md_content: str, images_dict: Dict[str, str]) -> List[Tuple[str, str]]:
+    """按图片 ID 在论文 markdown 中出现的先后顺序排序图片，便于视觉分析按文档顺序进行。"""
+    def sort_key(item: Tuple[str, str]) -> int:
         position = md_content.find(item[0])
         return position if position >= 0 else 10 ** 9
 
     return sorted(images_dict.items(), key=sort_key)
 
 
+
 def extract_local_context(md_content: str, image_id: str, window: int = 1800) -> str:
+    """提取图片附近的局部原文上下文，增强 Vision Agent 对图表作用的判断能力。"""
     index = md_content.find(image_id)
     if index == -1:
         return build_source_pack(md_content, max_chars=6000)
@@ -435,14 +581,9 @@ def extract_local_context(md_content: str, image_id: str, window: int = 1800) ->
 """
 
 
-def clean_section_output(text: str, keep_h1: bool = False) -> str:
-    cleaned = normalize_report_markdown(text)
-    if not keep_h1:
-        cleaned = re.sub(r"^#\s+.+?(?:\n+|$)", "", cleaned).strip()
-    return cleaned.strip()
 
-
-def find_matching_image_key(img_key: str, images_dict: dict):
+def find_matching_image_key(img_key: str, images_dict: Dict[str, str]) -> Optional[str]:
+    """兼容图片 ID 的模糊匹配，避免模型输出和真实 ID 有少量差异时找不到图。"""
     if img_key in images_dict:
         return img_key
     for img_name in images_dict:
@@ -451,7 +592,433 @@ def find_matching_image_key(img_key: str, images_dict: dict):
     return None
 
 
-def render_report_with_images(report_md: str, images_dict: dict):
+
+def previous_nonempty_element_sibling(node: Tag) -> Optional[Tag]:
+    """找到前一个非空白元素兄弟节点。"""
+    sibling = node.previous_sibling
+    while sibling is not None:
+        if isinstance(sibling, Tag):
+            return sibling
+        if getattr(sibling, "strip", None) and sibling.strip():
+            return None
+        sibling = sibling.previous_sibling
+    return None
+
+
+
+def image_size_from_base64(b64_data: str) -> Tuple[int, int]:
+    """读取 base64 图片尺寸，供图像分类时使用。"""
+    try:
+        image_bytes = base64.b64decode(b64_data)
+        with Image.open(BytesIO(image_bytes)) as img:
+            return img.size
+    except Exception:
+        return (0, 0)
+
+
+
+def build_figure_html(alt_text: str, b64_data: str) -> str:
+    """把 Markdown 图片占位符替换成带尺寸分类信息的 figure HTML。"""
+    mime_type = infer_image_mime(b64_data)
+    safe_alt = html_lib.escape(alt_text)
+
+    width, height = image_size_from_base64(b64_data)
+    ratio = (width / height) if width and height else 1.0
+
+    classes = ["pdf-figure"]
+    # 若图注写的是“表X”或“Table X”，则视为表格型图片。
+    if re.match(r"^\s*(表|table)\s*\d+", alt_text, flags=re.I):
+        classes.append("table-like")
+    elif ratio >= 1.45:
+        classes.append("wide-visual")
+    elif ratio <= 0.85:
+        classes.append("tall-visual")
+
+    return (
+        "\n"
+        f'<div class="{" ".join(classes)}">'
+        f'<img src="data:{mime_type};base64,{b64_data}" alt="{safe_alt}" />'
+        f'<div class="img-caption">{safe_alt}</div>'
+        "</div>\n"
+    )
+
+
+
+def embed_base64_images(md_text: str, images_dict: Dict[str, str]) -> str:
+    """把报告中的图片占位符替换成真正的内嵌 base64 图像。"""
+
+    def replace_markdown_img(match: re.Match) -> str:
+        alt_text = match.group(1).strip()
+        img_placeholder = match.group(2).strip()
+        matched_key = find_matching_image_key(img_placeholder, images_dict)
+        if matched_key:
+            return build_figure_html(alt_text, images_dict[matched_key])
+        return match.group(0)
+
+    def replace_ref_img(match: re.Match) -> str:
+        img_placeholder = match.group(1).strip()
+        matched_key = find_matching_image_key(img_placeholder, images_dict)
+        if matched_key:
+            return build_figure_html(img_placeholder, images_dict[matched_key])
+        return match.group(0)
+
+    md_text = re.sub(r"!\[(.*?)\]\((.*?)\)", replace_markdown_img, md_text)
+    md_text = re.sub(r"\[REF_IMG:\s*(.*?)\]", replace_ref_img, md_text)
+    return md_text
+
+
+
+def markdown_to_html(md_text: str) -> str:
+    """把 Markdown 转成 HTML。"""
+    return MARKDOWN_RENDERER(md_text)
+
+
+
+def wrap_tables_and_pair_captions(soup: BeautifulSoup) -> None:
+    """把 HTML 表格包装成 table-block，并把前一行表标题吸附到表格上方。"""
+    for table in soup.find_all("table"):
+        if table.parent and isinstance(table.parent, Tag) and "table-wrapper" in (table.parent.get("class") or []):
+            continue
+
+        wrapper = soup.new_tag("div", attrs={"class": "table-wrapper"})
+        block = soup.new_tag("div", attrs={"class": "table-block"})
+
+        table.wrap(wrapper)
+        wrapper.wrap(block)
+
+        prev = previous_nonempty_element_sibling(block)
+        if prev and prev.name == "p":
+            caption_text = prev.get_text(" ", strip=True)
+            if re.match(r"^\s*(表|table)\s*\d+[:：]", caption_text, flags=re.I):
+                classes = prev.get("class", [])
+                prev["class"] = classes + ["table-caption"]
+                prev.extract()
+                block.insert(0, prev)
+
+
+
+def defer_visuals_by_section(soup: BeautifulSoup) -> None:
+    """
+    把图表延后到当前节更靠后的位置。
+
+    这样做的目的是：
+    - 让文字尽量优先填满页面；
+    - 当图表在页末放不下时，文字仍然可以先排进去；
+    - 图表可以顺延到下一页，而不是强制和前一段文字紧贴，减少大块空白。
+    """
+    root = soup.find("div", attrs={"class": "report-shell"})
+    if not root:
+        return
+
+    children = list(root.children)
+    new_children = []
+    pending_visuals = []
+
+    def is_section_boundary(node) -> bool:
+        return isinstance(node, Tag) and node.name in {"h2", "h3"}
+
+    def is_visual_node(node) -> bool:
+        if not isinstance(node, Tag):
+            return False
+        node_classes = set(node.get("class", []))
+        return "pdf-figure" in node_classes or "table-block" in node_classes
+
+    def flush_pending() -> None:
+        nonlocal pending_visuals
+        new_children.extend(pending_visuals)
+        pending_visuals = []
+
+    for node in children:
+        if is_section_boundary(node) and new_children:
+            flush_pending()
+            new_children.append(node.extract())
+            continue
+
+        if is_visual_node(node):
+            pending_visuals.append(node.extract())
+            continue
+
+        new_children.append(node.extract() if isinstance(node, Tag) else node)
+
+    flush_pending()
+    root.clear()
+    for child in new_children:
+        root.append(child)
+
+
+
+def build_pdf_html_document(report_md: str, images_dict: Dict[str, str]) -> str:
+    """
+    生成服务器端 PDF 使用的 HTML 文档。
+
+    这里不再走 html2pdf 的浏览器截图路径，而是直接把 HTML 交给 WeasyPrint。
+    好处是：
+    - 文本是真实文字，不会在分页处被截图裁切；
+    - 分页规则更稳定；
+    - 英文/数字与中文混排时字体控制更可靠。
+    """
+    normalized_md = normalize_report_markdown(report_md)
+    md_with_images = embed_base64_images(normalized_md, images_dict)
+    html_content = markdown_to_html(md_with_images)
+
+    # 用一个 report-shell 容器包裹整个正文，便于 CSS 控制版芯宽度。
+    soup = BeautifulSoup(f'<div class="report-shell">{html_content}</div>', "html.parser")
+
+    # 对 HTML 表格进行包装，并把表标题和表格绑定成一个块。
+    wrap_tables_and_pair_captions(soup)
+
+    # 把图表在节内适度延后，减少页末大空白。
+    defer_visuals_by_section(soup)
+
+    body_html = str(soup)
+
+    # CSS 说明：
+    # 1. font-family 把 Times New Roman 放在最前面，英文和数字优先使用它；
+    # 2. 中文字符因 TNR 不支持，会自动回退到中文字体；
+    # 3. 图表与表格分别用不同样式控制。
+    template = Template(
+        """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <style>
+        @page {
+            size: A4;
+            margin: ${margin_top_mm}mm ${margin_right_mm}mm ${margin_bottom_mm}mm ${margin_left_mm}mm;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: #ffffff;
+            color: #111111;
+        }
+
+        body {
+            font-family: "Times New Roman", "Nimbus Roman No9 L", "Liberation Serif", "Microsoft YaHei", "PingFang SC", "Noto Serif CJK SC", "SimSun", serif;
+            font-size: ${body_font_size_px}px;
+            line-height: ${body_line_height};
+            text-align: justify;
+            text-justify: inter-ideograph;
+        }
+
+        .report-shell {
+            width: ${content_width_mm}mm;
+            max-width: ${content_width_mm}mm;
+            margin: 0 auto;
+        }
+
+        h1, h2, h3, h4 {
+            color: #111111;
+            line-height: 1.38;
+            break-after: avoid-page;
+            page-break-after: avoid;
+            page-break-inside: avoid;
+        }
+
+        h1 {
+            font-size: 29px;
+            margin: 0 0 10mm 0;
+            text-align: left;
+        }
+
+        h2 {
+            font-size: 23px;
+            margin: 8mm 0 4mm 0;
+        }
+
+        h3 {
+            font-size: 18px;
+            margin: 6mm 0 3mm 0;
+        }
+
+        h4 {
+            font-size: 16px;
+            margin: 5mm 0 2.5mm 0;
+        }
+
+        p, li, td, th, blockquote {
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        p {
+            margin: 0 0 0.95em 0;
+            text-indent: 2em;
+            orphans: 3;
+            widows: 3;
+        }
+
+        ul, ol {
+            margin: 0.3em 0 1em 1.2em;
+        }
+
+        li {
+            margin-bottom: 0.4em;
+        }
+
+        pre, code {
+            font-family: "Courier New", "Consolas", monospace;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        blockquote, pre {
+            margin: 4mm 0 5mm 0;
+            break-inside: avoid-page;
+            page-break-inside: avoid;
+        }
+
+        .pdf-figure,
+        .table-block {
+            width: 100%;
+            margin: 4mm 0 5mm 0;
+            break-inside: avoid-page;
+            page-break-inside: avoid;
+        }
+
+        .pdf-figure {
+            text-align: center;
+        }
+
+        .pdf-figure img {
+            display: inline-block;
+            width: auto;
+            height: auto;
+            max-width: ${figure_max_width_pct}%;
+            max-height: ${figure_max_height_mm}mm;
+            object-fit: contain;
+            margin: 0 auto 2mm auto;
+        }
+
+        .pdf-figure.wide-visual img {
+            max-width: ${wide_visual_max_width_pct}%;
+            max-height: ${wide_visual_max_height_mm}mm;
+        }
+
+        .pdf-figure.table-like img {
+            max-width: ${table_visual_max_width_pct}%;
+            max-height: ${table_visual_max_height_mm}mm;
+        }
+
+        .pdf-figure.tall-visual img {
+            max-width: ${tall_visual_max_width_pct}%;
+            max-height: ${tall_visual_max_height_mm}mm;
+        }
+
+        .img-caption,
+        .table-caption {
+            font-size: 12px;
+            text-indent: 0;
+            text-align: center;
+            color: #444444;
+            margin: 1.5mm 0 0 0;
+            font-weight: 600;
+            break-after: avoid-page;
+        }
+
+        .table-block {
+            margin-top: 4mm;
+        }
+
+        .table-caption {
+            margin-bottom: 2.2mm;
+        }
+
+        .table-wrapper {
+            width: 100%;
+            overflow: visible;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            font-size: ${table_font_size_px}px;
+            line-height: 1.42;
+        }
+
+        thead {
+            display: table-header-group;
+        }
+
+        tfoot {
+            display: table-footer-group;
+        }
+
+        tr {
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }
+
+        th, td {
+            border: 1px solid #111111;
+            padding: ${table_cell_padding_px}px ${table_cell_padding_px}px;
+            text-align: center;
+            vertical-align: middle;
+        }
+
+        th {
+            background: #f3f3f3;
+            font-weight: 700;
+        }
+
+        img {
+            max-width: 100%;
+        }
+    </style>
+</head>
+<body>
+    $body_html
+</body>
+</html>
+        """
+    )
+
+    return template.substitute(
+        body_html=body_html,
+        content_width_mm=PDF_EXPORT_CONFIG["content_width_mm"],
+        margin_top_mm=PDF_EXPORT_CONFIG["margin_top_mm"],
+        margin_right_mm=PDF_EXPORT_CONFIG["margin_right_mm"],
+        margin_bottom_mm=PDF_EXPORT_CONFIG["margin_bottom_mm"],
+        margin_left_mm=PDF_EXPORT_CONFIG["margin_left_mm"],
+        body_font_size_px=PDF_EXPORT_CONFIG["body_font_size_px"],
+        body_line_height=PDF_EXPORT_CONFIG["body_line_height"],
+        figure_max_width_pct=PDF_EXPORT_CONFIG["figure_max_width_pct"],
+        figure_max_height_mm=PDF_EXPORT_CONFIG["figure_max_height_mm"],
+        wide_visual_max_width_pct=PDF_EXPORT_CONFIG["wide_visual_max_width_pct"],
+        wide_visual_max_height_mm=PDF_EXPORT_CONFIG["wide_visual_max_height_mm"],
+        table_visual_max_width_pct=PDF_EXPORT_CONFIG["table_visual_max_width_pct"],
+        table_visual_max_height_mm=PDF_EXPORT_CONFIG["table_visual_max_height_mm"],
+        tall_visual_max_width_pct=PDF_EXPORT_CONFIG["tall_visual_max_width_pct"],
+        tall_visual_max_height_mm=PDF_EXPORT_CONFIG["tall_visual_max_height_mm"],
+        table_font_size_px=PDF_EXPORT_CONFIG["table_font_size_px"],
+        table_cell_padding_px=PDF_EXPORT_CONFIG["table_cell_padding_px"],
+    )
+
+
+
+def generate_pdf_bytes_from_markdown(report_md: str, images_dict: Dict[str, str]) -> bytes:
+    """用 WeasyPrint 在服务器端直接生成 PDF 字节流。"""
+    html_document = build_pdf_html_document(report_md, images_dict)
+    return HTML(string=html_document).write_pdf()
+
+
+@st.cache_data(show_spinner=False)
+def build_pdf_bytes_cached(report_md: str, images_items: Tuple[Tuple[str, str], ...]) -> bytes:
+    """
+    缓存 PDF 生成结果。
+
+    Streamlit 每次 rerun 都可能重新渲染页面，缓存后可避免重复生成 PDF。
+    """
+    images_dict = dict(images_items)
+    return generate_pdf_bytes_from_markdown(report_md, images_dict)
+
+
+
+def render_report_with_images(report_md: str, images_dict: Dict[str, str]) -> None:
+    """在 Streamlit 页面内渲染报告，并把图片占位符替换成实际图片。"""
     normalized_report = normalize_report_markdown(report_md)
     pattern = r"(\[REF_IMG:\s*.*?\]|!\[.*?\]\(.*?\))"
     sections = re.split(pattern, normalized_report)
@@ -476,517 +1043,25 @@ def render_report_with_images(report_md: str, images_dict: dict):
 
         matched_key = find_matching_image_key(img_key, images_dict)
         if matched_key:
-            st.image(
-                base64.b64decode(images_dict[matched_key]),
-                caption=alt_text,
-                use_container_width=True,
-            )
+            st.image(base64.b64decode(images_dict[matched_key]), caption=alt_text, use_container_width=True)
         else:
             st.markdown(section)
 
 
-def build_figure_html(alt_text: str, b64_data: str) -> str:
-    mime_type = infer_image_mime(b64_data)
-    safe_alt = html_lib.escape(alt_text)
-    kind = "table" if re.match(r"^\s*(表|table)\s*\d+", alt_text, flags=re.I) else "figure"
-    return (
-        "\n"
-        f'<div class="pdf-figure" data-kind="{kind}">'
-        f'<img src="data:{mime_type};base64,{b64_data}" alt="{safe_alt}" />'
-        f'<div class="img-caption">{safe_alt}</div>'
-        "</div>\n"
-    )
-
-
-def embed_base64_images(md_text, images_dict):
-    def replace_markdown_img(match):
-        alt_text = match.group(1).strip()
-        img_placeholder = match.group(2).strip()
-        matched_key = find_matching_image_key(img_placeholder, images_dict)
-        if matched_key:
-            return build_figure_html(alt_text, images_dict[matched_key])
-        return match.group(0)
-
-    def replace_ref_img(match):
-        img_placeholder = match.group(1).strip()
-        matched_key = find_matching_image_key(img_placeholder, images_dict)
-        if matched_key:
-            return build_figure_html(img_placeholder, images_dict[matched_key])
-        return match.group(0)
-
-    md_text = re.sub(r"!\[(.*?)\]\((.*?)\)", replace_markdown_img, md_text)
-    md_text = re.sub(r"\[REF_IMG:\s*(.*?)\]", replace_ref_img, md_text)
-    return md_text
-
-
-def download_pdf_component(md_text):
-    md_text = normalize_report_markdown(md_text)
-    html_content = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
-    html_content = re.sub(
-        r"(<table>.*?</table>)",
-        r'<div class="table-wrapper">\1</div>',
-        html_content,
-        flags=re.DOTALL,
-    )
-    safe_html_content = html_content.replace("$", "$$")
-
-    template = Template(
-        """
-    <html>
-    <head>
-        <meta charset="utf-8" />
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-        <style>
-            * {
-                box-sizing: border-box;
-            }
-
-            html, body {
-                margin: 0;
-                padding: 0;
-                background: #ffffff;
-                color: #111111;
-                font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Serif CJK SC', 'SimSun', serif;
-                line-height: $body_line_height;
-            }
-
-            body {
-                padding: 12px;
-            }
-
-            #report-source {
-                display: none;
-            }
-
-            #pdf-stage {
-                position: fixed;
-                left: -240vw;
-                top: 0;
-                width: ${content_width_mm}mm;
-                background: #ffffff;
-                z-index: -1;
-            }
-
-            .report-shell {
-                width: ${content_width_mm}mm;
-                min-width: ${content_width_mm}mm;
-                max-width: ${content_width_mm}mm;
-                margin: 0 auto;
-                background: #ffffff;
-                color: #111111;
-                font-size: ${body_font_size_px}px;
-                text-align: justify;
-                text-justify: inter-ideograph;
-                overflow: visible;
-            }
-
-            h1, h2, h3, h4 {
-                color: #111111;
-                margin: 22px 0 12px;
-                line-height: 1.4;
-                page-break-after: avoid;
-                break-after: avoid;
-            }
-
-            h1 {
-                margin-top: 4px;
-                font-size: 30px;
-            }
-
-            h2 {
-                margin-top: 26px;
-                font-size: 24px;
-            }
-
-            h3 {
-                margin-top: 20px;
-                font-size: 20px;
-            }
-
-            p, li, blockquote, td, th {
-                word-break: break-word;
-                overflow-wrap: anywhere;
-                white-space: normal;
-            }
-
-            p {
-                text-indent: 2em;
-                margin: 0 0 0.95em;
-                padding-bottom: 1px;
-            }
-
-            .pdf-figure,
-            .table-block,
-            pre,
-            blockquote {
-                width: 100%;
-                max-width: 100%;
-                margin: 16px 0 20px;
-            }
-
-            .pdf-figure,
-            .table-block {
-                page-break-inside: avoid;
-                break-inside: avoid;
-            }
-
-            .pdf-figure {
-                text-align: center;
-            }
-
-            .pdf-figure img {
-                display: inline-block;
-                width: auto;
-                max-width: ${figure_max_width_pct}%;
-                height: auto;
-                max-height: ${figure_max_height_mm}mm;
-                object-fit: contain;
-                margin: 0 auto 6px;
-            }
-
-            .pdf-figure.wide-visual img {
-                max-width: ${wide_visual_max_width_pct}%;
-                max-height: ${wide_visual_max_height_mm}mm;
-            }
-
-            .pdf-figure.table-like img {
-                max-width: ${table_visual_max_width_pct}%;
-                max-height: ${table_visual_max_height_mm}mm;
-            }
-
-            .pdf-figure.tall-visual img {
-                max-width: ${tall_visual_max_width_pct}%;
-                max-height: ${tall_visual_max_height_mm}mm;
-            }
-
-            img {
-                display: block;
-                width: auto;
-                height: auto;
-                max-width: 100%;
-            }
-
-            .img-caption,
-            .table-caption {
-                text-indent: 0;
-                text-align: center;
-                font-size: 12px;
-                color: #555555;
-                margin-top: 4px;
-                margin-bottom: 0;
-                font-weight: 600;
-            }
-
-            .table-block {
-                margin-top: 14px;
-            }
-
-            .table-caption {
-                margin-bottom: 8px;
-            }
-
-            .table-wrapper {
-                width: 100%;
-                overflow: visible;
-            }
-
-            table {
-                width: 100% !important;
-                max-width: 100%;
-                border-collapse: collapse;
-                table-layout: fixed;
-                margin: 0 auto;
-                font-size: ${table_font_size_px}px;
-                line-height: 1.5;
-                page-break-inside: avoid;
-                break-inside: avoid;
-            }
-
-            thead {
-                display: table-header-group;
-            }
-
-            tr {
-                page-break-inside: avoid;
-                break-inside: avoid;
-            }
-
-            th, td {
-                border: 1px solid #111111;
-                padding: ${table_cell_padding_px}px ${table_cell_padding_px}px;
-                text-align: center;
-                vertical-align: middle;
-            }
-
-            th {
-                background: #f5f5f5;
-                font-weight: 700;
-            }
-
-            pre, code {
-                white-space: pre-wrap;
-                word-break: break-word;
-            }
-
-            .download-btn {
-                display: block;
-                width: 100%;
-                padding: 12px;
-                background-color: #4CAF50;
-                color: #ffffff;
-                border: none;
-                border-radius: 4px;
-                font-size: 16px;
-                cursor: pointer;
-                font-weight: 700;
-            }
-
-            .download-btn:hover {
-                background-color: #45a049;
-            }
-        </style>
-    </head>
-    <body>
-        <button class="download-btn" onclick="generatePDF()">📥 导出标准版学术 PDF 报告</button>
-
-        <div id="report-source">
-            <div class="report-shell">$html_content</div>
-        </div>
-        <div id="pdf-stage"></div>
-
-        <script>
-            function sleep(ms) {
-                return new Promise(resolve => setTimeout(resolve, ms));
-            }
-
-            async function waitForImages(root) {
-                const images = Array.from(root.querySelectorAll('img'));
-                await Promise.all(images.map((img) => {
-                    if (img.complete) {
-                        return Promise.resolve();
-                    }
-                    return new Promise((resolve) => {
-                        const done = () => resolve();
-                        img.onload = done;
-                        img.onerror = done;
-                    });
-                }));
-            }
-
-            function cleanupEmptyParagraphs(root) {
-                Array.from(root.querySelectorAll('p')).forEach((p) => {
-                    const text = (p.textContent || '').trim();
-                    if (!text && !p.querySelector('img')) {
-                        p.remove();
-                    }
-                });
-            }
-
-            function classifyFigures(root) {
-                const figures = Array.from(root.querySelectorAll('.pdf-figure'));
-                figures.forEach((figure) => {
-                    const img = figure.querySelector('img');
-                    const captionNode = figure.querySelector('.img-caption');
-                    const caption = captionNode ? (captionNode.textContent || '').trim() : '';
-                    const declaredKind = (figure.dataset.kind || '').toLowerCase();
-
-                    if (declaredKind === 'table' || /^(表|table)\\s*\\d+[:：]/i.test(caption)) {
-                        figure.classList.add('table-like');
-                    }
-
-                    if (img && img.naturalWidth && img.naturalHeight) {
-                        const ratio = img.naturalWidth / img.naturalHeight;
-                        if (ratio >= 1.45) {
-                            figure.classList.add('wide-visual');
-                        }
-                        if (ratio <= 0.85) {
-                            figure.classList.add('tall-visual');
-                        }
-                    }
-                });
-            }
-
-            function pairTableCaptions(root) {
-                const wrappers = Array.from(root.querySelectorAll('.table-wrapper'));
-                wrappers.forEach((wrapper) => {
-                    if (wrapper.parentElement && wrapper.parentElement.classList.contains('table-block')) {
-                        return;
-                    }
-
-                    const block = document.createElement('div');
-                    block.className = 'table-block';
-
-                    const prev = wrapper.previousElementSibling;
-                    let captionNode = null;
-                    if (prev && prev.tagName === 'P') {
-                        const captionText = (prev.textContent || '').trim();
-                        if (/^(表|table)\\s*\\d+[:：]/i.test(captionText)) {
-                            captionNode = prev;
-                            captionNode.classList.add('table-caption');
-                        }
-                    }
-
-                    if (captionNode) {
-                        captionNode.parentNode.insertBefore(block, captionNode);
-                        block.appendChild(captionNode);
-                    } else {
-                        wrapper.parentNode.insertBefore(block, wrapper);
-                    }
-                    block.appendChild(wrapper);
-                });
-            }
-
-            function deferVisualsBySection(root) {
-                const children = Array.from(root.children);
-                const fragment = document.createDocumentFragment();
-                let pendingVisuals = [];
-
-                function isSectionBoundary(node) {
-                    return node.tagName === 'H2' || node.tagName === 'H3';
-                }
-
-                function isVisualNode(node) {
-                    return node.classList && (
-                        node.classList.contains('pdf-figure') ||
-                        node.classList.contains('table-block')
-                    );
-                }
-
-                function flushVisuals() {
-                    pendingVisuals.forEach((node) => fragment.appendChild(node));
-                    pendingVisuals = [];
-                }
-
-                children.forEach((node) => {
-                    if (isSectionBoundary(node) && fragment.childNodes.length > 0) {
-                        flushVisuals();
-                        fragment.appendChild(node);
-                        return;
-                    }
-                    if (isVisualNode(node)) {
-                        pendingVisuals.push(node);
-                        return;
-                    }
-                    fragment.appendChild(node);
-                });
-
-                flushVisuals();
-                root.innerHTML = '';
-                root.appendChild(fragment);
-            }
-
-            function buildPdfDom() {
-                const stage = document.getElementById('pdf-stage');
-                const source = document.getElementById('report-source');
-                stage.innerHTML = source.innerHTML;
-                const root = stage.querySelector('.report-shell');
-                cleanupEmptyParagraphs(root);
-                pairTableCaptions(root);
-                classifyFigures(root);
-                deferVisualsBySection(root);
-                cleanupEmptyParagraphs(root);
-                return root;
-            }
-
-            async function generatePDF() {
-                const element = buildPdfDom();
-                await sleep(120);
-
-                if (document.fonts && document.fonts.ready) {
-                    try {
-                        await document.fonts.ready;
-                    } catch (e) {}
-                }
-
-                await waitForImages(element);
-                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-
-                const opt = {
-                    margin: [$margin_top_mm, $margin_right_mm, $margin_bottom_mm, $margin_left_mm],
-                    filename: '论文深度透视报告.pdf',
-                    image: { type: 'jpeg', quality: 0.97 },
-                    html2canvas: {
-                        scale: $html2canvas_scale,
-                        useCORS: true,
-                        scrollX: 0,
-                        scrollY: 0,
-                        windowWidth: Math.ceil(element.scrollWidth + 8)
-                    },
-                    jsPDF: {
-                        unit: 'mm',
-                        format: 'a4',
-                        orientation: 'portrait',
-                        compress: true
-                    },
-                    pagebreak: {
-                        mode: ['css'],
-                        avoid: ['.pdf-figure', '.table-block', 'pre', 'blockquote']
-                    }
-                };
-
-                try {
-                    await html2pdf().set(opt).from(element).save();
-                } finally {
-                    document.getElementById('pdf-stage').innerHTML = '';
-                }
-            }
-        </script>
-    </body>
-    </html>
-        """
-    )
-
-    html_code = template.substitute(
-        html_content=safe_html_content,
-        content_width_mm=PDF_EXPORT_CONFIG["content_width_mm"],
-        margin_top_mm=PDF_EXPORT_CONFIG["margin_top_mm"],
-        margin_right_mm=PDF_EXPORT_CONFIG["margin_right_mm"],
-        margin_bottom_mm=PDF_EXPORT_CONFIG["margin_bottom_mm"],
-        margin_left_mm=PDF_EXPORT_CONFIG["margin_left_mm"],
-        body_font_size_px=PDF_EXPORT_CONFIG["body_font_size_px"],
-        body_line_height=PDF_EXPORT_CONFIG["body_line_height"],
-        figure_max_width_pct=PDF_EXPORT_CONFIG["figure_max_width_pct"],
-        figure_max_height_mm=PDF_EXPORT_CONFIG["figure_max_height_mm"],
-        wide_visual_max_width_pct=PDF_EXPORT_CONFIG["wide_visual_max_width_pct"],
-        wide_visual_max_height_mm=PDF_EXPORT_CONFIG["wide_visual_max_height_mm"],
-        table_visual_max_width_pct=PDF_EXPORT_CONFIG["table_visual_max_width_pct"],
-        table_visual_max_height_mm=PDF_EXPORT_CONFIG["table_visual_max_height_mm"],
-        tall_visual_max_width_pct=PDF_EXPORT_CONFIG["tall_visual_max_width_pct"],
-        tall_visual_max_height_mm=PDF_EXPORT_CONFIG["tall_visual_max_height_mm"],
-        table_font_size_px=PDF_EXPORT_CONFIG["table_font_size_px"],
-        table_cell_padding_px=PDF_EXPORT_CONFIG["table_cell_padding_px"],
-        html2canvas_scale=PDF_EXPORT_CONFIG["html2canvas_scale"],
-    )
-    components.html(html_code, height=90, scrolling=False)
-
-
-def analyze_pdf_with_modal(pdf_file_bytes):
-    with st.spinner("正在唤醒云端 GPU 引擎，深度解析公式与版面... "):
-        try:
-            files_payload = {"file": ("paper.pdf", pdf_file_bytes, "application/pdf")}
-            response = requests.post(MODAL_API_URL, files=files_payload, timeout=600)
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("status") == "success":
-                    return result
-                st.error(f"解析内部错误: {result.get('message')}")
-            else:
-                st.error(f"服务器响应错误: {response.status_code}")
-        except Exception as e:
-            st.error(f"连接云端失败: {str(e)}")
-    return None
-
-
 # ==========================================
-# 模块 5: LLM 客户端类
+# 模块 7: LLM 客户端类
 # ==========================================
+
 class LLMClient:
-    def __init__(self, sys_prompt, model="deepseek-chat", api_key="", base_url=""):
+    """对 OpenAI 兼容接口做一个轻量封装，统一普通生成和多模态生成。"""
+
+    def __init__(self, sys_prompt: str, model: str = "deepseek-chat", api_key: str = "", base_url: str = ""):
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.sys_prompt = sys_prompt
 
-    def generate(self, prompt_history):
+    def generate(self, prompt_history: List[str]) -> str:
+        """普通文本生成。"""
         messages = [{"role": "system", "content": self.sys_prompt}]
         for msg in prompt_history:
             messages.append({"role": "user", "content": msg})
@@ -1005,7 +1080,8 @@ class LLMClient:
                 else:
                     raise e
 
-    def generate_with_images(self, user_prompt, base64_images):
+    def generate_with_images(self, user_prompt: str, base64_images: List[str]) -> str:
+        """多模态生成：文本 + 图片。"""
         messages = [{"role": "system", "content": self.sys_prompt}]
         content_list = [{"type": "text", "text": user_prompt}]
         for b64 in base64_images:
@@ -1034,20 +1110,138 @@ class LLMClient:
 
 
 # ==========================================
-# 模块 6: 论文精读与渲染管线
+# 模块 8: 报告生成、完整性校验与审校修补
 # ==========================================
-SECTION_TASKS = [
-    "请只输出以下内容，不要输出其他章节：\n# 论文全维度深度透视报告\n\n## 1. 研究问题与核心贡献",
-    "请只输出以下内容，不要输出其他章节：\n## 2. 背景、研究缺口与前人路线",
-    "请只输出以下内容，不要输出其他章节：\n## 3. 方法总览与整体数据流",
-    "请只输出以下内容，不要输出其他章节：\n## 4. 关键模块逐层机制剖析",
-    "请只输出以下内容，不要输出其他章节：\n## 5. 实验设计、关键证据与论点验证",
-    "请只输出以下内容，不要输出其他章节：\n## 6. 复现要点与方法适用边界",
-    "请只输出以下内容，不要输出其他章节：\n## 7. 局限性与未解决问题",
-]
 
 
-def generate_visual_evidence(md_content: str, ordered_images):
+def remove_leading_headings(text: str) -> str:
+    """去掉模型输出最前面多余的 H1/H2 标题，后续统一由程序补回标准标题。"""
+    lines = strip_code_fences(text).strip().splitlines()
+    while lines and re.match(r"^#{1,6}\s+", lines[0].strip()):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+
+def remove_extra_top_sections(text: str) -> str:
+    """如果模型在当前章节后又顺手写了下一节，这里把多余部分截掉。"""
+    parts = re.split(r"^##\s*[1-8]\.\s+.*$", text, maxsplit=1, flags=re.M)
+    return parts[0].strip()
+
+
+
+def ensure_section_heading(section_number: int, raw_text: str) -> str:
+    """强制把某一节包装成标准标题格式。"""
+    section_title = SECTION_SPECS[section_number]["title"]
+    include_report_title = section_number == 1
+
+    body = remove_leading_headings(raw_text)
+    body = re.sub(r"^#\s+论文全维度深度透视报告\s*", "", body, flags=re.M).strip()
+    body = remove_extra_top_sections(body)
+
+    prefix = "# 论文全维度深度透视报告\n\n" if include_report_title else ""
+    expected_heading = f"## {section_number}. {section_title}"
+    final_text = f"{prefix}{expected_heading}\n\n{body}".strip()
+    return normalize_report_markdown(final_text)
+
+
+
+def section_body_text(section_md: str) -> str:
+    """取出章节正文，不含 H1/H2 标题，用于判断内容是否过短。"""
+    lines = section_md.splitlines()
+    body_lines = []
+    for line in lines:
+        if re.match(r"^#{1,2}\s+", line.strip()):
+            continue
+        body_lines.append(line)
+    return "\n".join(body_lines).strip()
+
+
+
+def section_is_sufficient(section_number: int, section_md: str) -> bool:
+    """判断某一节是否足够完整。"""
+    expected_heading = f"## {section_number}. {SECTION_SPECS[section_number]['title']}"
+    body = section_body_text(section_md)
+    return expected_heading in section_md and len(body) >= SECTION_SPECS[section_number]["min_chars"]
+
+
+
+def build_previous_sections_excerpt(section_map: Dict[int, str], current_section_number: int, max_chars: int = 16000) -> str:
+    """为当前章节提供少量前文上下文，帮助章节衔接自然。"""
+    ordered = [section_map[num] for num in sorted(section_map) if num < current_section_number and section_map.get(num)]
+    joined = "\n\n".join(ordered)
+    return joined[-max_chars:] if len(joined) > max_chars else joined
+
+
+
+def assemble_report_from_section_map(section_map: Dict[int, str]) -> str:
+    """按 1-8 节顺序组装完整报告。"""
+    ordered_sections = [section_map[num].strip() for num in range(1, 9) if section_map.get(num)]
+    return normalize_report_markdown("\n\n".join(ordered_sections))
+
+
+
+def generate_single_section(
+    agent: LLMClient,
+    combined_prompt: str,
+    section_number: int,
+    section_map: Dict[int, str],
+    extra_notes: str = "",
+    current_draft: str = "",
+) -> str:
+    """
+    单独生成某一节。
+
+    这是防止“只生成前 4-5 节就截断”的关键：
+    每一节单独请求模型，保证单次输出不会过长。
+    """
+    section_title = SECTION_SPECS[section_number]["title"]
+    task = SECTION_SPECS[section_number]["task"]
+    previous_excerpt = build_previous_sections_excerpt(section_map, section_number)
+    expected_heading = f"## {section_number}. {section_title}"
+
+    final_candidate = current_draft.strip()
+
+    for attempt in range(MAX_SECTION_RETRY):
+        retry_note = "" if attempt == 0 else "请把本节写得更完整，确保不要遗漏关键证据、关键模块或关键实验。"
+        prompt = f"""
+{combined_prompt}
+
+【已经生成的前文（仅供衔接参考）】
+{previous_excerpt if previous_excerpt else '暂无前文'}
+
+【当前章节必须输出的标准标题】
+{expected_heading}
+
+【当前章节写作任务】
+{task}
+
+【补充要求】
+{extra_notes if extra_notes else '无'}
+{retry_note}
+
+【当前章节旧稿】
+{current_draft if current_draft else '无'}
+
+请只输出当前章节，不要输出其他章节，不要重复前文，不要提前写下一节。
+"""
+        raw = agent.generate([prompt])
+        candidate = ensure_section_heading(section_number, raw)
+        final_candidate = candidate
+
+        if section_is_sufficient(section_number, candidate):
+            break
+
+        current_draft = candidate
+
+    return final_candidate
+
+
+
+def generate_visual_evidence(md_content: str, ordered_images: List[Tuple[str, str]]) -> str:
+    """为每张图片生成 FIGURE_CARD。"""
     if not ordered_images:
         return "无可用图表。"
 
@@ -1083,32 +1277,202 @@ def generate_visual_evidence(md_content: str, ordered_images):
     return "\n\n".join(cards)
 
 
-def generate_sectional_main_report(main_agent: LLMClient, combined_prompt: str) -> str:
-    parts = []
 
-    for idx, task in enumerate(SECTION_TASKS):
-        completed_context = "\n\n".join(parts)
-        if len(completed_context) > 18000:
-            completed_context = completed_context[-18000:]
+def generate_initial_section_map(
+    combined_prompt: str,
+    main_agent: LLMClient,
+    research_agent: LLMClient,
+) -> Dict[int, str]:
+    """先生成完整的 1-8 节 section_map。"""
+    section_map: Dict[int, str] = {}
 
-        prompt = f"""
-{combined_prompt}
+    # 先生成第 1-7 节事实型主报告。
+    for section_number in range(1, 8):
+        section_map[section_number] = generate_single_section(
+            agent=main_agent,
+            combined_prompt=combined_prompt,
+            section_number=section_number,
+            section_map=section_map,
+        )
 
-【已完成章节（仅供衔接参考）】
-{completed_context if completed_context else '尚无已完成章节'}
+    # 再生成第 8 节研究路线。
+    section_map[8] = generate_single_section(
+        agent=research_agent,
+        combined_prompt=combined_prompt + "\n\n请明确：第8节属于基于本文机制的研究设想，不是原文结论。",
+        section_number=8,
+        section_map=section_map,
+    )
 
-【当前写作任务】
-{task}
+    return section_map
+
+
+
+def ensure_section_map_complete(
+    section_map: Dict[int, str],
+    combined_prompt: str,
+    main_agent: LLMClient,
+    research_agent: LLMClient,
+) -> Dict[int, str]:
+    """
+    检查 1-8 节是否都存在且不过短。
+
+    这是针对“为什么只显示前 5 节就结束了”这一问题增加的硬校验。
+    即便某一轮模型漏掉了某节，这里也会定向补写缺失章节。
+    """
+    for section_number in range(1, 9):
+        needs_regen = not section_map.get(section_number) or not section_is_sufficient(section_number, section_map[section_number])
+        if needs_regen:
+            target_agent = research_agent if section_number == 8 else main_agent
+            extra_notes = "请确保本节独立完整，不要遗漏。"
+            section_map[section_number] = generate_single_section(
+                agent=target_agent,
+                combined_prompt=combined_prompt,
+                section_number=section_number,
+                section_map=section_map,
+                extra_notes=extra_notes,
+                current_draft=section_map.get(section_number, ""),
+            )
+    return section_map
+
+
+
+def extract_target_sections_from_audit(audit_text: str) -> List[int]:
+    """从审校意见中提取可能需要修补的章节编号。"""
+    targets = set()
+
+    for num in re.findall(r"第\s*([1-8])\s*节", audit_text):
+        targets.add(int(num))
+    for num in re.findall(r"##\s*([1-8])\.", audit_text):
+        targets.add(int(num))
+
+    # 若审校文本没有明确点名章节，就根据关键词做一层弱映射。
+    keyword_map = {
+        1: ["核心贡献", "研究问题"],
+        2: ["背景", "前人路线", "研究缺口"],
+        3: ["方法总览", "整体数据流"],
+        4: ["关键模块", "机制剖析"],
+        5: ["实验", "消融", "关键证据"],
+        6: ["复现", "适用边界"],
+        7: ["局限", "未解决问题"],
+        8: ["研究路线", "创新路线"],
+    }
+    lowered = audit_text.lower()
+    for num, keywords in keyword_map.items():
+        if any(keyword.lower() in lowered for keyword in keywords):
+            targets.add(num)
+
+    return sorted(targets)
+
+
+
+def audit_and_refine_report(
+    section_map: Dict[int, str],
+    combined_prompt: str,
+    source_pack: str,
+    text_report: str,
+    vision_summaries: str,
+    available_img_ids: str,
+    main_agent: LLMClient,
+    research_agent: LLMClient,
+    auditor: LLMClient,
+) -> Tuple[Dict[int, str], str]:
+    """
+    审校并定向修补 section_map。
+
+    这里故意不做“整篇重新生成”，因为那会再次触发长文本截断。
+    如果审校失败，只修对应章节。
+    """
+    last_audit_result = ""
+
+    for _ in range(MAX_AUDIT_ROUNDS):
+        section_map = ensure_section_map_complete(section_map, combined_prompt, main_agent, research_agent)
+        final_report = assemble_report_from_section_map(section_map)
+
+        audit_prompt = f"""
+【原始 markdown】
+{source_pack}
+
+【Text Agent 输出】
+{text_report}
+
+【Vision Agent 输出】
+{vision_summaries}
+
+【当前报告】
+{final_report}
+
+【合法图片ID】
+{available_img_ids}
 """
-        part = main_agent.generate([prompt])
-        cleaned = clean_section_output(part, keep_h1=(idx == 0))
-        parts.append(cleaned)
+        audit_result = auditor.generate([audit_prompt])
+        last_audit_result = audit_result
 
-    return normalize_report_markdown("\n\n".join([p for p in parts if p.strip()]))
+        if not re.search(r"RESULT\s*:\s*FAIL", audit_result, flags=re.I):
+            break
+
+        targets = extract_target_sections_from_audit(audit_result)
+        if not targets:
+            targets = list(range(1, 9))
+
+        for section_number in targets:
+            target_agent = research_agent if section_number == 8 else main_agent
+            section_map[section_number] = generate_single_section(
+                agent=target_agent,
+                combined_prompt=combined_prompt,
+                section_number=section_number,
+                section_map=section_map,
+                extra_notes=f"请针对以下审校意见修订本节，并只输出本节：\n{audit_result}",
+                current_draft=section_map.get(section_number, ""),
+            )
+
+    section_map = ensure_section_map_complete(section_map, combined_prompt, main_agent, research_agent)
+    return section_map, last_audit_result
 
 
-def render_analysis_ui(pdf_bytes):
+# ==========================================
+# 模块 9: PDF 结构解析服务调用
+# ==========================================
+
+
+def analyze_pdf_with_modal(pdf_file_bytes: bytes):
+    """把用户上传的 PDF 发送到云端解析服务，获取结构化 markdown 与图片。"""
+    with st.spinner("正在唤醒云端 GPU 引擎，深度解析公式与版面... "):
+        try:
+            files_payload = {"file": ("paper.pdf", pdf_file_bytes, "application/pdf")}
+            response = requests.post(MODAL_API_URL, files=files_payload, timeout=600)
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("status") == "success":
+                    return result
+                st.error(f"解析内部错误: {result.get('message')}")
+            else:
+                st.error(f"服务器响应错误: {response.status_code}")
+        except Exception as e:
+            st.error(f"连接云端失败: {str(e)}")
+    return None
+
+
+# ==========================================
+# 模块 10: 论文精读主流程
+# ==========================================
+
+
+def render_analysis_ui(pdf_bytes: bytes) -> None:
+    """
+    论文精读工作流总入口。
+
+    整个流程：
+    1. 解析 PDF -> markdown + 图片
+    2. 文本 Agent 做 FACT_BANK 抽取
+    3. 视觉 Agent 生成 FIGURE_CARD
+    4. 主报告 Agent 分章节生成 1-7 节
+    5. 研究路线 Agent 生成第 8 节
+    6. 完整性校验 + 审校 + 定向修补
+    7. 页面渲染 + Markdown/PDF 下载
+    """
     file_hash = hash(pdf_bytes)
+
+    # 只有当上传的 PDF 发生变化时，才重新跑整套解析与生成。
     if st.session_state.get("current_pdf_hash") != file_hash:
         st.session_state.current_pdf_hash = file_hash
         st.session_state.final_main_report = ""
@@ -1116,6 +1480,7 @@ def render_analysis_ui(pdf_bytes):
         st.session_state.final_text_report = ""
         st.session_state.final_vision_reports = ""
         st.session_state.source_md_content = ""
+        st.session_state.final_audit_result = ""
 
         result = analyze_pdf_with_modal(pdf_bytes)
         if result and result.get("status") == "success":
@@ -1127,20 +1492,30 @@ def render_analysis_ui(pdf_bytes):
             st.session_state.source_md_content = md_content
             st.session_state.temp_images = ordered_images_dict
 
+            # --------------------
+            # 步骤 1：文本事实抽取
+            # --------------------
             with st.spinner("文本专家正在抽取论文事实、方法与实验证据..."):
                 text_agent = LLMClient(
                     sys_prompt=TEXT_AGENT_PROMPT,
                     api_key=DEEPSEEK_API_KEY,
                     base_url=DEEPSEEK_BASE_URL,
                 )
-                text_prompt = f"请严格按系统提示完成论文事实抽取。以下为论文原始结构化 markdown：\n\n{build_source_pack(md_content, max_chars=60000)}"
+                text_prompt = (
+                    "请严格按系统提示完成论文事实抽取。以下为论文原始结构化 markdown：\n\n"
+                    f"{build_source_pack(md_content, max_chars=60000)}"
+                )
                 text_report = text_agent.generate([text_prompt])
                 st.session_state.final_text_report = text_report
 
+            # --------------------
+            # 步骤 2：图表证据抽取
+            # --------------------
             with st.spinner(f"视觉专家正在分析 {len(ordered_images)} 张关键图表，并补齐局部上下文..."):
                 vision_summaries = generate_visual_evidence(md_content, ordered_images)
                 st.session_state.final_vision_reports = vision_summaries
 
+            # 构造主报告阶段的统一上下文包。
             available_img_ids = "\n".join([f"- {name}" for name, _ in ordered_images]) if ordered_images else "无可用图片"
             source_pack = build_source_pack(md_content, max_chars=52000)
             combined_prompt = f"""
@@ -1157,76 +1532,56 @@ def render_analysis_ui(pdf_bytes):
 {available_img_ids}
 """
 
-            with st.spinner("主编代理正在分章节生成第 1-7 节研究型报告..."):
-                main_agent = LLMClient(
-                    sys_prompt=MAIN_AGENT_PROMPT,
-                    api_key=DEEPSEEK_API_KEY,
-                    base_url=DEEPSEEK_BASE_URL,
+            # --------------------
+            # 步骤 3：初始化大模型客户端
+            # --------------------
+            main_agent = LLMClient(
+                sys_prompt=MAIN_AGENT_PROMPT,
+                api_key=DEEPSEEK_API_KEY,
+                base_url=DEEPSEEK_BASE_URL,
+            )
+            research_agent = LLMClient(
+                sys_prompt=RESEARCH_AGENT_PROMPT,
+                api_key=DEEPSEEK_API_KEY,
+                base_url=DEEPSEEK_BASE_URL,
+            )
+            auditor = LLMClient(
+                sys_prompt=REPORT_AUDITOR_PROMPT,
+                api_key=DEEPSEEK_API_KEY,
+                base_url=DEEPSEEK_BASE_URL,
+            )
+
+            # --------------------
+            # 步骤 4：分章节生成
+            # --------------------
+            with st.spinner("主编代理正在分章节生成第 1-8 节研究型报告..."):
+                section_map = generate_initial_section_map(
+                    combined_prompt=combined_prompt,
+                    main_agent=main_agent,
+                    research_agent=research_agent,
                 )
-                core_report = generate_sectional_main_report(main_agent, combined_prompt)
 
-            with st.spinner("研究路线代理正在生成第 8 节可执行创新路线..."):
-                research_agent = LLMClient(
-                    sys_prompt=RESEARCH_AGENT_PROMPT,
-                    api_key=DEEPSEEK_API_KEY,
-                    base_url=DEEPSEEK_BASE_URL,
+            # --------------------
+            # 步骤 5：完整性校验 + 审校 + 定向修补
+            # --------------------
+            with st.spinner("审校代理正在核查章节完整性、证据一致性与图表引用..."):
+                section_map, audit_result = audit_and_refine_report(
+                    section_map=section_map,
+                    combined_prompt=combined_prompt,
+                    source_pack=source_pack,
+                    text_report=st.session_state.final_text_report,
+                    vision_summaries=st.session_state.final_vision_reports,
+                    available_img_ids=available_img_ids,
+                    main_agent=main_agent,
+                    research_agent=research_agent,
+                    auditor=auditor,
                 )
-                research_prompt = f"""
-{combined_prompt}
+                st.session_state.final_audit_result = audit_result
 
-【已生成的第1-7节主报告】
-{core_report}
-
-【当前写作任务】
-请只输出：
-## 8. 面向后续研究的可执行创新路线
-"""
-                section8 = research_agent.generate([research_prompt])
-                section8 = clean_section_output(section8, keep_h1=False)
-
-            final_report = normalize_report_markdown(core_report + "\n\n" + section8)
-
-            with st.spinner("审校代理正在核查无证据结论、图表ID与章节遗漏..."):
-                auditor = LLMClient(
-                    sys_prompt=REPORT_AUDITOR_PROMPT,
-                    api_key=DEEPSEEK_API_KEY,
-                    base_url=DEEPSEEK_BASE_URL,
-                )
-                audit_prompt = f"""
-【原始 markdown】
-{source_pack}
-
-【Text Agent 输出】
-{st.session_state.final_text_report}
-
-【Vision Agent 输出】
-{st.session_state.final_vision_reports}
-
-【当前报告】
-{final_report}
-
-【合法图片ID】
-{available_img_ids}
-"""
-                audit_result = auditor.generate([audit_prompt])
-
-            if re.search(r"RESULT\s*:\s*FAIL", audit_result, flags=re.I):
-                with st.spinner("根据审校意见进行最终修订..."):
-                    revise_prompt = f"""
-{combined_prompt}
-
-【当前报告】
-{final_report}
-
-【审校意见】
-{audit_result}
-
-请严格根据审校意见修订整篇 Markdown 报告，只输出修订后的最终报告。
-"""
-                    final_report = normalize_report_markdown(main_agent.generate([revise_prompt]))
-
+            final_report = assemble_report_from_section_map(section_map)
             st.session_state.final_main_report = final_report
 
+    # 若已有最终报告，则渲染结果与下载入口。
     if st.session_state.final_main_report:
         st.success("论文全维度深度透视报告已生成！")
 
@@ -1235,9 +1590,15 @@ def render_analysis_ui(pdf_bytes):
             st.session_state.temp_images,
         )
 
+        # 审校日志折叠显示，方便调试，但不打扰主界面阅读。
+        if st.session_state.get("final_audit_result"):
+            with st.expander("查看审校结果（调试信息）", expanded=False):
+                st.code(st.session_state.final_audit_result)
+
         st.divider()
         st.markdown("### 导出与下载")
         col1, col2 = st.columns(2)
+
         with col1:
             st.download_button(
                 "下载报告原文 (Markdown)",
@@ -1245,17 +1606,29 @@ def render_analysis_ui(pdf_bytes):
                 file_name="Report.md",
                 use_container_width=True,
             )
+
         with col2:
-            pdf_markdown = embed_base64_images(
-                st.session_state.final_main_report,
-                st.session_state.temp_images,
+            # PDF 改为服务器端生成。
+            # 这样不会再出现 html2canvas 在分页处把文字切掉的问题。
+            with st.spinner("正在生成服务器端排版 PDF，请稍候..."):
+                pdf_bytes = build_pdf_bytes_cached(
+                    st.session_state.final_main_report,
+                    tuple(st.session_state.temp_images.items()),
+                )
+
+            st.download_button(
+                "下载标准版学术 PDF 报告",
+                pdf_bytes,
+                file_name="论文深度透视报告.pdf",
+                mime="application/pdf",
+                use_container_width=True,
             )
-            download_pdf_component(pdf_markdown)
 
 
 # ==========================================
-# 模块 7: 侧边栏及前端 UI 定义
+# 模块 11: 侧边栏及前端 UI 定义
 # ==========================================
+
 st.title("AI 智能论文检索 Agent")
 st.markdown("基于大模型的多轮深度挖掘，为您精准匹配 Top 6 核心前沿文献。")
 
@@ -1300,8 +1673,9 @@ with st.sidebar:
 
 
 # ==========================================
-# 模块 8: 全局应用状态机初始化
+# 模块 12: 全局应用状态机初始化
 # ==========================================
+
 if "app_state" not in st.session_state:
     st.session_state.app_state = "IDLE"
 if "prompt_history" not in st.session_state:
@@ -1332,17 +1706,22 @@ if "final_main_report" not in st.session_state:
     st.session_state.final_main_report = ""
 if "source_md_content" not in st.session_state:
     st.session_state.source_md_content = ""
+if "final_audit_result" not in st.session_state:
+    st.session_state.final_audit_result = ""
 
 
 # ==========================================
-# 模块 9: 业务路由分发与主循环
+# 模块 13: 业务路由分发与主循环
 # ==========================================
+
+# 入口 A：直接解析本地 PDF。
 if start_analyze_button and sidebar_pdf:
     st.markdown("---")
     st.info("正在启动【直接解析模式】，开始解构文献...")
     render_analysis_ui(sidebar_pdf.read())
     st.stop()
 
+# 入口 B：论文检索模式。
 if start_button:
     if not user_topic:
         st.warning("请填写研究方向！")
@@ -1362,6 +1741,10 @@ if start_button:
         st.session_state.ui_logs = []
         st.rerun()
 
+
+# ------------------------------
+# IDLE：显示系统使用说明
+# ------------------------------
 if st.session_state.app_state == "IDLE":
     st.markdown(
         """
@@ -1387,12 +1770,20 @@ if st.session_state.app_state == "IDLE":
     """
     )
 
+
+# ------------------------------
+# 非 IDLE：展示 Agent 运行日志
+# ------------------------------
 if st.session_state.app_state != "IDLE":
     st.markdown("### Agent 检索执行轨迹")
     for log in st.session_state.ui_logs:
         with st.expander(log["title"], expanded=False):
             st.markdown(log["content"])
 
+
+# ------------------------------
+# RUNNING：检索 Agent 主循环
+# ------------------------------
 if st.session_state.app_state == "RUNNING":
     st.info("Agent 正在自主检索并筛选文献，请稍候...")
     current_step_container = st.container()
@@ -1436,6 +1827,10 @@ if st.session_state.app_state == "RUNNING":
                 observation = available_tools[tool_name](**raw_kwargs) if tool_name in available_tools else "错误"
                 st.session_state.prompt_history.append(f"Observation: {observation}")
 
+
+# ------------------------------
+# WAITING_FEEDBACK：展示检索结果并允许纠偏
+# ------------------------------
 elif st.session_state.app_state == "WAITING_FEEDBACK":
     st.markdown("### 阶段性检索结果展示")
     with st.container(border=True):
@@ -1455,6 +1850,10 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
                 st.session_state.app_state = "RUNNING"
                 st.rerun()
 
+
+# ------------------------------
+# COMPLETED：展示最终检索结果并支持上传 PDF 精读
+# ------------------------------
 elif st.session_state.app_state == "COMPLETED":
     st.success("文献检索任务已圆满完成！")
     st.markdown("### 最终确认的 Top 6 核心论文推荐")
