@@ -1,5 +1,7 @@
 streamlit
-openai
 requests
-streamlit-autorefresh
-markdown
+openai
+Pillow
+beautifulsoup4
+mistune
+weasyprint
