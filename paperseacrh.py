@@ -200,99 +200,260 @@ def search_and_detail_papers(query: str) -> str:
 available_tools = {"search_and_detail_papers": search_and_detail_papers}
 
 def embed_base64_images(md_text, images_dict):
-    def replace_img(match):
-        alt_text = match.group(1)
+    def build_figure_html(alt_text, b64):
+        return (
+            "\n"
+            '<div class="pdf-figure">'
+            f'<img src="data:image/jpeg;base64,{b64}" alt="{alt_text}" />'
+            f'<div class="img-caption">{alt_text}</div>'
+            '</div>\n'
+        )
+
+    def replace_markdown_img(match):
+        alt_text = match.group(1).strip()
         img_placeholder = match.group(2).strip()
-        
+
         for img_name, b64 in images_dict.items():
             if img_placeholder in img_name or img_name in img_placeholder:
-                return f"![{alt_text}](data:image/jpeg;base64,{b64})\n<div class='img-caption'>{alt_text}</div>"
-        
-        return match.group(0) 
-    return re.sub(r'!\[(.*?)\]\((.*?)\)', replace_img, md_text)
+                return build_figure_html(alt_text, b64)
+
+        return match.group(0)
+
+    def replace_ref_img(match):
+        img_placeholder = match.group(1).strip()
+        for img_name, b64 in images_dict.items():
+            if img_placeholder in img_name or img_name in img_placeholder:
+                return build_figure_html(img_placeholder, b64)
+        return match.group(0)
+
+    md_text = re.sub(r'!\[(.*?)\]\((.*?)\)', replace_markdown_img, md_text)
+    md_text = re.sub(r'\[REF_IMG:\s*(.*?)\]', replace_ref_img, md_text)
+    return md_text
 
 def download_pdf_component(md_text):
     html_content = markdown.markdown(md_text, extensions=['tables', 'fenced_code'])
+    html_content = re.sub(
+        r'(<table>.*?</table>)',
+        r'<div class="table-wrapper">\1</div>',
+        html_content,
+        flags=re.DOTALL,
+    )
+
     html_code = f"""
     <html>
     <head>
+        <meta charset="utf-8" />
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
+            * {{
+                box-sizing: border-box;
+            }}
+
+            html, body {{
+                margin: 0;
+                padding: 0;
+                background: #fff;
+                color: #000;
+                font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Serif CJK SC', 'SimSun', serif;
+                line-height: 1.85;
+            }}
+
             body {{
-                font-family: 'Times New Roman', 'SimSun', serif; 
-                color: #000; line-height: 1.8; padding: 20px; 
+                padding: 12px;
+            }}
+
+            #report-content {{
+                display: none;
+                width: 180mm;
+                min-width: 180mm;
+                max-width: 180mm;
+                margin: 0 auto;
+                background: #fff;
+                font-size: 14px;
                 text-align: justify;
+                text-justify: inter-ideograph;
+                overflow: visible;
             }}
-            
-            /* 核心修复：为段落增加 relative 定位和避让属性，帮助 html2canvas 识别文字边界 */
-            p {{ 
-                text-indent: 2em; 
-                margin-bottom: 1.2em; 
-                position: relative;
-                display: block;
+
+            h1, h2, h3, h4 {{
+                color: #000;
+                margin: 22px 0 14px;
+                line-height: 1.4;
+                page-break-after: avoid;
+                break-after: avoid;
             }}
-            
-            /* 表格容器样式优化 */
-            table {{ 
-                border-collapse: collapse; width: 100%; margin: 25px 0; 
-                font-size: 0.9em; page-break-inside: avoid; break-inside: avoid;
+
+            p, li, blockquote, td, th {{
+                word-break: break-word;
+                overflow-wrap: anywhere;
+                white-space: normal;
             }}
-            th, td {{ border: 1px solid #000; padding: 10px; text-align: center; }}
-            th {{ background-color: #f8f9fa; font-weight: bold; }}
-            
-            img, pre, code, blockquote {{
+
+            p {{
+                text-indent: 2em;
+                margin: 0 0 1em;
+            }}
+
+            .pdf-figure,
+            .table-wrapper,
+            pre,
+            blockquote {{
+                width: 100%;
+                max-width: 100%;
+                margin: 18px 0 24px;
                 page-break-inside: avoid;
                 break-inside: avoid;
             }}
-            
-            h1, h2, h3, h4 {{
-                color: #000; margin-top: 24px; margin-bottom: 16px;
-                page-break-after: avoid; 
-                break-after: avoid;
+
+            .pdf-figure {{
+                text-align: center;
             }}
-            
-            img {{ max-width: 100%; height: auto; margin: 20px auto; display: block; }}
-            
+
+            .pdf-figure img {{
+                display: inline-block;
+                width: auto;
+                max-width: 92%;
+                height: auto;
+                max-height: 190mm;
+                object-fit: contain;
+                margin: 0 auto 8px;
+            }}
+
+            img {{
+                display: block;
+                max-width: 100%;
+                width: auto;
+                height: auto;
+            }}
+
             .img-caption {{
-                text-align: center; font-size: 0.9em; color: #555; text-indent: 0; 
-                margin-top: -10px; margin-bottom: 20px; font-weight: bold; display: block;
+                text-align: center;
+                font-size: 12px;
+                color: #555;
+                text-indent: 0;
+                margin-top: 6px;
+                font-weight: bold;
             }}
-            
+
+            .table-wrapper {{
+                overflow: hidden;
+            }}
+
+            table {{
+                width: 100% !important;
+                max-width: 100%;
+                border-collapse: collapse;
+                table-layout: fixed;
+                margin: 0;
+                font-size: 12px;
+                page-break-inside: avoid;
+                break-inside: avoid;
+            }}
+
+            th, td {{
+                border: 1px solid #000;
+                padding: 6px 8px;
+                text-align: center;
+                vertical-align: middle;
+            }}
+
+            th {{
+                background-color: #f8f9fa;
+                font-weight: bold;
+            }}
+
+            code, pre {{
+                white-space: pre-wrap;
+                word-break: break-word;
+            }}
+
             .download-btn {{
-                display: block; width: 100%; padding: 12px;
-                background-color: #4CAF50; color: white; border: none; 
-                border-radius: 4px; font-size: 16px; cursor: pointer; font-weight: bold;
+                display: block;
+                width: 100%;
+                padding: 12px;
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                font-size: 16px;
+                cursor: pointer;
+                font-weight: bold;
             }}
-            .download-btn:hover {{ background-color: #45a049; }}
+
+            .download-btn:hover {{
+                background-color: #45a049;
+            }}
         </style>
     </head>
     <body>
         <button class="download-btn" onclick="generatePDF()">📥 导出标准版学术 PDF 报告</button>
-        <div id="report-content" style="display: none;">
+        <div id="report-content">
             {html_content}
         </div>
         <script>
-            function generatePDF() {{
-                var element = document.getElementById('report-content');
-                element.style.display = 'block'; 
-                var opt = {{
-                    margin:       [15, 15, 15, 15],
-                    filename:     '论文深度透视报告.pdf',
-                    image:        {{ type: 'jpeg', quality: 0.98 }},
-                    // 核心修复：增加 windowWidth 固定视口，防止计算文字折行时出现错位
-                    html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true, windowWidth: 1024 }},
-                    jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }},
-                    pagebreak:    {{ mode: ['css', 'legacy'] }}
+            function sleep(ms) {{
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }}
+
+            async function waitForImages(root) {{
+                const images = Array.from(root.querySelectorAll('img'));
+                await Promise.all(images.map(img => {{
+                    if (img.complete) return Promise.resolve();
+                    return new Promise(resolve => {{
+                        const done = () => resolve();
+                        img.onload = done;
+                        img.onerror = done;
+                    }});
+                }}));
+            }}
+
+            async function generatePDF() {{
+                const element = document.getElementById('report-content');
+                element.style.display = 'block';
+
+                await sleep(80);
+                if (document.fonts && document.fonts.ready) {{
+                    try {{
+                        await document.fonts.ready;
+                    }} catch (e) {{}}
+                }}
+                await waitForImages(element);
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+                const opt = {{
+                    margin: [10, 15, 10, 15],
+                    filename: '论文深度透视报告.pdf',
+                    image: {{ type: 'jpeg', quality: 0.98 }},
+                    html2canvas: {{
+                        scale: 2,
+                        useCORS: true,
+                        scrollX: 0,
+                        scrollY: 0,
+                        windowWidth: Math.ceil(element.scrollWidth)
+                    }},
+                    jsPDF: {{
+                        unit: 'mm',
+                        format: 'a4',
+                        orientation: 'portrait',
+                        compress: true
+                    }},
+                    pagebreak: {{
+                        mode: ['css', 'legacy'],
+                        avoid: ['.pdf-figure', '.table-wrapper', 'pre', 'blockquote']
+                    }}
                 }};
-                html2pdf().set(opt).from(element).save().then(() => {{
-                    element.style.display = 'none'; 
-                }});
+
+                try {{
+                    await html2pdf().set(opt).from(element).save();
+                }} finally {{
+                    element.style.display = 'none';
+                }}
             }}
         </script>
     </body>
     </html>
     """
-    components.html(html_code, height=70)
+    components.html(html_code, height=90)
 
 def analyze_pdf_with_modal(pdf_file_bytes):
     with st.spinner("正在唤醒云端 GPU 引擎，深度解析公式与版面... "):
