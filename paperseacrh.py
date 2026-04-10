@@ -218,13 +218,21 @@ def download_pdf_component(md_text):
     <head>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
         <style>
+            /* 修复 1：去掉 body 的 padding，统一由下方 jsPDF 的 margin 接管留白 */
             body {{
                 font-family: 'Times New Roman', 'SimSun', serif; 
-                color: #000; line-height: 1.8; padding: 20px; 
+                color: #000; line-height: 1.8; margin: 0; padding: 0; 
                 text-align: justify;
             }}
             
-            /* 核心修复：为段落增加 relative 定位和避让属性，帮助 html2canvas 识别文字边界 */
+            /* 为导出容器增加明确的宽度约束，防止视口无限蔓延 */
+            #report-content {{
+                width: 100%;
+                max-width: 1024px;
+                margin: 0 auto;
+                box-sizing: border-box;
+            }}
+            
             p {{ 
                 text-indent: 2em; 
                 margin-bottom: 1.2em; 
@@ -232,7 +240,6 @@ def download_pdf_component(md_text):
                 display: block;
             }}
             
-            /* 表格容器样式优化 */
             table {{ 
                 border-collapse: collapse; width: 100%; margin: 25px 0; 
                 font-size: 0.9em; page-break-inside: avoid; break-inside: avoid;
@@ -279,8 +286,15 @@ def download_pdf_component(md_text):
                     margin:       [15, 15, 15, 15],
                     filename:     '论文深度透视报告.pdf',
                     image:        {{ type: 'jpeg', quality: 0.98 }},
-                    // 核心修复：增加 windowWidth 固定视口，防止计算文字折行时出现错位
-                    html2canvas:  {{ scale: 2, useCORS: true, letterRendering: true, windowWidth: 1024 }},
+                    html2canvas:  {{ 
+                        scale: 2, 
+                        useCORS: true, 
+                        letterRendering: true, 
+                        windowWidth: 1024,
+                        // 修复 2：强制锁定 X 和 Y 的滚动坐标为 0，彻底切断右移/下移的源头
+                        scrollX: 0,
+                        scrollY: 0
+                    }},
                     jsPDF:        {{ unit: 'mm', format: 'a4', orientation: 'portrait' }},
                     pagebreak:    {{ mode: ['css', 'legacy'] }}
                 }};
