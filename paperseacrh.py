@@ -4,21 +4,36 @@
 import base64
 import datetime
 import hashlib
+import io
 import re
 import time
+from html import escape
 from typing import Dict, List, Tuple
 
 import markdown
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
+from bs4 import BeautifulSoup, NavigableString, Tag
 from openai import OpenAI
+from PIL import Image as PILImage
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout="wide")
 
 # ==========================================
 # 模块 2: 全局变量与 API 密钥配置
 # ==========================================
+# 说明：
+# 这些密钥都从 Streamlit secrets 读取。
+# 如果某个 key 未配置，对应功能会报错，因此部署前需要在 secrets.toml 中填好。
 
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -79,6 +94,13 @@ REPORT_SECTION_SPECS = [
 # ==========================================
 # 模块 4: 核心 Agent 提示词
 # ==========================================
+# 说明：
+# 1. Text Agent 只做事实抽取与解释，不做 speculative 创新推演。
+# 2. Vision Agent 输出 FIGURE_CARD，方便后续总报告引用。
+# 3. Main Agent 只负责第 1-7 节。
+# 4. Research Agent 单独负责第 8 节，避免“研究设想”和“原文事实”污染彼此。
+# 5. Auditor Agent 只做审校，不负责大段重写。
+
 TEXT_AGENT_PROMPT = """
 你是论文事实抽取专家，不是评论员。你的任务是把论文文本拆成“可验证事实”和“可阅读解释”两层内容，供后续主报告模型调用。
 
@@ -512,325 +534,307 @@ def wrap_markdown_tables(html_content: str) -> str:
 
 
 def html_escape_for_component(text: str) -> str:
-    """避免把 </script> 等字符串直接塞入 HTML 模板时破坏脚本结构。"""
-    return text.replace("</script>", "<\\/script>")
+    """保留这个兼容函数，便于旧逻辑平滑迁移；当前版本的 PDF 不再依赖浏览器端脚本。"""
+    return text
+
 
 # ==========================================
-# 模块 7: 浏览器端 PDF 导出组件
+# 模块 7: 服务器端高质量 PDF 生成
 # ==========================================
-def download_pdf_component(md_text: str):
-    """在 Streamlit 页面中插入“导出 PDF”按钮与导出逻辑。"""
-    html_content = markdown.markdown(md_text, extensions=['tables', 'fenced_code'])
-    html_content = wrap_markdown_tables(html_content)
-    html_content = html_escape_for_component(html_content)
+# 说明：
+# 1. 这里彻底改为 ReportLab 服务器端排版生成 PDF，不再依赖 html2canvas/jsPDF 截图。
+# 2. 这样生成的 PDF 文字是矢量文本，清晰度高，也不会因为截图造成页首/分页处丢字。
+# 3. ReportLab 会严格根据 A4 页尺寸、边距、字号、行高自动分页；放不下的块会自动顺延到下一页。
+# 4. 我们还会把每个二级章节里的图表统一后置到该章节尾部，让正文先尽量填满页面，再展示图表。
+# 5. 英文与数字优先使用 Times 系列，中文使用 STSong-Light（ReportLab 内置 CID 中文字体）。
 
+
+def _register_pdf_fonts():
+    """注册 PDF 所需字体。STSong-Light 是 ReportLab 自带的中文 CID 字体。"""
+    try:
+        pdfmetrics.getFont('STSong-Light')
+    except Exception:
+        pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+
+
+def _is_ascii_latin(ch: str) -> bool:
+    """判断字符是否属于英文/数字/常见英文标点，用于混排字体切换。"""
+    return ord(ch) < 128
+
+
+def _mixed_font_markup(text: str, ascii_font: str = 'Times-Roman', cjk_font: str = 'STSong-Light') -> str:
+    """把一段文本拆成英文/数字片段和中文片段，分别套不同字体。"""
+    if not text:
+        return ''
+    chunks = []
+    current = []
+    current_ascii = _is_ascii_latin(text[0])
+    for ch in text:
+        is_ascii = _is_ascii_latin(ch)
+        if is_ascii == current_ascii:
+            current.append(ch)
+        else:
+            chunks.append((current_ascii, ''.join(current)))
+            current = [ch]
+            current_ascii = is_ascii
+    if current:
+        chunks.append((current_ascii, ''.join(current)))
+    rendered = []
+    for is_ascii, chunk in chunks:
+        safe = escape(chunk)
+        font_name = ascii_font if is_ascii else cjk_font
+        rendered.append(f'<font name="{font_name}">{safe}</font>')
+    return ''.join(rendered)
+
+
+def _build_pdf_styles() -> Dict[str, ParagraphStyle]:
+    """构建 PDF 用的段落样式。"""
+    _register_pdf_fonts()
     cfg = PDF_EXPORT_CONFIG
+    sample = getSampleStyleSheet()
+    body = ParagraphStyle(
+        'BodyZH',
+        parent=sample['BodyText'],
+        fontName='STSong-Light',
+        fontSize=cfg['body_font_size_px'],
+        leading=cfg['body_font_size_px'] * cfg['body_line_height'],
+        alignment=TA_JUSTIFY,
+        firstLineIndent=cfg['body_font_size_px'] * 2,
+        spaceAfter=8,
+        textColor=colors.black,
+    )
+    h1 = ParagraphStyle(
+        'H1ZH', parent=sample['Heading1'], fontName='STSong-Light', fontSize=24,
+        leading=30, alignment=TA_CENTER, spaceAfter=14, spaceBefore=6, textColor=colors.black,
+    )
+    h2 = ParagraphStyle(
+        'H2ZH', parent=sample['Heading2'], fontName='STSong-Light', fontSize=18,
+        leading=24, spaceBefore=14, spaceAfter=10, textColor=colors.black,
+    )
+    h3 = ParagraphStyle(
+        'H3ZH', parent=sample['Heading3'], fontName='STSong-Light', fontSize=15,
+        leading=20, spaceBefore=10, spaceAfter=8, textColor=colors.black,
+    )
+    caption = ParagraphStyle(
+        'CaptionZH', parent=sample['BodyText'], fontName='STSong-Light', fontSize=10.5,
+        leading=14, alignment=TA_CENTER, spaceBefore=4, spaceAfter=10, textColor=colors.HexColor('#333333'),
+    )
+    table_text = ParagraphStyle(
+        'TableTextZH', parent=sample['BodyText'], fontName='STSong-Light',
+        fontSize=max(9, cfg['table_font_size_px']),
+        leading=max(12, cfg['table_font_size_px'] * 1.35),
+        alignment=TA_CENTER, textColor=colors.black,
+    )
+    return {'h1': h1, 'h2': h2, 'h3': h3, 'body': body, 'caption': caption, 'table': table_text}
 
-    html_code = f"""
-    <html>
-    <head>
-        <meta charset="utf-8" />
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-        <style>
-            * {{ box-sizing: border-box; }}
 
-            html, body {{
-                margin: 0;
-                padding: 0;
-                background: #ffffff;
-                color: #000000;
-            }}
+def _extract_plain_text(tag: Tag) -> str:
+    """从 HTML 标签中提取尽量干净的纯文本。"""
+    return tag.get_text(' ', strip=True).replace(' ', ' ').strip()
 
-            body {{
-                padding: 12px;
-                font-family: "Times New Roman", "Liberation Serif", "Nimbus Roman", "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
-            }}
 
-            .download-btn {{
-                display: block;
-                width: 100%;
-                padding: 12px;
-                background-color: #2e7d32;
-                color: #fff;
-                border: none;
-                border-radius: 8px;
-                font-size: 16px;
-                font-weight: 700;
-                cursor: pointer;
-                margin-bottom: 12px;
-            }}
+def _classify_visual(alt_text: str, width: int, height: int) -> str:
+    """根据标题和宽高比，判断是普通图、宽图、表格图还是高图。"""
+    alt = (alt_text or '').lower()
+    ratio = width / max(height, 1)
+    if '表' in alt or 'table' in alt or ratio > 1.85:
+        return 'table'
+    if height / max(width, 1) > 1.35:
+        return 'tall'
+    if ratio > 1.35:
+        return 'wide'
+    return 'normal'
 
-            .download-btn:hover {{
-                background-color: #256b2a;
-            }}
 
-            /* 这里用 offscreen 而不是 display:none，避免 html2canvas 在隐藏节点上测量出错 */
-            #pdf-host {{
-                position: fixed;
-                left: -100000px;
-                top: 0;
-                width: 210mm;
-                background: #fff;
-                z-index: -1;
-                opacity: 1;
-            }}
+def _scaled_image_size(width: int, height: int, visual_type: str) -> Tuple[float, float]:
+    """按视觉类型和配置，把图片缩放到合适尺寸。"""
+    cfg = PDF_EXPORT_CONFIG
+    content_width_pt = cfg['content_width_mm'] * mm
+    if visual_type == 'table':
+        max_w = content_width_pt * cfg['table_visual_max_width_pct'] / 100.0
+        max_h = cfg['table_visual_max_height_mm'] * mm
+    elif visual_type == 'wide':
+        max_w = content_width_pt * cfg['wide_visual_max_width_pct'] / 100.0
+        max_h = cfg['wide_visual_max_height_mm'] * mm
+    elif visual_type == 'tall':
+        max_w = content_width_pt * cfg['tall_visual_max_width_pct'] / 100.0
+        max_h = cfg['tall_visual_max_height_mm'] * mm
+    else:
+        max_w = content_width_pt * cfg['figure_max_width_pct'] / 100.0
+        max_h = cfg['figure_max_height_mm'] * mm
+    scale = min(max_w / max(width, 1), max_h / max(height, 1), 1.0)
+    return width * scale, height * scale
 
-            #report-content {{
-                width: {cfg['content_width_mm']}mm;
-                min-width: {cfg['content_width_mm']}mm;
-                max-width: {cfg['content_width_mm']}mm;
-                margin: 0 auto;
-                background: #fff;
-                color: #000;
-                font-size: {cfg['body_font_size_px']}px;
-                line-height: {cfg['body_line_height']};
-                text-align: justify;
-                text-justify: inter-ideograph;
-                overflow: visible;
-                padding-top: 2mm;
-            }}
 
-            h1, h2, h3, h4 {{
-                color: #000;
-                line-height: 1.45;
-                margin: 20px 0 12px;
-                page-break-after: avoid;
-                break-after: avoid;
-                font-weight: 700;
-            }}
+def _build_image_flowable(img_key: str, caption: str, images_dict: Dict[str, str], styles: Dict[str, ParagraphStyle]):
+    """把 Markdown 图片占位符转换成 ReportLab 的图片 + 图注。"""
+    matched_b64 = None
+    matched_name = img_key
+    for img_name, b64 in images_dict.items():
+        if img_key in img_name or img_name in img_key:
+            matched_b64 = b64
+            matched_name = img_name
+            break
+    if not matched_b64:
+        return None
+    raw = base64.b64decode(matched_b64)
+    pil = PILImage.open(io.BytesIO(raw))
+    width, height = pil.size
+    visual_type = _classify_visual(caption or matched_name, width, height)
+    draw_w, draw_h = _scaled_image_size(width, height, visual_type)
+    img = RLImage(io.BytesIO(raw), width=draw_w, height=draw_h)
+    img.hAlign = 'CENTER'
+    cap = Paragraph(_mixed_font_markup(caption or matched_name), styles['caption'])
+    return KeepTogether([img, Spacer(1, 4), cap, Spacer(1, 4)])
 
-            h1 {{ font-size: 28px; text-align: center; margin-top: 8px; margin-bottom: 18px; }}
-            h2 {{ font-size: 24px; margin-top: 26px; }}
-            h3 {{ font-size: 20px; }}
-            h4 {{ font-size: 18px; }}
 
-            p, li, blockquote, td, th {{
-                word-break: break-word;
-                overflow-wrap: anywhere;
-                white-space: normal;
-            }}
+def _build_table_flowable(table_tag: Tag, styles: Dict[str, ParagraphStyle]):
+    """把 HTML 表格转成 ReportLab Table。"""
+    rows = []
+    for tr in table_tag.find_all('tr'):
+        cells = tr.find_all(['th', 'td'])
+        if not cells:
+            continue
+        row = []
+        for cell in cells:
+            txt = _extract_plain_text(cell)
+            row.append(Paragraph(_mixed_font_markup(txt), styles['table']))
+        rows.append(row)
+    if not rows:
+        return None
+    col_count = max(len(r) for r in rows)
+    normalized = []
+    for row in rows:
+        if len(row) < col_count:
+            row = row + [''] * (col_count - len(row))
+        normalized.append(row)
+    cfg = PDF_EXPORT_CONFIG
+    content_width_pt = cfg['content_width_mm'] * mm
+    col_width = content_width_pt / max(col_count, 1)
+    t = Table(normalized, colWidths=[col_width] * col_count, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'STSong-Light'),
+        ('FONTSIZE', (0, 0), (-1, -1), max(9, cfg['table_font_size_px'])),
+        ('LEADING', (0, 0), (-1, -1), max(12, cfg['table_font_size_px'] * 1.35)),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f3f3f3')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+        ('GRID', (0, 0), (-1, -1), 0.6, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('LEFTPADDING', (0, 0), (-1, -1), cfg['table_cell_padding_px']),
+        ('RIGHTPADDING', (0, 0), (-1, -1), cfg['table_cell_padding_px']),
+        ('TOPPADDING', (0, 0), (-1, -1), max(3, cfg['table_cell_padding_px'] - 1)),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), max(3, cfg['table_cell_padding_px'] - 1)),
+    ]))
+    return t
 
-            p {{
-                margin: 0 0 0.95em;
-                text-indent: 2em;
-                orphans: 2;
-                widows: 2;
-            }}
 
-            code, pre {{
-                white-space: pre-wrap;
-                word-break: break-word;
-            }}
+def _flush_paragraph_buffer(buffer: List[str], bucket: List, styles: Dict[str, ParagraphStyle]):
+    """把累计的正文段落一次性写入 flowable 列表。"""
+    if not buffer:
+        return
+    text = '\n'.join([x.strip() for x in buffer if x.strip()]).strip()
+    buffer.clear()
+    if not text:
+        return
+    bucket.append(Paragraph(_mixed_font_markup(text), styles['body']))
+    bucket.append(Spacer(1, 4))
 
-            pre, blockquote {{
-                page-break-inside: avoid;
-                break-inside: avoid;
-                margin: 16px 0 20px;
-            }}
 
-            .report-section {{
-                width: 100%;
-            }}
+def _reorder_section_visuals(md_text: str, images_dict: Dict[str, str], styles: Dict[str, ParagraphStyle]):
+    """解析 Markdown，并把每个二级章节中的图表移动到该章节尾部。"""
+    html = markdown.markdown(md_text, extensions=['tables', 'fenced_code'])
+    soup = BeautifulSoup(html, 'html.parser')
+    sections = []
+    current = {'text': [], 'visuals': []}
+    para_buffer: List[str] = []
 
-            .pdf-figure, .table-block {{
-                width: 100%;
-                max-width: 100%;
-                margin: 18px 0 24px;
-                page-break-inside: avoid;
-                break-inside: avoid;
-            }}
+    def flush_current():
+        _flush_paragraph_buffer(para_buffer, current['text'], styles)
+        if current['text'] or current['visuals']:
+            sections.append({'text': list(current['text']), 'visuals': list(current['visuals'])})
+        current['text'].clear()
+        current['visuals'].clear()
 
-            .pdf-figure {{
-                text-align: center;
-            }}
+    for node in soup.children:
+        if isinstance(node, NavigableString):
+            raw = str(node).strip()
+            if raw:
+                para_buffer.append(raw)
+            continue
+        if not isinstance(node, Tag):
+            continue
+        if node.name == 'h1':
+            _flush_paragraph_buffer(para_buffer, current['text'], styles)
+            current['text'].append(Paragraph(_mixed_font_markup(_extract_plain_text(node), ascii_font='Times-Bold'), styles['h1']))
+            current['text'].append(Spacer(1, 8))
+            continue
+        if node.name == 'h2':
+            flush_current()
+            current['text'].append(Paragraph(_mixed_font_markup(_extract_plain_text(node), ascii_font='Times-Bold'), styles['h2']))
+            current['text'].append(Spacer(1, 4))
+            continue
+        if node.name in ('h3', 'h4'):
+            _flush_paragraph_buffer(para_buffer, current['text'], styles)
+            current['text'].append(Paragraph(_mixed_font_markup(_extract_plain_text(node), ascii_font='Times-Bold'), styles['h3']))
+            current['text'].append(Spacer(1, 3))
+            continue
+        if node.name == 'p':
+            img = node.find('img')
+            if img and img.get('src'):
+                _flush_paragraph_buffer(para_buffer, current['text'], styles)
+                flowable = _build_image_flowable(img.get('src', '').strip(), img.get('alt', '').strip(), images_dict, styles)
+                if flowable:
+                    current['visuals'].append(flowable)
+                    current['visuals'].append(Spacer(1, 6))
+                continue
+            txt = _extract_plain_text(node)
+            if txt:
+                para_buffer.append(txt)
+            continue
+        if node.name == 'table':
+            _flush_paragraph_buffer(para_buffer, current['text'], styles)
+            table_flow = _build_table_flowable(node, styles)
+            if table_flow:
+                current['visuals'].append(KeepTogether([table_flow, Spacer(1, 8)]))
+            continue
+        if node.name == 'pre':
+            _flush_paragraph_buffer(para_buffer, current['text'], styles)
+            pre_text = _extract_plain_text(node)
+            if pre_text:
+                current['text'].append(Paragraph(_mixed_font_markup(pre_text, ascii_font='Courier'), styles['body']))
+                current['text'].append(Spacer(1, 6))
+            continue
+        txt = _extract_plain_text(node)
+        if txt:
+            para_buffer.append(txt)
 
-            .pdf-figure img {{
-                display: inline-block;
-                width: auto;
-                height: auto;
-                max-width: {cfg['figure_max_width_pct']}%;
-                max-height: {cfg['figure_max_height_mm']}mm;
-                object-fit: contain;
-                margin: 0 auto 6px;
-            }}
+    flush_current()
+    flowables = []
+    for section in sections:
+        flowables.extend(section['text'])
+        flowables.extend(section['visuals'])
+    return flowables
 
-            .pdf-figure.wide-visual img {{
-                max-width: {cfg['wide_visual_max_width_pct']}%;
-                max-height: {cfg['wide_visual_max_height_mm']}mm;
-            }}
 
-            .pdf-figure.table-visual img {{
-                max-width: {cfg['table_visual_max_width_pct']}%;
-                max-height: {cfg['table_visual_max_height_mm']}mm;
-            }}
-
-            .pdf-figure.tall-visual img {{
-                max-width: {cfg['tall_visual_max_width_pct']}%;
-                max-height: {cfg['tall_visual_max_height_mm']}mm;
-            }}
-
-            .img-caption {{
-                text-align: center;
-                font-size: 12px;
-                color: #444;
-                text-indent: 0;
-                margin-top: 4px;
-                font-weight: 700;
-            }}
-
-            .table-block {{
-                overflow: hidden;
-            }}
-
-            table {{
-                width: 100% !important;
-                max-width: 100%;
-                border-collapse: collapse;
-                table-layout: fixed;
-                margin: 0;
-                font-size: {cfg['table_font_size_px']}px;
-                page-break-inside: avoid;
-                break-inside: avoid;
-            }}
-
-            th, td {{
-                border: 1px solid #000;
-                padding: {cfg['table_cell_padding_px']}px;
-                text-align: center;
-                vertical-align: middle;
-            }}
-
-            th {{
-                background: #f6f6f6;
-                font-weight: 700;
-            }}
-        </style>
-    </head>
-    <body>
-        <button class="download-btn" onclick="generatePDF()">📥 导出标准版学术 PDF 报告</button>
-        <div id="pdf-host">
-            <div id="report-content">{html_content}</div>
-        </div>
-        <script>
-            function sleep(ms) {{
-                return new Promise(resolve => setTimeout(resolve, ms));
-            }}
-
-            async function waitForImages(root) {{
-                const images = Array.from(root.querySelectorAll('img'));
-                await Promise.all(images.map(img => {{
-                    if (img.complete) return Promise.resolve();
-                    return new Promise(resolve => {{
-                        const done = () => resolve();
-                        img.onload = done;
-                        img.onerror = done;
-                    }});
-                }}));
-            }}
-
-            function wrapSections(root) {{
-                const nodes = Array.from(root.childNodes);
-                let currentSection = null;
-                nodes.forEach(node => {{
-                    if (node.nodeType === 1 && node.tagName === 'H2') {{
-                        currentSection = document.createElement('div');
-                        currentSection.className = 'report-section';
-                        root.insertBefore(currentSection, node);
-                        currentSection.appendChild(node);
-                    }} else if (currentSection) {{
-                        currentSection.appendChild(node);
-                    }}
-                }});
-            }}
-
-            function classifyFigures(root) {{
-                const figures = Array.from(root.querySelectorAll('.pdf-figure'));
-                figures.forEach(fig => {{
-                    const img = fig.querySelector('img');
-                    if (!img) return;
-                    const alt = (img.alt || '').toLowerCase();
-                    const w = img.naturalWidth || img.width || 1;
-                    const h = img.naturalHeight || img.height || 1;
-                    const ratio = w / Math.max(h, 1);
-
-                    fig.classList.remove('wide-visual', 'table-visual', 'tall-visual');
-
-                    if (alt.includes('表') || alt.includes('table') || ratio > 1.85) {{
-                        fig.classList.add('table-visual');
-                    }} else if (h / Math.max(w, 1) > 1.35) {{
-                        fig.classList.add('tall-visual');
-                    }} else if (ratio > 1.35) {{
-                        fig.classList.add('wide-visual');
-                    }}
-                }});
-            }}
-
-            function moveVisualsToSectionTail(root) {{
-                const sections = Array.from(root.querySelectorAll('.report-section'));
-                sections.forEach(section => {{
-                    const visuals = Array.from(section.querySelectorAll(':scope > .pdf-figure, :scope > .table-block'));
-                    visuals.forEach(v => v.remove());
-                    visuals.forEach(v => section.appendChild(v));
-                }});
-            }}
-
-            async function prepareLayout(root) {{
-                wrapSections(root);
-                await waitForImages(root);
-                classifyFigures(root);
-                moveVisualsToSectionTail(root);
-                if (document.fonts && document.fonts.ready) {{
-                    try {{ await document.fonts.ready; }} catch (e) {{}}
-                }}
-                await sleep(100);
-                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-            }}
-
-            async function generatePDF() {{
-                const element = document.getElementById('report-content');
-                const clone = element.cloneNode(true);
-                const host = document.getElementById('pdf-host');
-
-                const exportNode = document.createElement('div');
-                exportNode.id = 'report-content';
-                exportNode.innerHTML = clone.innerHTML;
-                host.innerHTML = '';
-                host.appendChild(exportNode);
-
-                await prepareLayout(exportNode);
-
-                const opt = {{
-                    margin: [{cfg['margin_top_mm']}, {cfg['margin_right_mm']}, {cfg['margin_bottom_mm']}, {cfg['margin_left_mm']}],
-                    filename: '论文深度透视报告.pdf',
-                    image: {{ type: 'jpeg', quality: 0.98 }},
-                    html2canvas: {{
-                        scale: {cfg['html2canvas_scale']},
-                        useCORS: true,
-                        scrollX: 0,
-                        scrollY: 0,
-                        letterRendering: false,
-                        windowWidth: Math.ceil(exportNode.scrollWidth)
-                    }},
-                    jsPDF: {{
-                        unit: 'mm',
-                        format: 'a4',
-                        orientation: 'portrait',
-                        compress: true
-                    }},
-                    pagebreak: {{
-                        mode: ['css', 'legacy'],
-                        avoid: ['.pdf-figure', '.table-block', 'table', 'tr', 'pre', 'blockquote', 'h1', 'h2', 'h3', 'h4']
-                    }}
-                }};
-
-                await html2pdf().set(opt).from(exportNode).save();
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    components.html(html_code, height=90)
-
+def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> bytes:
+    """把最终 Markdown 报告排版成真正的 PDF 字节流。"""
+    styles = _build_pdf_styles()
+    cfg = PDF_EXPORT_CONFIG
+    story = _reorder_section_visuals(md_text, images_dict, styles)
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=cfg['margin_left_mm'] * mm,
+        rightMargin=cfg['margin_right_mm'] * mm,
+        topMargin=cfg['margin_top_mm'] * mm,
+        bottomMargin=cfg['margin_bottom_mm'] * mm,
+        title='论文全维度透视报告',
+        author='ChatGPT',
+    )
+    doc.build(story)
+    return buffer.getvalue()
 # ==========================================
 # 模块 8: LLM 客户端类
 # ==========================================
@@ -843,8 +847,8 @@ class LLMClient:
         self.model = model
         self.sys_prompt = sys_prompt
 
-    def generate(self, prompt_history: List[str]) -> str:
-        """纯文本生成接口。"""
+    def generate(self, prompt_history: List[str], max_tokens: int = 8192) -> str:
+        """纯文本生成接口。max_tokens 显式给大一点，减少长输出被截断的概率。"""
         messages = [{"role": "system", "content": self.sys_prompt}]
         for msg in prompt_history:
             messages.append({"role": "user", "content": msg})
@@ -855,6 +859,7 @@ class LLMClient:
                     model=self.model,
                     messages=messages,
                     temperature=0.2,
+                    max_tokens=max_tokens,
                 )
                 return response.choices[0].message.content or ""
             except Exception as e:
@@ -863,7 +868,7 @@ class LLMClient:
                 else:
                     raise e
 
-    def generate_with_images(self, user_prompt: str, base64_images: List[str]) -> str:
+    def generate_with_images(self, user_prompt: str, base64_images: List[str], max_tokens: int = 4096) -> str:
         """多模态生成接口，支持给 Vision Agent 喂图。"""
         messages = [{"role": "system", "content": self.sys_prompt}]
         content_list = [{"type": "text", "text": user_prompt}]
@@ -919,6 +924,50 @@ def analyze_pdf_with_modal(pdf_file_bytes: bytes):
 # 说明：
 # 这里把“文本抽取 -> 图表证据抽取 -> 核心报告生成 -> 研究路线生成 -> 审校修订”拆开，
 # 尽量避免 one-shot 长输出被截断，只生成前几节就结束。
+
+
+def _remove_overlap(prev: str, new: str) -> str:
+    """去掉多轮续写时首尾可能重复的内容。"""
+    prev_tail = prev[-1200:]
+    max_overlap = min(len(prev_tail), len(new), 500)
+    for n in range(max_overlap, 30, -1):
+        if prev_tail[-n:] == new[:n]:
+            return new[n:]
+    return new
+
+
+def generate_until_marker(agent: LLMClient, task_prompt: str, end_marker: str = '[END_OF_SECTION]', max_rounds: int = 4, max_tokens: int = 6500) -> str:
+    """带结束标记的稳健长文本生成。若首轮输出被截断，就继续续写直到看到结束标记。"""
+    accumulated = ''
+    for round_idx in range(max_rounds):
+        if round_idx == 0:
+            prompt = f"""{task_prompt}
+
+请严格遵守以下要求：
+1. 只输出当前请求的正文内容，不要输出解释。
+2. 当你完整写完本次请求的全部内容后，必须单独一行输出 {end_marker}。
+3. 如果一次输出不完，不要写总结，不要写结束语，直接在下一轮继续。"""
+        else:
+            prompt = f"""你上一轮的输出在长度限制处被截断了。请从前文结尾继续写，不要重复已经写过的内容。
+
+【已生成内容末尾】
+{accumulated[-3500:]}
+
+请继续，并在完整结束后单独一行输出 {end_marker}。"""
+        part = (agent.generate([prompt], max_tokens=max_tokens) or '').strip()
+        if not part:
+            break
+        if accumulated:
+            part = _remove_overlap(accumulated, part)
+            accumulated += '\n' + part.strip()
+        else:
+            accumulated = part
+        if end_marker in accumulated:
+            accumulated = accumulated.split(end_marker)[0].strip()
+            break
+        if len(part.strip()) < 80:
+            break
+    return normalize_report_markdown(accumulated)
 
 
 def build_main_context(md_content: str, text_report: str, vision_summaries: str, image_ids: List[str]) -> str:
@@ -985,7 +1034,7 @@ def generate_research_section(
 【已生成的第1-7节主报告】
 {core_report}
 """
-    return normalize_report_markdown(research_agent.generate([prompt]))
+    return generate_until_marker(research_agent, prompt)
 
 
 def audit_prompt_for(
@@ -1056,7 +1105,7 @@ def audit_and_revise_report(
 
 请严格根据审校意见修订整篇 Markdown 报告，只输出修订后的最终报告。
 """
-        final_report = normalize_report_markdown(main_agent.generate([revise_prompt]))
+        final_report = generate_until_marker(main_agent, revise_prompt, end_marker="[END_OF_REPORT]", max_rounds=3, max_tokens=7000)
 
     return final_report, last_audit_result
 
@@ -1195,11 +1244,32 @@ def render_analysis_ui(pdf_bytes: bytes):
                 use_container_width=True,
             )
         with col2:
-            pdf_markdown = embed_base64_images(
-                st.session_state.final_main_report,
-                st.session_state.temp_images,
-            )
-            download_pdf_component(pdf_markdown)
+            pdf_cache_key = hashlib.md5(
+                (st.session_state.final_main_report + '||' + '|'.join(st.session_state.temp_images.keys())).encode('utf-8')
+            ).hexdigest()
+            if st.session_state.get('final_pdf_hash') != pdf_cache_key:
+                with st.spinner('正在生成高质量 PDF（矢量文本排版）...'):
+                    try:
+                        st.session_state.final_pdf_bytes = build_pdf_bytes_from_markdown(
+                            st.session_state.final_main_report,
+                            st.session_state.temp_images,
+                        )
+                        st.session_state.final_pdf_hash = pdf_cache_key
+                    except Exception as e:
+                        st.session_state.final_pdf_bytes = b''
+                        st.session_state.final_pdf_hash = None
+                        st.error(f'PDF 生成失败：{e}')
+
+            if st.session_state.get('final_pdf_bytes'):
+                st.download_button(
+                    '下载高质量 PDF 报告',
+                    data=st.session_state.final_pdf_bytes,
+                    file_name='论文全维度透视报告.pdf',
+                    mime='application/pdf',
+                    use_container_width=True,
+                )
+            else:
+                st.info('当前未成功生成 PDF，请先查看上方报错信息。')
 
         # 审校结果默认折叠，方便排查“为什么某些节没有生成/被修订”这类问题
         if st.session_state.get("final_audit_result"):
@@ -1272,6 +1342,8 @@ DEFAULT_STATES = {
     "current_pdf_hash": None,
     "final_main_report": "",
     "final_audit_result": "",
+    "final_pdf_bytes": b"",
+    "final_pdf_hash": None,
     "temp_images": {},
 }
 
