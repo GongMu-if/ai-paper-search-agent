@@ -755,24 +755,34 @@ def register_pdf_fonts():
 
 
 def mixed_inline_markup(text: str) -> str:
-    """
-    让英文/数字优先走 Times-Roman，中文走 STSong-Light。
-    返回 ReportLab Paragraph 可识别的简易富文本。
-    """
-    text = html.escape(text)
     if not text:
         return ""
+    text = html.escape(text)
 
-    parts = []
-    pattern = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@\[\]\{\}<>\'\"\s]+)')
-    for chunk in pattern.split(text):
-        if not chunk:
-            continue
-        if pattern.fullmatch(chunk):
-            parts.append(f'<font name="Times-Roman">{chunk}</font>')
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+
+    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+    text = re.sub(r'\$(.*?)\$', r'<b><i>\1</i></b>', text)
+    text = re.sub(r'`(.*?)`', r'<font name="Times-Roman" color="#224488"> \1 </font>', text)
+
+    parts = re.split(r'(<[^>]+>)', text)
+    final_output = []
+    
+    en_pattern = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@\[\]\{\}<>\'\"\s\^\*]+)')
+
+    for p in parts:
+        if p.startswith('<'):
+            final_output.append(p)
         else:
-            parts.append(f'<font name="STSong-Light">{chunk}</font>')
-    return "".join(parts)
+            sub_chunks = en_pattern.split(p)
+            for chunk in sub_chunks:
+                if not chunk: continue
+                if en_pattern.fullmatch(chunk):
+                    final_output.append(f'<font name="Times-Roman">{chunk}</font>')
+                else:
+                    final_output.append(f'<font name="STSong-Light">{chunk}</font>')
+                    
+    return "".join(final_output)
 
 
 def build_pdf_styles():
@@ -856,21 +866,11 @@ def build_pdf_styles():
 # 模块 10：Markdown 自定义块解析
 # ==========================================
 def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
-    """
-    自定义 Markdown 块解析器。
-
-    只解析当前系统真正会生成的几类结构：
-    - 标题：## / ###
-    - 图片：![caption](id)
-    - 表格标题：表1：...
-    - Markdown 表格：| a | b |
-    - 普通段落：空行分隔
-    """
+    """优化版块解析器：确保标题识别的唯一性"""
     text = normalize_report_markdown(md_text)
     lines = text.split("\n")
-    blocks: List[Tuple[str, object]] = []
-
-    paragraph_buffer: List[str] = []
+    blocks = []
+    paragraph_buffer = []
 
     def flush_paragraph():
         if paragraph_buffer:
@@ -889,18 +889,26 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             i += 1
             continue
 
+        # 标题处理
         if stripped.startswith("## "):
             flush_paragraph()
             blocks.append(("h2", stripped[3:].strip()))
             i += 1
             continue
-
         if stripped.startswith("### "):
             flush_paragraph()
             blocks.append(("h3", stripped[4:].strip()))
             i += 1
             continue
 
+        # 表格标题处理 (表 X: )
+        if re.match(r'^表\s*\d+\s*[：:]', stripped) or re.match(r'^表\s*\d+\s+', stripped):
+            flush_paragraph()
+            blocks.append(("table_title", stripped))
+            i += 1
+            continue
+
+        # 图片语法处理
         img_match = re.fullmatch(r'!\[(.*?)\]\((.*?)\)', stripped)
         if img_match:
             flush_paragraph()
@@ -908,12 +916,7 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             i += 1
             continue
 
-        if re.match(r'^表\s*\d+\s*[：:]', stripped) or re.match(r'^表\s*\d+\s+', stripped):
-            flush_paragraph()
-            blocks.append(("table_title", stripped))
-            i += 1
-            continue
-
+        # Markdown 表格处理
         if stripped.startswith("|"):
             flush_paragraph()
             table_lines = [stripped]
@@ -925,6 +928,7 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             i = j
             continue
 
+        # 普通正文
         paragraph_buffer.append(stripped)
         i += 1
 
@@ -1040,14 +1044,6 @@ def markdown_table_flowable(table_lines: List[str], styles):
 
 
 def build_story_from_markdown(md_text: str, images_dict: Dict[str, str]) -> List:
-    """
-    将最终 markdown 报告转换为 ReportLab story。
-
-    关键处理：
-    - 标题使用专门样式，不与正文同字号。
-    - 标题 keepWithNext，尽量避免标题掉到页末单独一行。
-    - 自定义块解析器确保段落按空行正确分段。
-    """
     styles = build_pdf_styles()
     doc_title, body = split_title_and_body(md_text)
     blocks = split_markdown_blocks(body)
@@ -1057,8 +1053,6 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str]) -> List
         Spacer(1, 8),
     ]
 
-    pending_table_title = None
-
     for block_type, payload in blocks:
         if block_type == "h2":
             story.append(Paragraph(mixed_inline_markup(str(payload)), styles["h2"]))
@@ -1067,27 +1061,25 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str]) -> List
             story.append(Paragraph(mixed_inline_markup(str(payload)), styles["h3"]))
 
         elif block_type == "table_title":
-            pending_table_title = str(payload)
+            # 立即渲染表格标题，样式自带 keepWithNext 属性
+            story.append(Paragraph(mixed_inline_markup(str(payload)), styles["table_title"]))
 
         elif block_type == "paragraph":
             story.append(Paragraph(mixed_inline_markup(str(payload)), styles["body"]))
 
         elif block_type == "image":
             caption, key = payload
-            if pending_table_title:
-                story.append(Paragraph(mixed_inline_markup(pending_table_title), styles["table_title"]))
-                pending_table_title = None
             img_block = image_flowable(caption, key, images_dict, styles)
             if img_block:
                 story.append(img_block)
 
         elif block_type == "md_table":
-            if pending_table_title:
-                story.append(Paragraph(mixed_inline_markup(pending_table_title), styles["table_title"]))
-                pending_table_title = None
             tbl = markdown_table_flowable(payload, styles)
             if tbl is not None:
-                story.append(KeepTogether([tbl, Spacer(1, 6)]))
+                # 给表格加一个简单的包裹，确保间距
+                story.append(Spacer(1, 2))
+                story.append(tbl)
+                story.append(Spacer(1, 6))
 
     return story
 
