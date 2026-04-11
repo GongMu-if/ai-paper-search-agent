@@ -1812,7 +1812,8 @@ if "vision_summaries" not in st.session_state:
     st.session_state.vision_summaries = ""
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = {}
-
+if "feedback_start_time" not in st.session_state:
+    st.session_state.feedback_start_time = None
 
 # ==========================================
 # 模块 16：业务路由与检索循环
