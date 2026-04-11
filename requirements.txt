@@ -1,7 +1,8 @@
 streamlit
-requests
 openai
-Pillow
-beautifulsoup4
-mistune
+requests
 markdown
+beautifulsoup4
+Pillow
+reportlab
+
