@@ -781,7 +781,7 @@ INLINE_MARKUP_TOKEN_RE = re.compile(
     r'(\*\*[^\n]+?\*\*|__[^\n]+?__|\$[^$\n]+\$|\\\([^\n]+?\\\)|\\\[[^\n]+?\\\]|`[^`\n]+`)',
     flags=re.S,
 )
-ASCII_TEXT_RE = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@\[\]\{\}<>\'\"\s]+)')
+ASCII_TEXT_RE = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@&\[\]\{\}<>\'\"\s]+)')
 
 
 def strip_outer_markdown_markers(text: str) -> str:
@@ -934,41 +934,51 @@ def render_formula_image(
         return None
 
 
-def wrap_plain_text_for_paragraph(text: str) -> str:
+def wrap_plain_text_for_paragraph(text: str, bold: bool = False) -> str:
+    """
+    将普通文本转换为 ReportLab Paragraph 可识别的安全行内标记。
+
+    设计原则：
+    - 常规英数字使用 Times-Roman / Times-Bold，确保英文加粗真正生效；
+    - 中文与其他非 ASCII 文本默认走 STSong-Light；
+    - 对中文加粗场景，不再嵌套 <font> 到 <b> 内，避免被解析成普通字重或触发字体映射异常。
+    """
     escaped = html.escape(text)
     if not escaped:
         return ''
 
     parts = []
+    ascii_font = 'Times-Bold' if bold else 'Times-Roman'
     for chunk in ASCII_TEXT_RE.split(escaped):
         if not chunk:
             continue
         if ASCII_TEXT_RE.fullmatch(chunk):
-            parts.append(f'<font name="Times-Roman">{chunk}</font>')
+            parts.append(f'<font name="{ascii_font}">{chunk}</font>')
         else:
-            parts.append(f'<font name="STSong-Light">{chunk}</font>')
+            if bold:
+                parts.append(f'<b>{chunk}</b>')
+            else:
+                parts.append(f'<font name="STSong-Light">{chunk}</font>')
     return ''.join(parts)
-
 
 def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: float = 12.0) -> str:
     asset = render_formula_image(formula_text, asset_ctx, font_size=font_size, display=False)
     if not asset:
         fallback = extract_formula_text(formula_text)
-        return f'<font name="DejaVuSans">{html.escape(fallback)}</font>'
+        return wrap_plain_text_for_paragraph(fallback)
 
     return (
         f'<img src="{html.escape(asset["path"], quote=True)}" '
         f'width="{asset["width"]:.2f}" height="{asset["height"]:.2f}" valign="middle"/>'
     )
 
-
-def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None) -> str:
+def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, bold: bool = False) -> str:
     """
     渲染 ReportLab Paragraph 可识别的行内富文本：
     - 普通文本保留中英文字体切换
     - **bold** / __bold__ 会转为真正的加粗样式
-    - $...$ / \\(...\\) / `公式` 会优先渲染为公式图片
-    - 非公式代码仍使用等宽字体展示
+    - $...$ / \(...\) / `公式` 会优先渲染为公式图片
+    - 非公式代码使用标准 Courier / Courier-Bold，避免依赖环境字体导致崩溃
     """
     value = text or ''
     if not value:
@@ -981,13 +991,13 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None) -
     start = 0
     for match in INLINE_MARKUP_TOKEN_RE.finditer(value):
         if match.start() > start:
-            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()]))
+            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()], bold=bold))
 
         token = match.group(0)
         if token.startswith('**') and token.endswith('**'):
-            parts.append(f'<b>{mixed_inline_markup(token[2:-2], asset_ctx)}</b>')
+            parts.append(mixed_inline_markup(token[2:-2], asset_ctx, bold=True))
         elif token.startswith('__') and token.endswith('__'):
-            parts.append(f'<b>{mixed_inline_markup(token[2:-2], asset_ctx)}</b>')
+            parts.append(mixed_inline_markup(token[2:-2], asset_ctx, bold=True))
         elif token.startswith('$') and token.endswith('$'):
             parts.append(inline_math_markup(token[1:-1], asset_ctx))
         elif token.startswith(r'\(') and token.endswith(r'\)'):
@@ -999,14 +1009,14 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None) -
             if looks_like_formula_text(inner):
                 parts.append(inline_math_markup(inner, asset_ctx))
             else:
-                parts.append(f'<font name="DejaVuSansMono">{html.escape(inner)}</font>')
+                code_font = 'Courier-Bold' if bold else 'Courier'
+                parts.append(f'<font name="{code_font}">{html.escape(inner)}</font>')
         start = match.end()
 
     if start < len(value):
-        parts.append(wrap_plain_text_for_paragraph(value[start:]))
+        parts.append(wrap_plain_text_for_paragraph(value[start:], bold=bold))
 
     return ''.join(parts)
-
 
 def build_pdf_styles():
     """构造 PDF 所有样式，标题字号明显大于正文，并启用 keepWithNext。"""
@@ -1368,7 +1378,7 @@ def math_block_flowable(formula_text: str, asset_ctx: Dict[str, Any]) -> Optiona
             return None
         fallback_style = ParagraphStyle(
             'MathFallback',
-            fontName='DejaVuSans',
+            fontName='STSong-Light',
             fontSize=11.5,
             leading=16,
             alignment=TA_CENTER,
@@ -1395,7 +1405,6 @@ def math_block_flowable(formula_text: str, asset_ctx: Dict[str, Any]) -> Optiona
         eq_img,
         Spacer(1, 8),
     ])
-
 
 def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_ctx: Dict[str, Any]) -> List:
     """
