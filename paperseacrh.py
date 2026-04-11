@@ -10,7 +10,7 @@ import hashlib
 import tempfile
 from io import BytesIO
 from typing import Any, Dict, List, Tuple, Optional
-
+import datetime
 import requests
 import streamlit as st
 from openai import OpenAI
@@ -252,8 +252,8 @@ ISSUES:
 # 模块 4：检索 Agent Prompt
 # ==========================================
 def get_system_prompt(requirements, preprint_rule):
-    """构造检索 Agent 的系统提示词。"""
-    if preprint_rule == "仅限同行评审文献 (排除预印本)":
+    current_year = datetime.datetime.now().year
+    if preprint_rule == "排除预印本 (仅限正规期刊/会议)":
         preprint_prompt = "严禁选择 Venue 为 'Unknown Venue/Preprint' 的预印本论文。"
     else:
         preprint_prompt = "可以接受预印本论文。"
@@ -261,26 +261,28 @@ def get_system_prompt(requirements, preprint_rule):
     return f"""
 你是一个科研论文搜索专家。你的任务是根据研究方向，在近一年内的论文中筛选六篇。
 
-# 工作流程
-1. 通过 search_and_detail_papers 工具获得相关论文的标题、摘要和 Introduction。
-2. 将符合要求的记录在 Thought 中作为“备选池”累加。
-3. 学习同义词或近义词，作为下一次查询词。【警告】：严禁直接加入用户要求中的关键词。
-4. 如果论文不符合或没有摘要：直接摒弃。
-5. 最终选出最好的六篇。
+# 你的工作流程：
+1. 通过`search_and_detail_papers`工具来获得相关论文的标题、摘要和Introduction。
+2. 每次搜索后，阅读标题、摘要和Introduction。如果符合用户的具体要求，将其记录在你的 Thought 中作为“备选池”累加。
+3. 每次阅读完一批论文后，学习同义词或近义词，作为下一次的 `search_and_detail_papers` 查询词。【警告】：新query必须是纯粹同义词，严禁加入用户要求中的关键词！
+4. 如果不符合或无法获取摘要：摒弃该论文。
+5. 最终在备选池中选出最好的六篇来作为结果。
 
-# 用户要求
+# 用户的具体筛选要求：
 {requirements}
 {preprint_prompt}
 
-# 输出格式
-Thought: [你的思考逻辑]
+# 输出格式要求：
+Thought: [你的思考逻辑，包括学习到的新关键词]
 Action: [执行工具或结束]
 
-Action 格式支持：
-1. search_and_detail_papers(query="关键词")
-2. Finish:
-使用 Markdown 直接列出最终 6 篇论文（标题、Venue、DOI、推荐理由）。
-不要多余说明。
+Action格式支持以下两种：
+1. 继续搜索时输出：
+search_and_detail_papers(query="关键词")
+
+2. 已经选够6篇好论文结束时输出：
+Finish:
+在此处使用 Markdown 格式直接列出选出的 6 篇论文（必须包含 1.标题 2.Venue 3.DOI 4.推荐理由）。不要写多余的话。
 """
 
 
@@ -1699,11 +1701,6 @@ def render_single_analysis_result(
 
 
 def render_analysis_ui(pdf_inputs):
-    """
-    上传论文后的主工作流：
-    - 支持单篇 PDF 分析
-    - 支持多篇 PDF 同时上传，并分别生成各自报告与 PDF
-    """
     entries: List[Tuple[str, bytes]] = []
 
     if isinstance(pdf_inputs, bytes):
@@ -1883,8 +1880,15 @@ if st.session_state.app_state == "RUNNING":
         while True:
             st.session_state.loop_count += 1
             i = st.session_state.loop_count
+            
+            if i == 1:
+                loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
+            else:
+                loop_reminder = (
+                    "系统提示: 请继续执行检索。如果你在对比后认为备选池中的Top 6论文已经完美符合用户的全部要求，【警告】：新query必须是纯粹同义词，严禁加入方法论关键词！"
+                    "如果找齐了，请输出 Action: Finish: [推荐结果]。否则请继续 search_and_detail_papers。"
+                )
 
-            loop_reminder = "系统提示：正在执行检索……" if i > 1 else "系统提示：第一次循环开始……"
             st.session_state.prompt_history.append(loop_reminder)
 
             output = st.session_state.agent.generate(st.session_state.prompt_history)
@@ -1919,33 +1923,60 @@ if st.session_state.app_state == "RUNNING":
             if tool_match:
                 tool_name, args_str = tool_match.group(1), tool_match.group(2)
                 raw_kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
-                observation = available_tools[tool_name](**raw_kwargs) if tool_name in available_tools else "Observation: 工具不存在。"
-                st.session_state.prompt_history.append(observation)
-
-            if i >= 10:
-                st.session_state.final_result = "Agent 超过最大迭代轮数，已停止本轮检索。你可以修改要求后重新检索。"
-                st.session_state.app_state = "COMPLETED"
-                st.rerun()
-                break
+                if tool_name in available_tools:
+                    import inspect
+                    allowed_keys = inspect.signature(available_tools[tool_name]).parameters.keys()
+                    kwargs = {k: v for k, v in raw_kwargs.items() if k in allowed_keys}
+                    
+                    if "query" in kwargs:
+                        observation = available_tools[tool_name](**kwargs)
+                    else:
+                        observation = "错误：必须提供query参数。"
+                else:
+                    observation = f"错误:未定义的工具 '{tool_name}'"
+            else:
+                observation = "错误:Action格式无法解析。"
+                
+            st.session_state.prompt_history.append(f"Observation: {observation}")
 
 elif st.session_state.app_state == "WAITING_FEEDBACK":
-    st.markdown("### 阶段性检索结果展示")
-    with st.container(border=True):
-        st.markdown(st.session_state.final_result)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("满意，确认检索组合", use_container_width=True):
+    # --- 超时检测逻辑 ---
+    if st.session_state.feedback_start_time:
+        elapsed_time = time.time() - st.session_state.feedback_start_time
+        remaining_time = 1800 - elapsed_time
+        
+        if remaining_time <= 0:
             st.session_state.app_state = "COMPLETED"
             st.rerun()
+        st_autorefresh(interval=10000, key="feedback_timer")
+        mins_left = int(remaining_time // 60)
+        st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
+
+    st.markdown("### 阶段性检索结果展示")
+    st.write("请审阅 Agent 挑选出的文献，判断是否符合您的要求：")
+    
+    with st.container(border=True):
+        st.markdown(st.session_state.final_result)
+    
+    st.divider()
+    st.markdown("#### 您对当前的文献组合满意吗？")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("满意，结束检索", use_container_width=True):
+            st.session_state.app_state = "COMPLETED"
+            st.rerun()
+            
     with col2:
-        with st.popover("不满意，修改筛选条件", use_container_width=True):
-            new_req = st.text_area("指出不符合要求的地方 / 添加新约束：")
-            if st.button("提交纠偏指令"):
-                st.session_state.prompt_history.append(f"用户反馈: {new_req}")
-                st.session_state.has_provided_feedback = True
-                st.session_state.app_state = "RUNNING"
-                st.rerun()
+        with st.popover("不满意，修改要求", use_container_width=True):
+            new_req = st.text_area("请指出不符合要求的地方：")
+            if st.button("提交新要求并继续"):
+                if new_req.strip():
+                    feedback_prompt = f"用户反馈: 【{new_req}】。请基于此继续筛选 Top 6。"
+                    st.session_state.prompt_history.append(feedback_prompt)
+                    st.session_state.has_provided_feedback = True 
+                    st.session_state.app_state = "RUNNING"
+                    st.rerun()
 
 elif st.session_state.app_state == "COMPLETED":
     st.success("文献检索任务已完成！")
