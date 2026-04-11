@@ -2,11 +2,14 @@
 # 模块 1：依赖导入与页面配置
 # ==========================================
 import re
+import os
 import time
 import html
 import base64
+import hashlib
+import tempfile
 from io import BytesIO
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 import streamlit as st
@@ -32,6 +35,7 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
 
 st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout="wide")
 
@@ -745,34 +749,263 @@ def generate_full_report(md_content: str, text_report: str, vision_summaries: st
 def register_pdf_fonts():
     """
     注册 PDF 字体：
-    - STSong-Light：ReportLab 内建中文 CID 字体
-    - Times-Roman：ReportLab 内建西文字体，用于英文和数字
+    - STSong-Light：中文主字体
+    - DejaVuSans / DejaVuSans-Bold：公式、符号与西文加粗回退
+    - DejaVuSansMono：代码与等宽文本
     """
     try:
         pdfmetrics.getFont("STSong-Light")
     except KeyError:
         pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
 
+    font_candidates = {
+        "DejaVuSans": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "DejaVuSansMono": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    }
+    registered = set(pdfmetrics.getRegisteredFontNames())
+    for name, path in font_candidates.items():
+        if name in registered or not os.path.exists(path):
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont(name, path))
+        except Exception:
+            continue
 
-def mixed_inline_markup(text: str) -> str:
-    """
-    让英文/数字优先走 Times-Roman，中文走 STSong-Light。
-    返回 ReportLab Paragraph 可识别的简易富文本。
-    """
-    text = html.escape(text)
-    if not text:
-        return ""
+
+TABLE_TITLE_LINE_RE = re.compile(
+    r'^(?:表|table)\s*\d+(?:\s*[：:.-]|(?:\s+[-–—]\s+)|\s+).+',
+    flags=re.I,
+)
+INLINE_MARKUP_TOKEN_RE = re.compile(
+    r'(\*\*[^\n]+?\*\*|__[^\n]+?__|\$[^$\n]+\$|\\\([^\n]+?\\\)|\\\[[^\n]+?\\\]|`[^`\n]+`)',
+    flags=re.S,
+)
+ASCII_TEXT_RE = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@\[\]\{\}<>\'\"\s]+)')
+
+
+def strip_outer_markdown_markers(text: str) -> str:
+    value = (text or '').strip()
+    patterns = [
+        r'^\*\*(.*?)\*\*$',
+        r'^__(.*?)__$',
+        r'^`(.*?)`$',
+        r'^_(.*?)_$',
+    ]
+
+    changed = True
+    while changed:
+        changed = False
+        for pattern in patterns:
+            match = re.fullmatch(pattern, value, flags=re.S)
+            if match:
+                value = match.group(1).strip()
+                changed = True
+    return value
+
+
+def normalize_compare_text(text: str) -> str:
+    cleaned = strip_outer_markdown_markers(text)
+    cleaned = re.sub(r'[\s`*_~：:.,，。；;、\-—–（）()\[\]{}]+', '', cleaned)
+    return cleaned.lower()
+
+
+def normalize_table_title_line(text: str) -> str:
+    return re.sub(r'\s+', ' ', strip_outer_markdown_markers(text)).strip()
+
+
+def is_table_title_line(text: str) -> bool:
+    return bool(TABLE_TITLE_LINE_RE.match(normalize_table_title_line(text)))
+
+
+def looks_like_formula_text(text: str) -> bool:
+    candidate = extract_formula_text(text)
+    if not candidate:
+        return False
+
+    explicit_tokens = [
+        r'\frac', r'\sum', r'\prod', r'\sqrt', r'\alpha', r'\beta', r'\gamma',
+        r'\theta', r'\lambda', r'\mu', r'\sigma', r'\omega', r'\mathbf',
+        r'\mathrm', r'\mathcal', r'\mathbb', r'\hat', r'\tilde', r'\left',
+        r'\right', r'\begin', r'\end', r'\log', r'\exp', r'\arg', r'\max',
+        r'\min',
+    ]
+    if any(token in candidate for token in explicit_tokens):
+        return True
+
+    operator_count = sum(ch in candidate for ch in '=<>^_\\+-*/')
+    has_letter = bool(re.search(r'[A-Za-zΑ-Ωα-ω]', candidate))
+    return has_letter and operator_count >= 1
+
+
+def extract_formula_text(text: str) -> str:
+    candidate = (text or '').strip()
+    if not candidate:
+        return ''
+
+    if candidate.startswith('$$') and candidate.endswith('$$') and len(candidate) >= 4:
+        candidate = candidate[2:-2]
+    elif candidate.startswith(r'\(') and candidate.endswith(r'\)') and len(candidate) >= 4:
+        candidate = candidate[2:-2]
+    elif candidate.startswith(r'\[') and candidate.endswith(r'\]') and len(candidate) >= 4:
+        candidate = candidate[2:-2]
+    elif candidate.startswith('`') and candidate.endswith('`') and len(candidate) >= 2:
+        candidate = candidate[1:-1]
+
+    candidate = re.sub(r'^```(?:math|latex|tex)?\s*', '', candidate, flags=re.I)
+    candidate = re.sub(r'\s*```$', '', candidate)
+    candidate = candidate.replace('\r\n', '\n').replace('\r', '\n')
+    candidate = '\n'.join([line.strip() for line in candidate.split('\n') if line.strip()])
+    return candidate.strip()
+
+
+def sanitize_formula_for_render(text: str) -> str:
+    expr = extract_formula_text(text)
+    if not expr:
+        return ''
+
+    expr = re.sub(r'\\begin\{[^{}]+\}', '', expr)
+    expr = re.sub(r'\\end\{[^{}]+\}', '', expr)
+    expr = expr.replace('&', ' ')
+    expr = expr.replace('\\\\', ' ')
+    expr = expr.replace(r'\displaystyle', '')
+    expr = expr.replace('−', '-').replace('–', '-').replace('—', '-')
+    expr = re.sub(r'\\label\{.*?\}', '', expr)
+    expr = re.sub(r'\\tag\{.*?\}', '', expr)
+    expr = re.sub(r'\\nonumber\b', '', expr)
+    expr = re.sub(
+        r'\\text\s*\{([^{}]*)\}',
+        lambda m: r'\mathrm{' + m.group(1).replace(' ', r'\ ') + '}',
+        expr,
+    )
+    expr = re.sub(
+        r'\\operatorname\s*\{([^{}]*)\}',
+        lambda m: r'\mathrm{' + m.group(1).replace(' ', r'\ ') + '}',
+        expr,
+    )
+    expr = re.sub(r'\s+', ' ', expr).strip()
+    return expr
+
+
+def create_formula_asset_context(formula_dir: str) -> Dict[str, Any]:
+    return {
+        'formula_dir': formula_dir,
+        'formula_cache': {},
+    }
+
+
+def render_formula_image(
+    formula_text: str,
+    asset_ctx: Dict[str, Any],
+    font_size: float = 12.0,
+    display: bool = False,
+) -> Optional[Dict[str, Any]]:
+    expr = sanitize_formula_for_render(formula_text)
+    if not expr:
+        return None
+
+    cache_key = hashlib.sha256(
+        f"{font_size:.2f}|{int(display)}|{expr}".encode('utf-8')
+    ).hexdigest()
+    cached = asset_ctx['formula_cache'].get(cache_key)
+    if cached and os.path.exists(cached['path']):
+        return cached
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        from matplotlib.font_manager import FontProperties
+        from matplotlib.mathtext import math_to_image
+
+        output_path = os.path.join(asset_ctx['formula_dir'], f'formula_{cache_key}.png')
+        prop = FontProperties(family='DejaVu Sans', size=font_size + (2 if display else 0))
+        math_to_image(f'${expr}$', output_path, prop=prop, dpi=220, format='png', color='black')
+
+        reader = ImageReader(output_path)
+        width_px, height_px = reader.getSize()
+        asset = {
+            'path': output_path,
+            'width': width_px * 72.0 / 220.0,
+            'height': height_px * 72.0 / 220.0,
+        }
+        asset_ctx['formula_cache'][cache_key] = asset
+        return asset
+    except Exception:
+        return None
+
+
+def wrap_plain_text_for_paragraph(text: str) -> str:
+    escaped = html.escape(text)
+    if not escaped:
+        return ''
 
     parts = []
-    pattern = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@\[\]\{\}<>\'\"\s]+)')
-    for chunk in pattern.split(text):
+    for chunk in ASCII_TEXT_RE.split(escaped):
         if not chunk:
             continue
-        if pattern.fullmatch(chunk):
+        if ASCII_TEXT_RE.fullmatch(chunk):
             parts.append(f'<font name="Times-Roman">{chunk}</font>')
         else:
             parts.append(f'<font name="STSong-Light">{chunk}</font>')
-    return "".join(parts)
+    return ''.join(parts)
+
+
+def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: float = 12.0) -> str:
+    asset = render_formula_image(formula_text, asset_ctx, font_size=font_size, display=False)
+    if not asset:
+        fallback = extract_formula_text(formula_text)
+        return f'<font name="DejaVuSans">{html.escape(fallback)}</font>'
+
+    return (
+        f'<img src="{html.escape(asset["path"], quote=True)}" '
+        f'width="{asset["width"]:.2f}" height="{asset["height"]:.2f}" valign="middle"/>'
+    )
+
+
+def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None) -> str:
+    """
+    渲染 ReportLab Paragraph 可识别的行内富文本：
+    - 普通文本保留中英文字体切换
+    - **bold** / __bold__ 会转为真正的加粗样式
+    - $...$ / \\(...\\) / `公式` 会优先渲染为公式图片
+    - 非公式代码仍使用等宽字体展示
+    """
+    value = text or ''
+    if not value:
+        return ''
+
+    if asset_ctx is None:
+        asset_ctx = create_formula_asset_context(tempfile.gettempdir())
+
+    parts = []
+    start = 0
+    for match in INLINE_MARKUP_TOKEN_RE.finditer(value):
+        if match.start() > start:
+            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()]))
+
+        token = match.group(0)
+        if token.startswith('**') and token.endswith('**'):
+            parts.append(f'<b>{mixed_inline_markup(token[2:-2], asset_ctx)}</b>')
+        elif token.startswith('__') and token.endswith('__'):
+            parts.append(f'<b>{mixed_inline_markup(token[2:-2], asset_ctx)}</b>')
+        elif token.startswith('$') and token.endswith('$'):
+            parts.append(inline_math_markup(token[1:-1], asset_ctx))
+        elif token.startswith(r'\(') and token.endswith(r'\)'):
+            parts.append(inline_math_markup(token[2:-2], asset_ctx))
+        elif token.startswith(r'\[') and token.endswith(r'\]'):
+            parts.append(inline_math_markup(token[2:-2], asset_ctx))
+        elif token.startswith('`') and token.endswith('`'):
+            inner = token[1:-1]
+            if looks_like_formula_text(inner):
+                parts.append(inline_math_markup(inner, asset_ctx))
+            else:
+                parts.append(f'<font name="DejaVuSansMono">{html.escape(inner)}</font>')
+        start = match.end()
+
+    if start < len(value):
+        parts.append(wrap_plain_text_for_paragraph(value[start:]))
+
+    return ''.join(parts)
 
 
 def build_pdf_styles():
@@ -862,7 +1095,8 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
     只解析当前系统真正会生成的几类结构：
     - 标题：## / ###
     - 图片：![caption](id)
-    - 表格标题：表1：...
+    - 表格标题：表1：... / Table 1: ...
+    - 公式块：$$...$$ / \\[...\\] / ```latex``` / 常见公式环境
     - Markdown 表格：| a | b |
     - 普通段落：空行分隔
     """
@@ -901,6 +1135,72 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             i += 1
             continue
 
+        if stripped.startswith("```"):
+            flush_paragraph()
+            fence_lang = stripped[3:].strip().lower()
+            fenced_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                fenced_lines.append(lines[i].rstrip())
+                i += 1
+            if i < len(lines) and lines[i].strip().startswith("```"):
+                i += 1
+
+            block_text = "\n".join([x for x in fenced_lines if x.strip()]).strip()
+            if block_text:
+                if fence_lang in {"math", "latex", "tex"} or looks_like_formula_text(block_text):
+                    blocks.append(("math_block", block_text))
+                else:
+                    blocks.append(("paragraph", " ".join([x.strip() for x in fenced_lines if x.strip()])))
+            continue
+
+        if re.match(r'^\\begin\{[^{}]+\}$', stripped):
+            flush_paragraph()
+            env_lines = [stripped]
+            i += 1
+            while i < len(lines):
+                env_lines.append(lines[i].strip())
+                if re.match(r'^\\end\{[^{}]+\}$', lines[i].strip()):
+                    i += 1
+                    break
+                i += 1
+            blocks.append(("math_block", "\n".join(env_lines)))
+            continue
+
+        if stripped.startswith("$$") or stripped.startswith(r"\["):
+            flush_paragraph()
+            opener, closer = ("$$", "$$") if stripped.startswith("$$") else (r"\[", r"\]")
+            formula_lines = []
+            current = stripped
+
+            if current.startswith(opener):
+                current = current[len(opener):]
+
+            if current.endswith(closer) and current.strip() != closer:
+                current = current[:-len(closer)]
+                if current.strip():
+                    formula_lines.append(current.strip())
+                i += 1
+            else:
+                if current.strip():
+                    formula_lines.append(current.strip())
+                i += 1
+                while i < len(lines):
+                    current = lines[i].strip()
+                    if current.endswith(closer):
+                        tail = current[:-len(closer)].strip()
+                        if tail:
+                            formula_lines.append(tail)
+                        i += 1
+                        break
+                    formula_lines.append(current)
+                    i += 1
+
+            formula_text = "\n".join([x for x in formula_lines if x])
+            if formula_text:
+                blocks.append(("math_block", formula_text))
+            continue
+
         img_match = re.fullmatch(r'!\[(.*?)\]\((.*?)\)', stripped)
         if img_match:
             flush_paragraph()
@@ -908,9 +1208,9 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             i += 1
             continue
 
-        if re.match(r'^表\s*\d+\s*[：:]', stripped) or re.match(r'^表\s*\d+\s+', stripped):
+        if is_table_title_line(stripped):
             flush_paragraph()
-            blocks.append(("table_title", stripped))
+            blocks.append(("table_title", normalize_table_title_line(stripped)))
             i += 1
             continue
 
@@ -980,7 +1280,14 @@ def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
     return iw * scale, ih * scale
 
 
-def image_flowable(caption: str, key: str, images_dict: Dict[str, str], styles) -> Optional[KeepTogether]:
+def image_flowable(
+    caption: str,
+    key: str,
+    images_dict: Dict[str, str],
+    styles,
+    asset_ctx: Dict[str, Any],
+    suppress_caption: bool = False,
+) -> Optional[KeepTogether]:
     """构造图片块（图片 + 图注）。"""
     matched_b64 = None
     for img_name, b64 in images_dict.items():
@@ -988,9 +1295,12 @@ def image_flowable(caption: str, key: str, images_dict: Dict[str, str], styles) 
             matched_b64 = b64
             break
 
+    display_caption = (caption or key).strip()
     if not matched_b64:
+        if suppress_caption:
+            return KeepTogether([Spacer(1, 4)])
         return KeepTogether([
-            Paragraph(mixed_inline_markup(f"[未匹配到图片] {caption or key}"), styles["caption"]),
+            Paragraph(mixed_inline_markup(f"[未匹配到图片] {display_caption}", asset_ctx), styles["caption"]),
             Spacer(1, 4),
         ])
 
@@ -999,20 +1309,22 @@ def image_flowable(caption: str, key: str, images_dict: Dict[str, str], styles) 
         reader = ImageReader(img_bytes)
         w, h = classify_image_size(reader)
         rl_img = RLImage(img_bytes, width=w, height=h)
-        return KeepTogether([
-            Spacer(1, 4),
-            rl_img,
-            Paragraph(mixed_inline_markup(caption or key), styles["caption"]),
-            Spacer(1, 4),
-        ])
+
+        items = [Spacer(1, 4), rl_img]
+        if display_caption and not suppress_caption:
+            items.append(Paragraph(mixed_inline_markup(display_caption, asset_ctx), styles["caption"]))
+        items.append(Spacer(1, 4))
+        return KeepTogether(items)
     except Exception:
+        if suppress_caption:
+            return KeepTogether([Spacer(1, 4)])
         return KeepTogether([
-            Paragraph(mixed_inline_markup(f"[图片加载失败] {caption or key}"), styles["caption"]),
+            Paragraph(mixed_inline_markup(f"[图片加载失败] {display_caption}", asset_ctx), styles["caption"]),
             Spacer(1, 4),
         ])
 
 
-def markdown_table_flowable(table_lines: List[str], styles):
+def markdown_table_flowable(table_lines: List[str], styles, asset_ctx: Dict[str, Any]):
     """构造 Markdown 表格的 Flowable。"""
     data = parse_md_table(table_lines)
     if not data:
@@ -1024,7 +1336,7 @@ def markdown_table_flowable(table_lines: List[str], styles):
 
     wrapped = []
     for row in data:
-        wrapped.append([Paragraph(mixed_inline_markup(cell), styles["body"]) for cell in row])
+        wrapped.append([Paragraph(mixed_inline_markup(cell, asset_ctx), styles["body"]) for cell in row])
 
     tbl = Table(wrapped, colWidths=[col_width] * cols, repeatRows=1)
     tbl.setStyle(TableStyle([
@@ -1039,7 +1351,53 @@ def markdown_table_flowable(table_lines: List[str], styles):
     return tbl
 
 
-def build_story_from_markdown(md_text: str, images_dict: Dict[str, str]) -> List:
+def captions_equivalent(left: str, right: str) -> bool:
+    norm_left = normalize_compare_text(left)
+    norm_right = normalize_compare_text(right)
+    if not norm_left or not norm_right:
+        return False
+    return norm_left == norm_right or norm_left in norm_right or norm_right in norm_left
+
+
+def math_block_flowable(formula_text: str, asset_ctx: Dict[str, Any]) -> Optional[KeepTogether]:
+    """将块级公式渲染为独立图片，避免在 PDF 中显示为代码或乱码。"""
+    asset = render_formula_image(formula_text, asset_ctx, font_size=14.5, display=True)
+    if not asset:
+        fallback_text = extract_formula_text(formula_text)
+        if not fallback_text:
+            return None
+        fallback_style = ParagraphStyle(
+            'MathFallback',
+            fontName='DejaVuSans',
+            fontSize=11.5,
+            leading=16,
+            alignment=TA_CENTER,
+            spaceBefore=4,
+            spaceAfter=8,
+        )
+        return KeepTogether([
+            Paragraph(html.escape(fallback_text), fallback_style),
+            Spacer(1, 6),
+        ])
+
+    max_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
+    width = asset["width"]
+    height = asset["height"]
+    if width > max_width * 0.92:
+        scale = (max_width * 0.92) / width
+        width *= scale
+        height *= scale
+
+    eq_img = RLImage(asset["path"], width=width, height=height)
+    eq_img.hAlign = 'CENTER'
+    return KeepTogether([
+        Spacer(1, 4),
+        eq_img,
+        Spacer(1, 8),
+    ])
+
+
+def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_ctx: Dict[str, Any]) -> List:
     """
     将最终 markdown 报告转换为 ReportLab story。
 
@@ -1047,48 +1405,77 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str]) -> List
     - 标题使用专门样式，不与正文同字号。
     - 标题 keepWithNext，尽量避免标题掉到页末单独一行。
     - 自定义块解析器确保段落按空行正确分段。
+    - 行内 bold / 公式 / 代码会在 PDF 中被正确渲染。
+    - 表题与图表 caption 做去重，避免重复显示。
     """
     styles = build_pdf_styles()
     doc_title, body = split_title_and_body(md_text)
     blocks = split_markdown_blocks(body)
 
     story = [
-        Paragraph(mixed_inline_markup(doc_title), styles["title"]),
+        Paragraph(mixed_inline_markup(doc_title, asset_ctx), styles["title"]),
         Spacer(1, 8),
     ]
 
-    pending_table_title = None
+    pending_table_title: Optional[str] = None
+
+    def emit_pending_table_title():
+        nonlocal pending_table_title
+        if pending_table_title:
+            story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
+            pending_table_title = None
 
     for block_type, payload in blocks:
         if block_type == "h2":
-            story.append(Paragraph(mixed_inline_markup(str(payload)), styles["h2"]))
+            emit_pending_table_title()
+            story.append(Paragraph(mixed_inline_markup(str(payload), asset_ctx), styles["h2"]))
 
         elif block_type == "h3":
-            story.append(Paragraph(mixed_inline_markup(str(payload)), styles["h3"]))
+            emit_pending_table_title()
+            story.append(Paragraph(mixed_inline_markup(str(payload), asset_ctx), styles["h3"]))
 
         elif block_type == "table_title":
             pending_table_title = str(payload)
 
         elif block_type == "paragraph":
-            story.append(Paragraph(mixed_inline_markup(str(payload)), styles["body"]))
+            paragraph_text = str(payload)
+            if pending_table_title and captions_equivalent(paragraph_text, pending_table_title):
+                continue
+            story.append(Paragraph(mixed_inline_markup(paragraph_text, asset_ctx), styles["body"]))
+
+        elif block_type == "math_block":
+            emit_pending_table_title()
+            formula_block = math_block_flowable(str(payload), asset_ctx)
+            if formula_block is not None:
+                story.append(formula_block)
 
         elif block_type == "image":
             caption, key = payload
+            suppress_caption = False
             if pending_table_title:
-                story.append(Paragraph(mixed_inline_markup(pending_table_title), styles["table_title"]))
+                story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
+                suppress_caption = captions_equivalent(caption, pending_table_title)
                 pending_table_title = None
-            img_block = image_flowable(caption, key, images_dict, styles)
+            img_block = image_flowable(
+                caption=caption,
+                key=key,
+                images_dict=images_dict,
+                styles=styles,
+                asset_ctx=asset_ctx,
+                suppress_caption=suppress_caption,
+            )
             if img_block:
                 story.append(img_block)
 
         elif block_type == "md_table":
             if pending_table_title:
-                story.append(Paragraph(mixed_inline_markup(pending_table_title), styles["table_title"]))
+                story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
                 pending_table_title = None
-            tbl = markdown_table_flowable(payload, styles)
+            tbl = markdown_table_flowable(payload, styles, asset_ctx)
             if tbl is not None:
                 story.append(KeepTogether([tbl, Spacer(1, 6)]))
 
+    emit_pending_table_title()
     return story
 
 
@@ -1126,6 +1513,7 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
     - 文字为真实矢量文本，不是截图
     - 段落、标题、图片、表格按 story 排版
     - 分页由 ReportLab 控制，避免 html2canvas 裁字
+    - 公式与加粗会在这一层被正确渲染
     """
     register_pdf_fonts()
     buffer = BytesIO()
@@ -1141,8 +1529,10 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
         author="AI 论文检索 Agent",
     )
 
-    story = build_story_from_markdown(md_text, images_dict)
-    doc.build(story)
+    with tempfile.TemporaryDirectory(prefix='paper_report_formula_') as formula_dir:
+        asset_ctx = create_formula_asset_context(formula_dir)
+        story = build_story_from_markdown(md_text, images_dict, asset_ctx)
+        doc.build(story)
 
     pdf_bytes = buffer.getvalue()
     buffer.close()
@@ -1152,58 +1542,51 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
 # ==========================================
 # 模块 13：论文精读主流程
 # ==========================================
-def render_analysis_ui(pdf_bytes: bytes):
+def get_pdf_cache_key(pdf_bytes: bytes) -> str:
+    """为每篇论文生成稳定缓存键，支持多文件分别缓存。"""
+    return hashlib.sha256(pdf_bytes).hexdigest()
+
+
+def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
     """
-    上传论文后的主工作流：
+    单篇论文的完整分析流程：
     1. 远端解析 PDF
     2. Text Agent 输出 FACT_BANK + 文本综述
     3. Vision Agent 输出 FIGURE_CARD
     4. 主报告逐节生成
     5. 服务器端生成高清 PDF
     """
-    file_hash = hash(pdf_bytes)
+    result = analyze_pdf_with_modal(pdf_bytes)
+    if not (result and result.get("status") == "success"):
+        return None
 
-    if st.session_state.get("current_pdf_hash") != file_hash:
-        st.session_state.current_pdf_hash = file_hash
-        st.session_state.final_main_report = ""
-        st.session_state.final_pdf_bytes = None
-        st.session_state.temp_images = {}
-        st.session_state.source_markdown = ""
-        st.session_state.text_report = ""
-        st.session_state.vision_summaries = ""
+    md_content = result["markdown"]
+    ordered_images = sort_images_by_doc_order(md_content, result.get("images", {}))
+    images_dict = dict(ordered_images)
 
-        result = analyze_pdf_with_modal(pdf_bytes)
-        if result and result.get("status") == "success":
-            md_content = result["markdown"]
-            st.session_state.source_markdown = md_content
+    with st.spinner("文本专家正在精读全篇文本……"):
+        text_agent = LLMClient(
+            sys_prompt=TEXT_AGENT_PROMPT,
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+            max_tokens=6000,
+        )
+        text_report = text_agent.generate([f"请详尽解析此论文：\n{md_content}"])
 
-            ordered_images = sort_images_by_doc_order(md_content, result.get("images", {}))
-            st.session_state.temp_images = dict(ordered_images)
-
-            with st.spinner("文本专家正在精读全篇文本……"):
-                text_agent = LLMClient(
-                    sys_prompt=TEXT_AGENT_PROMPT,
-                    api_key=DEEPSEEK_API_KEY,
-                    base_url=DEEPSEEK_BASE_URL,
-                    max_tokens=6000,
-                )
-                text_report = text_agent.generate([f"请详尽解析此论文：\n{md_content}"])
-                st.session_state.text_report = text_report
-
-            vision_summaries = ""
-            if st.session_state.temp_images:
-                with st.spinner(f"视觉专家正在分析 {len(st.session_state.temp_images)} 张关键图表……"):
-                    vision_agent = LLMClient(
-                        sys_prompt=VISION_AGENT_PROMPT,
-                        model="qwen3.6-plus",
-                        api_key=QWEN_API_KEY,
-                        base_url=QWEN_BASE_URL,
-                        max_tokens=3000,
-                    )
-                    cards = []
-                    for name, b64 in ordered_images:
-                        local_context = extract_local_context(md_content, name)
-                        vision_prompt = f"""
+    vision_summaries = ""
+    if images_dict:
+        with st.spinner(f"视觉专家正在分析 {len(images_dict)} 张关键图表……"):
+            vision_agent = LLMClient(
+                sys_prompt=VISION_AGENT_PROMPT,
+                model="qwen3.6-plus",
+                api_key=QWEN_API_KEY,
+                base_url=QWEN_BASE_URL,
+                max_tokens=3000,
+            )
+            cards = []
+            for name, b64 in ordered_images:
+                local_context = extract_local_context(md_content, name)
+                vision_prompt = f"""
 请基于以下论文上下文与图片，严格输出 FIGURE_CARD。
 
 【图片ID】
@@ -1215,59 +1598,134 @@ def render_analysis_ui(pdf_bytes: bytes):
 【论文整体上下文摘要】
 {build_source_pack(md_content, max_chars=4000)}
 """
-                        v_res = vision_agent.generate_with_images(vision_prompt, [b64])
-                        cards.append(f"\n--- 图表标识: {name} ---\n{v_res}\n")
-                    vision_summaries = "\n".join(cards)
-                    st.session_state.vision_summaries = vision_summaries
+                v_res = vision_agent.generate_with_images(vision_prompt, [b64])
+                cards.append(f"\n--- 图表标识: {name} ---\n{v_res}\n")
+            vision_summaries = "\n".join(cards)
 
-            with st.spinner("总策划正在逐节生成终极报告……"):
-                report = generate_full_report(
-                    md_content=md_content,
-                    text_report=st.session_state.text_report,
-                    vision_summaries=st.session_state.vision_summaries,
-                    image_ids=list(st.session_state.temp_images.keys()),
-                )
-                st.session_state.final_main_report = normalize_report_markdown(report)
+    with st.spinner("总策划正在逐节生成终极报告……"):
+        report = generate_full_report(
+            md_content=md_content,
+            text_report=text_report,
+            vision_summaries=vision_summaries,
+            image_ids=list(images_dict.keys()),
+        )
+        final_main_report = normalize_report_markdown(report)
 
-            if is_report_truncated(st.session_state.final_main_report):
-                with st.spinner("检测到报告可能截断，正在补全缺失内容……"):
-                    report = generate_full_report(
-                        md_content=md_content,
-                        text_report=st.session_state.text_report,
-                        vision_summaries=st.session_state.vision_summaries,
-                        image_ids=list(st.session_state.temp_images.keys()),
-                    )
-                    st.session_state.final_main_report = normalize_report_markdown(report)
-
-            with st.spinner("正在服务器端排版并生成高清 PDF……"):
-                st.session_state.final_pdf_bytes = build_pdf_bytes_from_markdown(
-                    st.session_state.final_main_report,
-                    st.session_state.temp_images,
-                )
-
-    if st.session_state.final_main_report:
-        st.success("论文深度透视报告已生成！")
-        render_report_with_images(st.session_state.final_main_report, st.session_state.temp_images)
-
-        st.divider()
-        st.markdown("### 导出与下载")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "下载报告原文（Markdown）",
-                st.session_state.final_main_report,
-                file_name="论文全维度深度透视报告.md",
-                mime="text/markdown",
-                use_container_width=True,
+    if is_report_truncated(final_main_report):
+        with st.spinner("检测到报告可能截断，正在补全缺失内容……"):
+            report = generate_full_report(
+                md_content=md_content,
+                text_report=text_report,
+                vision_summaries=vision_summaries,
+                image_ids=list(images_dict.keys()),
             )
-        with col2:
-            st.download_button(
-                "下载高清 PDF 报告",
-                st.session_state.final_pdf_bytes,
-                file_name="论文全维度深度透视报告.pdf",
-                mime="application/pdf",
-                use_container_width=True,
+            final_main_report = normalize_report_markdown(report)
+
+    with st.spinner("正在服务器端排版并生成高清 PDF……"):
+        final_pdf_bytes = build_pdf_bytes_from_markdown(final_main_report, images_dict)
+
+    return {
+        "source_markdown": md_content,
+        "text_report": text_report,
+        "vision_summaries": vision_summaries,
+        "images": images_dict,
+        "main_report": final_main_report,
+        "pdf_bytes": final_pdf_bytes,
+    }
+
+
+def get_or_create_analysis_result(pdf_bytes: bytes) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """读取或创建单篇论文分析结果，支持多文件分别缓存。"""
+    cache_key = get_pdf_cache_key(pdf_bytes)
+    cache_pool = st.session_state.analysis_results
+    if cache_key in cache_pool and cache_pool[cache_key] is not None:
+        return cache_key, cache_pool[cache_key]
+
+    analysis_result = build_analysis_result(pdf_bytes)
+    if analysis_result is not None:
+        cache_pool[cache_key] = analysis_result
+    else:
+        cache_pool.pop(cache_key, None)
+    return cache_key, analysis_result
+
+
+def build_export_filename(source_name: str, suffix: str) -> str:
+    base_name = re.sub(r'(?i)\.pdf$', '', (source_name or '').strip())
+    base_name = re.sub(r'[\\/:*?"<>|]+', '_', base_name).strip() or '论文'
+    return f"{base_name}{suffix}"
+
+
+def render_single_analysis_result(
+    analysis_result: Dict[str, Any],
+    cache_key: str,
+    source_name: str,
+    show_paper_title: bool = False,
+):
+    if show_paper_title:
+        st.markdown(f"### {source_name}")
+    st.success("论文深度透视报告已生成！")
+    render_report_with_images(analysis_result["main_report"], analysis_result["images"])
+
+    st.divider()
+    st.markdown("### 导出与下载")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "下载报告原文（Markdown）",
+            analysis_result["main_report"],
+            file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
+            mime="text/markdown",
+            use_container_width=True,
+            key=f"download_md_{cache_key}",
+        )
+    with col2:
+        st.download_button(
+            "下载高清 PDF 报告",
+            analysis_result["pdf_bytes"],
+            file_name=build_export_filename(source_name, "_论文全维度深度透视报告.pdf"),
+            mime="application/pdf",
+            use_container_width=True,
+            key=f"download_pdf_{cache_key}",
+        )
+
+
+def render_analysis_ui(pdf_inputs):
+    """
+    上传论文后的主工作流：
+    - 支持单篇 PDF 分析
+    - 支持多篇 PDF 同时上传，并分别生成各自报告与 PDF
+    """
+    entries: List[Tuple[str, bytes]] = []
+
+    if isinstance(pdf_inputs, bytes):
+        entries.append(("论文.pdf", pdf_inputs))
+    else:
+        for idx, uploaded in enumerate(pdf_inputs or [], start=1):
+            if uploaded is None:
+                continue
+            paper_name = getattr(uploaded, 'name', f'paper_{idx}.pdf')
+            if hasattr(uploaded, 'getvalue'):
+                entries.append((paper_name, uploaded.getvalue()))
+            else:
+                entries.append((paper_name, uploaded))
+
+    if not entries:
+        return
+
+    multi_mode = len(entries) > 1
+    for idx, (paper_name, pdf_bytes) in enumerate(entries, start=1):
+        if multi_mode:
+            st.markdown(f"## 第 {idx} 篇论文")
+        cache_key, analysis_result = get_or_create_analysis_result(pdf_bytes)
+        if analysis_result:
+            render_single_analysis_result(
+                analysis_result=analysis_result,
+                cache_key=cache_key,
+                source_name=paper_name,
+                show_paper_title=multi_mode,
             )
+        if multi_mode and idx < len(entries):
+            st.divider()
 
 
 # ==========================================
@@ -1303,6 +1761,7 @@ with st.sidebar:
         type="pdf",
         key="sb_pdf",
         help="跳过检索步骤，直接对已有文献生成精读报告",
+        accept_multiple_files=True,
     )
 
     start_analyze_button = st.button(
@@ -1345,6 +1804,8 @@ if "text_report" not in st.session_state:
     st.session_state.text_report = ""
 if "vision_summaries" not in st.session_state:
     st.session_state.vision_summaries = ""
+if "analysis_results" not in st.session_state:
+    st.session_state.analysis_results = {}
 
 
 # ==========================================
@@ -1353,7 +1814,7 @@ if "vision_summaries" not in st.session_state:
 if start_analyze_button and sidebar_pdf:
     st.markdown("---")
     st.info("正在启动【直接解析模式】，开始解构文献……")
-    render_analysis_ui(sidebar_pdf.read())
+    render_analysis_ui(sidebar_pdf)
     st.stop()
 
 if start_button:
@@ -1485,9 +1946,9 @@ elif st.session_state.app_state == "COMPLETED":
 
     st.divider()
     st.header("开启深度解读工作流")
-    st.info("从上方选定并下载任意一篇论文的 PDF，在此上传，系统将自动生成完整 8 节精读报告，并导出高清 PDF。")
+    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 8 节精读报告，并导出各自的高清 PDF。")
 
-    uploaded_pdf = st.file_uploader("上传 PDF 文件以获取精读报告", type="pdf", key="bottom_pdf")
+    uploaded_pdf = st.file_uploader("上传 PDF 文件以获取精读报告", type="pdf", key="bottom_pdf", accept_multiple_files=True)
     bottom_start_btn = st.button(
         "开始深度解读",
         type="primary",
@@ -1495,7 +1956,7 @@ elif st.session_state.app_state == "COMPLETED":
         use_container_width=True,
     )
     if bottom_start_btn and uploaded_pdf:
-        render_analysis_ui(uploaded_pdf.read())
+        render_analysis_ui(uploaded_pdf)
 
     if st.button("开启全新检索轮次", type="primary"):
         st.session_state.clear()
