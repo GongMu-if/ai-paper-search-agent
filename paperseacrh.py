@@ -1916,7 +1916,11 @@ if st.session_state.app_state == "RUNNING":
             if action_str.startswith("Finish"):
                 clean_result = re.sub(r"^Finish\s*[:：\[]?\s*", "", action_str).rstrip("]").strip()
                 st.session_state.final_result = clean_result
-                st.session_state.app_state = "WAITING_FEEDBACK" if not st.session_state.has_provided_feedback else "COMPLETED"
+                if not st.session_state.has_provided_feedback:
+                    st.session_state.app_state = "WAITING_FEEDBACK"
+                    st.session_state.feedback_start_time = time.time()
+                else:
+                    st.session_state.app_state = "COMPLETED"
                 st.rerun()
                 break
 
@@ -1981,6 +1985,10 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
 
 elif st.session_state.app_state == "COMPLETED":
     st.success("文献检索任务已完成！")
+    if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
+        elapsed = time.time() - st.session_state.feedback_start_time
+        if elapsed > 1800:
+            st.warning("提示：由于超过 30 分钟未响应，系统已为您自动确认最终结果。")
     st.markdown("### 最终确认的 Top 6 核心论文推荐")
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
