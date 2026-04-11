@@ -784,6 +784,12 @@ INLINE_MARKUP_TOKEN_RE = re.compile(
     flags=re.S,
 )
 ASCII_TEXT_RE = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@&\[\]\{\}<>\'\"\s]+)')
+MATH_UNICODE_HINT_RE = re.compile(
+    r'[\u0300-\u036F\u0370-\u03FF\u2070-\u209F\u2100-\u214F\u2190-\u22FF\u27C0-\u27EF\u2980-\u2AFF\U0001D400-\U0001D7FF]'
+)
+RAW_INLINE_FORMULA_SCAN_RE = re.compile(
+    r'[A-Za-z0-9\u0300-\u036F\u0370-\u03FF\u2070-\u209F\u2100-\u214F\u2190-\u22FF\u27C0-\u27EF\u2980-\u2AFF\U0001D400-\U0001D7FF_\\\^=+\-*/(){}\[\]<>|% ]+'
+)
 
 
 def strip_outer_markdown_markers(text: str) -> str:
@@ -820,10 +826,44 @@ def is_table_title_line(text: str) -> bool:
     return bool(TABLE_TITLE_LINE_RE.match(normalize_table_title_line(text)))
 
 
+def looks_like_raw_inline_formula(text: str) -> bool:
+    candidate = strip_outer_markdown_markers(text).strip()
+    if not candidate:
+        return False
+
+    candidate = re.sub(r'\s+', ' ', candidate)
+    if len(candidate) > 96:
+        return False
+
+    if MATH_UNICODE_HINT_RE.search(candidate):
+        return True
+
+    has_ascii_letter = bool(re.search(r'[A-Za-z]', candidate))
+    if not has_ascii_letter:
+        return False
+
+    if ('\\' in candidate) or ('_' in candidate) or ('^' in candidate) or ('=' in candidate):
+        return True
+
+    if '/' in candidate:
+        parts = [part.strip() for part in candidate.split('/') if part.strip()]
+        if 2 <= len(parts) <= 3 and all(
+            re.fullmatch(r'[A-Za-z0-9]{1,12}', part) or
+            re.fullmatch(r'[A-Za-z0-9]{1,12}_[A-Za-z0-9]{1,12}', part)
+            for part in parts
+        ):
+            return True
+
+    return False
+
+
 def looks_like_formula_text(text: str) -> bool:
     candidate = extract_formula_text(text)
     if not candidate:
         return False
+
+    if looks_like_raw_inline_formula(candidate):
+        return True
 
     explicit_tokens = [
         r'\frac', r'\sum', r'\prod', r'\sqrt', r'\alpha', r'\beta', r'\gamma',
@@ -963,6 +1003,48 @@ def wrap_plain_text_for_paragraph(text: str, bold: bool = False) -> str:
                 parts.append(f'<font name="STSong-Light">{chunk}</font>')
     return ''.join(parts)
 
+def wrap_plain_text_with_auto_formula(text: str, asset_ctx: Dict[str, Any], bold: bool = False) -> str:
+    """
+    对普通文本做二次扫描：
+    - 常规中英文仍按原字体逻辑输出；
+    - 对未被 $...$ 包裹、但明显是公式的原始片段（如 μ_d、ℒ_sup、𝑧_𝑡、L_d / L_t）
+      自动转成行内公式图片，避免在 PDF 里变成方框或乱码。
+    """
+    value = text or ''
+    if not value:
+        return ''
+
+    parts: List[str] = []
+    start = 0
+    for match in RAW_INLINE_FORMULA_SCAN_RE.finditer(value):
+        token = match.group(0)
+        if not looks_like_raw_inline_formula(token):
+            continue
+
+        if match.start() > start:
+            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()], bold=bold))
+
+        leading_ws = token[: len(token) - len(token.lstrip())]
+        trailing_ws = token[len(token.rstrip()):]
+        core = token.strip()
+
+        if leading_ws:
+            parts.append(wrap_plain_text_for_paragraph(leading_ws, bold=bold))
+
+        if core:
+            parts.append(inline_math_markup(core, asset_ctx))
+
+        if trailing_ws:
+            parts.append(wrap_plain_text_for_paragraph(trailing_ws, bold=bold))
+
+        start = match.end()
+
+    if start < len(value):
+        parts.append(wrap_plain_text_for_paragraph(value[start:], bold=bold))
+
+    return ''.join(parts)
+
+
 def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: float = 12.0) -> str:
     asset = render_formula_image(formula_text, asset_ctx, font_size=font_size, display=False)
     if not asset:
@@ -993,7 +1075,7 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
     start = 0
     for match in INLINE_MARKUP_TOKEN_RE.finditer(value):
         if match.start() > start:
-            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()], bold=bold))
+            parts.append(wrap_plain_text_with_auto_formula(value[start:match.start()], asset_ctx, bold=bold))
 
         token = match.group(0)
         if token.startswith('**') and token.endswith('**'):
@@ -1016,7 +1098,7 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
         start = match.end()
 
     if start < len(value):
-        parts.append(wrap_plain_text_for_paragraph(value[start:], bold=bold))
+        parts.append(wrap_plain_text_with_auto_formula(value[start:], asset_ctx, bold=bold))
 
     return ''.join(parts)
 
@@ -1095,7 +1177,6 @@ def build_pdf_styles():
         "caption": caption_style,
         "table_title": table_title_style,
     }
-
 
 # ==========================================
 # 模块 10：Markdown 自定义块解析
@@ -1489,7 +1570,6 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_c
     emit_pending_table_title()
     return story
 
-
 # ==========================================
 # 模块 12：PDF 文档模板
 # ==========================================
@@ -1644,7 +1724,6 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
         "pdf_bytes": final_pdf_bytes,
     }
 
-
 def get_or_create_analysis_result(pdf_bytes: bytes) -> Tuple[str, Optional[Dict[str, Any]]]:
     """读取或创建单篇论文分析结果，支持多文件分别缓存。"""
     cache_key = get_pdf_cache_key(pdf_bytes)
@@ -1699,8 +1778,12 @@ def render_single_analysis_result(
             key=f"download_pdf_{cache_key}",
         )
 
-
 def render_analysis_ui(pdf_inputs):
+    """
+    上传论文后的主工作流：
+    - 支持单篇 PDF 分析
+    - 支持多篇 PDF 同时上传，并分别生成各自报告与 PDF
+    """
     entries: List[Tuple[str, bytes]] = []
 
     if isinstance(pdf_inputs, bytes):
@@ -1732,7 +1815,6 @@ def render_analysis_ui(pdf_inputs):
             )
         if multi_mode and idx < len(entries):
             st.divider()
-
 
 # ==========================================
 # 模块 14：前端 UI
