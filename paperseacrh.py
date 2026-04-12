@@ -11,11 +11,11 @@ import tempfile
 import unicodedata
 from io import BytesIO
 from typing import Any, Dict, List, Tuple, Optional
-
+import datetime
 import requests
 import streamlit as st
 from openai import OpenAI
-
+from streamlit_autorefresh import st_autorefresh
 # 服务器端 PDF 排版依赖
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
