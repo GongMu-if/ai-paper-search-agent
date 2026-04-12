@@ -777,8 +777,9 @@ def register_pdf_fonts():
             continue
 
 
+
 TABLE_TITLE_LINE_RE = re.compile(
-    r'^(?:表|table)\s*\d+(?:\s*[：:.-]|(?:\s+[-–—]\s+)|\s+).+',
+    r'^(?:表|table)\s*(?:\d+|[IVXLCDM]+|[一二三四五六七八九十百千万]+)(?:\s*[：:.-]|(?:\s+[-–—]\s+)|\s+).+',
     flags=re.I,
 )
 INLINE_MARKUP_TOKEN_RE = re.compile(
@@ -820,6 +821,42 @@ SPECIAL_FORMULA_CHAR_MAP = {
     '≥': r'\ge', '≠': r'\neq', '±': r'\pm', '∞': r'\infty', '∑': r'\sum',
     '∏': r'\prod', '√': r'\sqrt',
 }
+SUPERSCRIPT_CHAR_MAP = {
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    '⁺': '+', '⁻': '-', '⁼': '=', '⁽': '(', '⁾': ')',
+    'ⁿ': 'n', 'ⁱ': 'i',
+}
+SUBSCRIPT_CHAR_MAP = {
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    '₊': '+', '₋': '-', '₌': '=', '₍': '(', '₎': ')',
+    'ₐ': 'a', 'ₑ': 'e', 'ₕ': 'h', 'ᵢ': 'i', 'ⱼ': 'j',
+    'ₖ': 'k', 'ₗ': 'l', 'ₘ': 'm', 'ₙ': 'n', 'ₒ': 'o',
+    'ₚ': 'p', 'ᵣ': 'r', 'ₛ': 's', 'ₜ': 't', 'ᵤ': 'u',
+    'ᵥ': 'v', 'ₓ': 'x',
+}
+UNICODE_SUPERSCRIPT_CHARS = ''.join(SUPERSCRIPT_CHAR_MAP.keys())
+UNICODE_SUBSCRIPT_CHARS = ''.join(SUBSCRIPT_CHAR_MAP.keys())
+SPECIAL_FORMULA_RUN_RE = re.compile(
+    rf'(?:'
+    rf'[A-Za-zΑ-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]�?[_^][A-Za-z0-9Α-Ωα-ω]+'
+    rf'|'
+    rf'[A-Za-zΑ-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+[{re.escape(UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)}]+'
+    rf')'
+)
+CAPTION_CORE_RE = re.compile(
+    r'^(?:表|图|table|figure)\s*(?:\d+|[IVXLCDM]+|[一二三四五六七八九十百千万]+)?\s*[：:.-]?\s*(.+)$',
+    flags=re.I,
+)
+BULLET_LINE_RE = re.compile(r'^[*•\-]\s+(.*)$')
+ORDERED_LIST_LINE_RE = re.compile(
+    r'^((?:\(?\d+[\).、])|(?:[A-Za-z][\).])|(?:[一二三四五六七八九十]+[、.]))\s*(.*)$'
+)
+INLINE_BULLET_SPLIT_RE = re.compile(
+    r'\s+\*\s+(?=(?:对应缺口/模块|改造方案|预期收益|验证方式|技术风险|对应缺口|技术风险)[:：])'
+)
+PAREN_FORMULA_CANDIDATE_RE = re.compile(r'[（(][^（）()\n]{1,80}[）)]')
 
 
 def strip_outer_markdown_markers(text: str) -> str:
@@ -852,6 +889,14 @@ def normalize_table_title_line(text: str) -> str:
     return re.sub(r'\s+', ' ', strip_outer_markdown_markers(text)).strip()
 
 
+def normalize_caption_core_text(text: str) -> str:
+    cleaned = normalize_table_title_line(text)
+    match = CAPTION_CORE_RE.match(cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+    return normalize_compare_text(cleaned)
+
+
 def is_table_title_line(text: str) -> bool:
     return bool(TABLE_TITLE_LINE_RE.match(normalize_table_title_line(text)))
 
@@ -880,8 +925,48 @@ def collapse_spaced_math_braces(text: str) -> str:
     return value
 
 
-def normalize_math_unicode_to_latex(text: str) -> str:
+def convert_unicode_scripts_to_tex(text: str) -> str:
     value = text
+    if UNICODE_SUBSCRIPT_CHARS:
+        sub_re = re.compile(r'[' + re.escape(UNICODE_SUBSCRIPT_CHARS) + r']+')
+        value = sub_re.sub(
+            lambda m: '_{' + ''.join(SUBSCRIPT_CHAR_MAP[ch] for ch in m.group(0)) + '}',
+            value,
+        )
+    if UNICODE_SUPERSCRIPT_CHARS:
+        sup_re = re.compile(r'[' + re.escape(UNICODE_SUPERSCRIPT_CHARS) + r']+')
+        value = sup_re.sub(
+            lambda m: '^{' + ''.join(SUPERSCRIPT_CHAR_MAP[ch] for ch in m.group(0)) + '}',
+            value,
+        )
+    return value
+
+
+def repair_broken_formula_glyphs(text: str) -> str:
+    value = text or ''
+    value = value.replace('￾', '').replace('￼', '').replace('\u00ad', '')
+    value = re.sub(
+        r'([xX])�(?=_[dDtT])',
+        lambda m: r'\tilde{' + m.group(1).lower() + '}',
+        value,
+    )
+    value = re.sub(
+        r'([A-Za-zΑ-Ωα-ω])�(?=_[A-Za-z0-9])',
+        lambda m: r'\hat{' + m.group(1) + '}',
+        value,
+    )
+    value = re.sub(
+        r'([A-Za-zΑ-Ωα-ω])�',
+        lambda m: r'\hat{' + m.group(1) + '}',
+        value,
+    )
+    return value
+
+
+def normalize_math_unicode_to_latex(text: str) -> str:
+    value = repair_broken_formula_glyphs(text)
+    value = value.replace('（', '(').replace('）', ')').replace('，', ',').replace('：', ':')
+    value = convert_unicode_scripts_to_tex(value)
     for raw, latex in SPECIAL_FORMULA_CHAR_MAP.items():
         value = value.replace(raw, latex)
 
@@ -913,7 +998,11 @@ def looks_like_formula_text(text: str) -> bool:
         return False
 
     normalized = collapse_spaced_math_braces(normalize_formula_spacing(candidate))
-    if AUTO_FORMULA_RUN_RE.fullmatch(normalized):
+    if AUTO_FORMULA_RUN_RE.fullmatch(normalized) or SPECIAL_FORMULA_RUN_RE.fullmatch(normalized):
+        return True
+
+    repaired = repair_broken_formula_glyphs(normalized)
+    if repaired != normalized and (AUTO_FORMULA_RUN_RE.search(repaired) or '_' in repaired or '^' in repaired):
         return True
 
     explicit_tokens = [
@@ -927,6 +1016,9 @@ def looks_like_formula_text(text: str) -> bool:
         return True
 
     if re.search(r'[Α-Ωα-ωℒμµ]', normalized):
+        return True
+
+    if any(ch in normalized for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
         return True
 
     operator_count = sum(ch in normalized for ch in "=<>^_+-*/\\")
@@ -960,6 +1052,7 @@ def sanitize_formula_for_render(text: str) -> str:
     if not expr:
         return ''
 
+    expr = repair_broken_formula_glyphs(expr)
     expr = normalize_formula_spacing(expr)
     expr = collapse_spaced_math_braces(expr)
     expr = normalize_math_unicode_to_latex(expr)
@@ -1077,6 +1170,8 @@ def should_auto_render_formula(candidate: str) -> bool:
     stripped = extract_formula_text(candidate)
     if not stripped:
         return False
+    if '�' in stripped or any(ch in stripped for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
+        return True
     if re.fullmatch(r'[A-Z]{2,}(?:-[A-Z]{2,})*', stripped):
         return False
     if re.fullmatch(r'[A-Za-z]{2,}', stripped):
@@ -1099,19 +1194,49 @@ def wrap_plain_text_for_paragraph(
     parts: List[str] = []
     cursor = 0
 
-    while cursor < len(working):
-        match = AUTO_FORMULA_RUN_RE.search(working, cursor)
+    def find_parenthetical_formula(start_pos: int):
+        match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
         if not match:
+            return None
+        candidate = match.group(0).strip()
+        inner = candidate[1:-1].strip()
+        if looks_like_formula_text(inner) or '�' in inner or any(
+            ch in inner for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS
+        ):
+            return match
+        return None
+
+    while cursor < len(working):
+        candidate_matches = []
+        auto_match = AUTO_FORMULA_RUN_RE.search(working, cursor)
+        if auto_match:
+            candidate_matches.append(auto_match)
+
+        special_match = SPECIAL_FORMULA_RUN_RE.search(working, cursor)
+        if special_match:
+            candidate_matches.append(special_match)
+
+        paren_match = find_parenthetical_formula(cursor)
+        if paren_match:
+            candidate_matches.append(paren_match)
+
+        if not candidate_matches:
             parts.append(wrap_plain_text_basic(working[cursor:], bold=bold))
             break
 
+        match = min(candidate_matches, key=lambda m: (m.start(), -(m.end() - m.start())))
         start, end = match.span()
         candidate = match.group(0).strip()
 
         if start > cursor:
             parts.append(wrap_plain_text_basic(working[cursor:start], bold=bold))
 
-        if should_auto_render_formula(candidate):
+        if (
+            should_auto_render_formula(candidate)
+            or '�' in candidate
+            or any(ch in candidate for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)
+            or candidate[:1] in {'(', '（'}
+        ):
             parts.append(inline_math_markup(candidate, asset_ctx))
         else:
             parts.append(wrap_plain_text_basic(candidate, bold=bold))
@@ -1119,6 +1244,7 @@ def wrap_plain_text_for_paragraph(
         cursor = end
 
     return ''.join(parts)
+
 
 
 def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: float = 12.0) -> str:
@@ -1224,6 +1350,14 @@ def build_pdf_styles():
         spaceAfter=PDF_LAYOUT["paragraph_space_after"],
     )
 
+    list_item_style = ParagraphStyle(
+        "ListItem",
+        parent=body_style,
+        firstLineIndent=0,
+        leftIndent=12,
+        spaceAfter=4,
+    )
+
     caption_style = ParagraphStyle(
         "Caption",
         fontName="STSong-Light",
@@ -1250,6 +1384,7 @@ def build_pdf_styles():
         "h2": h2_style,
         "h3": h3_style,
         "body": body_style,
+        "list_item": list_item_style,
         "caption": caption_style,
         "table_title": table_title_style,
     }
@@ -1268,6 +1403,7 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
     - 表格标题：表1：... / Table 1: ...
     - 公式块：$$...$$ / \\[...\\] / ```latex``` / 常见公式环境
     - Markdown 表格：| a | b |
+    - 列表项：* xxx / 1) xxx
     - 普通段落：空行分隔
     """
     text = normalize_report_markdown(md_text)
@@ -1278,10 +1414,52 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
 
     def flush_paragraph():
         if paragraph_buffer:
-            p = " ".join([x.strip() for x in paragraph_buffer if x.strip()]).strip()
-            if p:
-                blocks.append(("paragraph", p))
+            joined = " ".join([x.strip() for x in paragraph_buffer if x.strip()]).strip()
+            if joined:
+                fragments = [frag.strip() for frag in INLINE_BULLET_SPLIT_RE.split(joined) if frag and frag.strip()]
+                if len(fragments) > 1:
+                    head = fragments[0]
+                    if head:
+                        blocks.append(("paragraph", head))
+                    for frag in fragments[1:]:
+                        cleaned = frag.lstrip("*•- ").strip()
+                        if cleaned:
+                            blocks.append(("list_item", f"• {cleaned}"))
+                else:
+                    blocks.append(("paragraph", joined))
             paragraph_buffer.clear()
+
+    def is_structural_block(line: str) -> bool:
+        if not line:
+            return True
+        if line.startswith("## ") or line.startswith("### "):
+            return True
+        if line.startswith("```"):
+            return True
+        if re.match(r'^\\begin\{[^{}]+\}$', line):
+            return True
+        if line.startswith("$$") or line.startswith(r"\["):
+            return True
+        if re.fullmatch(r'!\[(.*?)\]\((.*?)\)', line):
+            return True
+        if is_table_title_line(line):
+            return True
+        if line.startswith("|"):
+            return True
+        if BULLET_LINE_RE.match(line) or ORDERED_LIST_LINE_RE.match(line):
+            return True
+        return False
+
+    def consume_list_item(start_index: int, initial_text: str) -> Tuple[str, int]:
+        item_lines = [initial_text.strip()]
+        j = start_index + 1
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if not nxt or is_structural_block(nxt):
+                break
+            item_lines.append(nxt)
+            j += 1
+        return " ".join([x for x in item_lines if x]).strip(), j
 
     i = 0
     while i < len(lines):
@@ -1303,6 +1481,26 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             flush_paragraph()
             blocks.append(("h3", stripped[4:].strip()))
             i += 1
+            continue
+
+        bullet_match = BULLET_LINE_RE.match(stripped)
+        if bullet_match:
+            flush_paragraph()
+            item_text, next_i = consume_list_item(i, bullet_match.group(1))
+            if item_text:
+                blocks.append(("list_item", f"• {item_text}"))
+            i = next_i
+            continue
+
+        ordered_match = ORDERED_LIST_LINE_RE.match(stripped)
+        if ordered_match:
+            flush_paragraph()
+            marker = ordered_match.group(1).strip()
+            item_text, next_i = consume_list_item(i, ordered_match.group(2))
+            combined = f"{marker} {item_text}".strip()
+            if combined:
+                blocks.append(("list_item", combined))
+            i = next_i
             continue
 
         if stripped.startswith("```"):
@@ -1427,9 +1625,6 @@ def split_title_and_body(md_text: str) -> Tuple[str, str]:
     return "论文全维度深度透视报告", text
 
 
-# ==========================================
-# 模块 11：Flowable 构建
-# ==========================================
 def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
     """根据图片宽高比选择更合适的显示尺寸。"""
     iw, ih = img_reader.getSize()
@@ -1522,8 +1717,8 @@ def markdown_table_flowable(table_lines: List[str], styles, asset_ctx: Dict[str,
 
 
 def captions_equivalent(left: str, right: str) -> bool:
-    norm_left = normalize_compare_text(left)
-    norm_right = normalize_compare_text(right)
+    norm_left = normalize_caption_core_text(left) or normalize_compare_text(left)
+    norm_right = normalize_caption_core_text(right) or normalize_compare_text(right)
     if not norm_left or not norm_right:
         return False
     return norm_left == norm_right or norm_left in norm_right or norm_right in norm_left
@@ -1612,6 +1807,10 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_c
                 continue
             story.append(Paragraph(mixed_inline_markup(paragraph_text, asset_ctx), styles["body"]))
 
+        elif block_type == "list_item":
+            emit_pending_table_title()
+            story.append(Paragraph(mixed_inline_markup(str(payload), asset_ctx), styles["list_item"]))
+
         elif block_type == "math_block":
             emit_pending_table_title()
             formula_block = math_block_flowable(str(payload), asset_ctx)
@@ -1623,7 +1822,7 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_c
             suppress_caption = False
             if pending_table_title:
                 story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
-                suppress_caption = captions_equivalent(caption, pending_table_title)
+                suppress_caption = True
                 pending_table_title = None
             img_block = image_flowable(
                 caption=caption,
@@ -1706,7 +1905,6 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
     pdf_bytes = buffer.getvalue()
     buffer.close()
     return pdf_bytes
-
 
 # ==========================================
 # 模块 13：论文精读主流程
@@ -1895,7 +2093,6 @@ def render_analysis_ui(pdf_inputs):
             )
         if multi_mode and idx < len(entries):
             st.divider()
-
 
 # ==========================================
 # 模块 14：前端 UI
