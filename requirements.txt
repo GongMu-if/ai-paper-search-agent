@@ -5,4 +5,4 @@ markdown
 beautifulsoup4
 Pillow
 reportlab
-
+streamlit-autorefresh
