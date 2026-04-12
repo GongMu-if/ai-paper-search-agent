@@ -2352,12 +2352,17 @@ def get_history_selector_key(username: str) -> str:
 
 
 
+def get_history_reset_flag_key(username: str) -> str:
+    return f"history_reset_pending_{canonical_username(username)}"
+
+
+
 def reset_user_workspace_view(username: Optional[str] = None):
     username = normalize_username(username or st.session_state.get("current_user", ""))
     if not username:
         return
-    selector_key = get_history_selector_key(username)
-    st.session_state[selector_key] = "__workspace__"
+    reset_flag_key = get_history_reset_flag_key(username)
+    st.session_state[reset_flag_key] = True
     st.session_state.selected_history_report_id = None
 
 
@@ -2540,11 +2545,17 @@ def render_auth_ui():
 def render_history_sidebar(username: str):
     history = load_user_report_index(username)
     selector_key = get_history_selector_key(username)
+    reset_flag_key = get_history_reset_flag_key(username)
     options = ["__workspace__"] + [item.get("report_id", "") for item in history if item.get("report_id")]
     meta_map = {item.get("report_id", ""): item for item in history if item.get("report_id")}
 
-    if selector_key not in st.session_state or st.session_state[selector_key] not in options:
+    if (
+        selector_key not in st.session_state
+        or st.session_state[selector_key] not in options
+        or st.session_state.get(reset_flag_key, False)
+    ):
         st.session_state[selector_key] = "__workspace__"
+        st.session_state[reset_flag_key] = False
 
     st.header("历史报告记录")
     selected_id = st.radio(
