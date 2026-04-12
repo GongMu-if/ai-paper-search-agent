@@ -52,6 +52,8 @@ QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 
+ANALYSIS_CACHE_VERSION = "20260412_formula_render_v3"
+
 # 检索时避免重复论文
 seen_paper_ids = set()
 
@@ -858,6 +860,11 @@ INLINE_BULLET_SPLIT_RE = re.compile(
 )
 PAREN_FORMULA_CANDIDATE_RE = re.compile(r'[（(][^（）()\n]{1,80}[）)]')
 
+LIST_ENUMERATOR_ONLY_RE = re.compile(r'^[（(]?[0-9]+[）).、]?$')
+IMPLICIT_SUBSCRIPT_BASE_RE = re.compile(
+    r'(?P<base>\\mathcal\{[A-Za-z]\}|\\mathbb\{[A-Za-z]\}|\\mathrm\{[A-Za-z]\}|\\[A-Za-z]+|[A-Za-z])\{(?P<sub>[A-Za-z][A-Za-z0-9]{0,15})\}'
+)
+
 
 def strip_outer_markdown_markers(text: str) -> str:
     value = (text or '').strip()
@@ -992,9 +999,83 @@ def normalize_math_unicode_to_latex(text: str) -> str:
     return value
 
 
+
+def is_list_enumerator_text(text: str) -> bool:
+    candidate = extract_formula_text(text)
+    if not candidate:
+        return False
+    candidate = candidate.strip().replace('（', '(').replace('）', ')')
+    return bool(LIST_ENUMERATOR_ONLY_RE.fullmatch(candidate)) or bool(re.fullmatch(r'^[A-Za-z][\).]$', candidate))
+
+
+def repair_implicit_subscripts(expr: str) -> str:
+    allowed_symbol_cmds = {
+        r'\alpha', r'\beta', r'\gamma', r'\delta', r'\epsilon', r'\theta',
+        r'\lambda', r'\mu', r'\sigma', r'\omega', r'\phi', r'\psi',
+        r'\rho', r'\nu', r'\kappa', r'\xi', r'\Delta', r'\Gamma',
+        r'\Lambda', r'\Sigma', r'\Pi', r'\Omega', r'\Phi', r'\Psi',
+    }
+
+    def _replace(match):
+        base = match.group('base')
+        sub = match.group('sub')
+        if base.startswith(r'\mathcal{') or base.startswith(r'\mathbb{') or base.startswith(r'\mathrm{'):
+            return f'{base}_{{{sub}}}'
+        if len(base) == 1 and base.isalpha():
+            return f'{base}_{{{sub}}}'
+        if base in allowed_symbol_cmds:
+            return f'{base}_{{{sub}}}'
+        return match.group(0)
+
+    previous = None
+    value = expr
+    while previous != value:
+        previous = value
+        value = IMPLICIT_SUBSCRIPT_BASE_RE.sub(_replace, value)
+    return value
+
+
+def explode_inline_numbered_segments(text: str) -> List[str]:
+    value = (text or '').strip()
+    if not value:
+        return []
+
+    colon_match = re.search(r'[：:]', value)
+    if not colon_match:
+        return [value]
+
+    prefix = value[:colon_match.end()].strip()
+    suffix = value[colon_match.end():].strip()
+    numbered_parts = [
+        part.strip(' ；;')
+        for part in re.split(r'(?=(?:\(?\d+[\).、]))', suffix)
+        if part and part.strip(' ；;')
+    ]
+    if len(numbered_parts) < 2:
+        return [value]
+
+    return [prefix] + numbered_parts
+
+def append_list_item_blocks(blocks: List[Tuple[str, object]], item_text: str, prefix: str = '- '):
+    pieces = explode_inline_numbered_segments(item_text)
+    if not pieces:
+        return
+    for idx, piece in enumerate(pieces):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if idx == 0 and prefix:
+            blocks.append(("list_item", f"{prefix}{piece}"))
+        elif re.match(r'^\(?\d+[\).、]', piece):
+            blocks.append(("list_item", piece))
+        else:
+            blocks.append(("list_item", f"- {piece}"))
+
 def looks_like_formula_text(text: str) -> bool:
     candidate = extract_formula_text(text)
     if not candidate:
+        return False
+    if is_list_enumerator_text(candidate):
         return False
 
     normalized = collapse_spaced_math_braces(normalize_formula_spacing(candidate))
@@ -1024,7 +1105,6 @@ def looks_like_formula_text(text: str) -> bool:
     operator_count = sum(ch in normalized for ch in "=<>^_+-*/\\")
     has_letter = bool(re.search(r'[A-Za-zΑ-Ωα-ω]', normalized))
     return has_letter and operator_count >= 1
-
 
 def extract_formula_text(text: str) -> str:
     candidate = (text or '').strip()
@@ -1056,6 +1136,7 @@ def sanitize_formula_for_render(text: str) -> str:
     expr = normalize_formula_spacing(expr)
     expr = collapse_spaced_math_braces(expr)
     expr = normalize_math_unicode_to_latex(expr)
+    expr = repair_implicit_subscripts(expr)
 
     expr = re.sub(r'\\begin\{[^{}]+\}', '', expr)
     expr = re.sub(r'\\end\{[^{}]+\}', '', expr)
@@ -1116,10 +1197,19 @@ def render_formula_image(
         return cached
 
     try:
+        os.makedirs(asset_ctx['formula_dir'], exist_ok=True)
+        mpl_config_dir = os.path.join(asset_ctx['formula_dir'], 'mplconfig')
+        os.makedirs(mpl_config_dir, exist_ok=True)
+        os.environ['MPLCONFIGDIR'] = mpl_config_dir
+
         import matplotlib
         matplotlib.use('Agg')
+        from matplotlib import rcParams
         from matplotlib.font_manager import FontProperties
         from matplotlib.mathtext import math_to_image
+
+        rcParams['mathtext.fontset'] = 'dejavusans'
+        rcParams['font.family'] = 'DejaVu Sans'
 
         output_path = os.path.join(asset_ctx['formula_dir'], f'formula_{cache_key}.png')
         prop = FontProperties(family='DejaVu Sans', size=font_size + (2 if display else 0))
@@ -1136,7 +1226,6 @@ def render_formula_image(
         return asset
     except Exception:
         return None
-
 
 def wrap_plain_text_basic(text: str, bold: bool = False) -> str:
     """
@@ -1170,14 +1259,15 @@ def should_auto_render_formula(candidate: str) -> bool:
     stripped = extract_formula_text(candidate)
     if not stripped:
         return False
+    if is_list_enumerator_text(stripped):
+        return False
     if '�' in stripped or any(ch in stripped for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
         return True
     if re.fullmatch(r'[A-Z]{2,}(?:-[A-Z]{2,})*', stripped):
         return False
     if re.fullmatch(r'[A-Za-z]{2,}', stripped):
         return False
-    return True
-
+    return looks_like_formula_text(stripped)
 
 def wrap_plain_text_for_paragraph(
     text: str,
@@ -1232,10 +1322,13 @@ def wrap_plain_text_for_paragraph(
             parts.append(wrap_plain_text_basic(working[cursor:start], bold=bold))
 
         if (
-            should_auto_render_formula(candidate)
-            or '�' in candidate
-            or any(ch in candidate for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)
-            or candidate[:1] in {'(', '（'}
+            not is_list_enumerator_text(candidate)
+            and (
+                should_auto_render_formula(candidate)
+                or '�' in candidate
+                or any(ch in candidate for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)
+                or candidate[:1] in {'(', '（'}
+            )
         ):
             parts.append(inline_math_markup(candidate, asset_ctx))
         else:
@@ -1423,8 +1516,7 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
                         blocks.append(("paragraph", head))
                     for frag in fragments[1:]:
                         cleaned = frag.lstrip("*•- ").strip()
-                        if cleaned:
-                            blocks.append(("list_item", f"• {cleaned}"))
+                        append_list_item_blocks(blocks, cleaned, prefix='- ')
                 else:
                     blocks.append(("paragraph", joined))
             paragraph_buffer.clear()
@@ -1487,8 +1579,7 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
         if bullet_match:
             flush_paragraph()
             item_text, next_i = consume_list_item(i, bullet_match.group(1))
-            if item_text:
-                blocks.append(("list_item", f"• {item_text}"))
+            append_list_item_blocks(blocks, item_text, prefix='- ')
             i = next_i
             continue
 
@@ -1497,9 +1588,18 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
             flush_paragraph()
             marker = ordered_match.group(1).strip()
             item_text, next_i = consume_list_item(i, ordered_match.group(2))
-            combined = f"{marker} {item_text}".strip()
-            if combined:
-                blocks.append(("list_item", combined))
+            pieces = explode_inline_numbered_segments(item_text)
+            if pieces:
+                first = f"{marker} {pieces[0]}".strip()
+                blocks.append(("list_item", first))
+                for piece in pieces[1:]:
+                    piece = piece.strip()
+                    if not piece:
+                        continue
+                    if re.match(r'^\(?\d+[\).、]', piece):
+                        blocks.append(("list_item", piece))
+                    else:
+                        blocks.append(("list_item", f"- {piece}"))
             i = next_i
             continue
 
@@ -1598,7 +1698,6 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
 
     flush_paragraph()
     return blocks
-
 
 def parse_md_table(table_lines: List[str]) -> List[List[str]]:
     """解析最常见的 Markdown 表格格式。"""
@@ -1911,7 +2010,7 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
 # ==========================================
 def get_pdf_cache_key(pdf_bytes: bytes) -> str:
     """为每篇论文生成稳定缓存键，支持多文件分别缓存。"""
-    return hashlib.sha256(pdf_bytes).hexdigest()
+    return hashlib.sha256(ANALYSIS_CACHE_VERSION.encode('utf-8') + pdf_bytes).hexdigest()
 
 
 def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
@@ -2022,6 +2121,55 @@ def build_export_filename(source_name: str, suffix: str) -> str:
     return f"{base_name}{suffix}"
 
 
+
+def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
+    entries: List[Tuple[str, bytes]] = []
+
+    if isinstance(pdf_inputs, bytes):
+        entries.append(("论文.pdf", pdf_inputs))
+        return entries
+
+    if isinstance(pdf_inputs, tuple) and len(pdf_inputs) == 2:
+        name, data = pdf_inputs
+        if isinstance(data, (bytes, bytearray)):
+            entries.append((str(name) or "论文.pdf", bytes(data)))
+        return entries
+
+    for idx, uploaded in enumerate(pdf_inputs or [], start=1):
+        if uploaded is None:
+            continue
+        if isinstance(uploaded, tuple) and len(uploaded) == 2:
+            name, data = uploaded
+            if isinstance(data, (bytes, bytearray)):
+                entries.append((str(name) or f"paper_{idx}.pdf", bytes(data)))
+            continue
+        if isinstance(uploaded, dict):
+            name = str(uploaded.get("name") or f"paper_{idx}.pdf")
+            data = uploaded.get("bytes")
+            if isinstance(data, (bytes, bytearray)):
+                entries.append((name, bytes(data)))
+            continue
+        paper_name = getattr(uploaded, 'name', f'paper_{idx}.pdf')
+        if hasattr(uploaded, 'getvalue'):
+            entries.append((paper_name, uploaded.getvalue()))
+        elif isinstance(uploaded, (bytes, bytearray)):
+            entries.append((paper_name, bytes(uploaded)))
+        else:
+            entries.append((paper_name, uploaded))
+
+    return entries
+
+
+def safe_download_button(**kwargs):
+    params = dict(kwargs)
+    try:
+        if "on_click" in inspect.signature(st.download_button).parameters:
+            params["on_click"] = "ignore"
+    except Exception:
+        pass
+    return st.download_button(**params)
+
+
 def render_single_analysis_result(
     analysis_result: Dict[str, Any],
     cache_key: str,
@@ -2037,24 +2185,23 @@ def render_single_analysis_result(
     st.markdown("### 导出与下载")
     col1, col2 = st.columns(2)
     with col1:
-        st.download_button(
-            "下载报告原文（Markdown）",
-            analysis_result["main_report"],
+        safe_download_button(
+            label="下载报告原文（Markdown）",
+            data=analysis_result["main_report"],
             file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
             mime="text/markdown",
             use_container_width=True,
             key=f"download_md_{cache_key}",
         )
     with col2:
-        st.download_button(
-            "下载高清 PDF 报告",
-            analysis_result["pdf_bytes"],
+        safe_download_button(
+            label="下载高清 PDF 报告",
+            data=analysis_result["pdf_bytes"],
             file_name=build_export_filename(source_name, "_论文全维度深度透视报告.pdf"),
             mime="application/pdf",
             use_container_width=True,
             key=f"download_pdf_{cache_key}",
         )
-
 
 def render_analysis_ui(pdf_inputs):
     """
@@ -2062,20 +2209,7 @@ def render_analysis_ui(pdf_inputs):
     - 支持单篇 PDF 分析
     - 支持多篇 PDF 同时上传，并分别生成各自报告与 PDF
     """
-    entries: List[Tuple[str, bytes]] = []
-
-    if isinstance(pdf_inputs, bytes):
-        entries.append(("论文.pdf", pdf_inputs))
-    else:
-        for idx, uploaded in enumerate(pdf_inputs or [], start=1):
-            if uploaded is None:
-                continue
-            paper_name = getattr(uploaded, 'name', f'paper_{idx}.pdf')
-            if hasattr(uploaded, 'getvalue'):
-                entries.append((paper_name, uploaded.getvalue()))
-            else:
-                entries.append((paper_name, uploaded))
-
+    entries = collect_pdf_entries(pdf_inputs)
     if not entries:
         return
 
@@ -2175,20 +2309,26 @@ if "analysis_results" not in st.session_state:
 if "feedback_start_time" not in st.session_state:
     st.session_state.feedback_start_time = None
 
+if "sidebar_direct_entries" not in st.session_state:
+    st.session_state.sidebar_direct_entries = []
+if "bottom_direct_entries" not in st.session_state:
+    st.session_state.bottom_direct_entries = []
+
 # ==========================================
 # 模块 16：业务路由与检索循环
 # ==========================================
 if start_analyze_button and sidebar_pdf:
-    st.markdown("---")
-    st.info("正在启动【直接解析模式】，开始解构文献……")
-    render_analysis_ui(sidebar_pdf)
-    st.stop()
+    st.session_state.bottom_direct_entries = []
+    st.session_state.sidebar_direct_entries = collect_pdf_entries(sidebar_pdf)
+    st.rerun()
 
 if start_button:
     if not user_topic:
         st.warning("请填写研究方向！")
     else:
         seen_paper_ids.clear()
+        st.session_state.sidebar_direct_entries = []
+        st.session_state.bottom_direct_entries = []
         sys_prompt = get_system_prompt(user_requirements, allow_preprint)
         st.session_state.agent = LLMClient(
             sys_prompt=sys_prompt,
@@ -2203,6 +2343,12 @@ if start_button:
         st.session_state.has_provided_feedback = False
         st.session_state.ui_logs = []
         st.rerun()
+
+if st.session_state.sidebar_direct_entries:
+    st.markdown("---")
+    st.info("正在启动【直接解析模式】，开始解构文献……")
+    render_analysis_ui(st.session_state.sidebar_direct_entries)
+    st.stop()
 
 if st.session_state.app_state == "IDLE":
     st.markdown("""
@@ -2365,7 +2511,12 @@ elif st.session_state.app_state == "COMPLETED":
         use_container_width=True,
     )
     if bottom_start_btn and uploaded_pdf:
-        render_analysis_ui(uploaded_pdf)
+        st.session_state.bottom_direct_entries = collect_pdf_entries(uploaded_pdf)
+        st.rerun()
+
+    if st.session_state.bottom_direct_entries:
+        st.markdown("---")
+        render_analysis_ui(st.session_state.bottom_direct_entries)
 
     if st.button("开启全新检索轮次", type="primary"):
         st.session_state.clear()
