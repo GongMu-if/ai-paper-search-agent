@@ -9,6 +9,7 @@ import base64
 import hashlib
 import tempfile
 import unicodedata
+import json
 from io import BytesIO
 from typing import Any, Dict, List, Tuple, Optional
 import datetime
@@ -52,7 +53,7 @@ QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 
-ANALYSIS_CACHE_VERSION = "20260412_md_formula_wrap_v4"
+ANALYSIS_CACHE_VERSION = "20260412_history_single_image_v5"
 
 # 检索时避免重复论文
 seen_paper_ids = set()
@@ -189,8 +190,9 @@ MAIN_AGENT_PROMPT = """
 5. 每次解释方法或实验时，都要回答四个问题：它要解决什么问题、具体怎么做、证据是什么、边界在哪里。
 6. 插图必须使用 Markdown 图片语法，且图片占位符必须从提供的图片ID列表中原样复制，格式为：
    ![图X：学术化图注](图片ID)
-7. 表格前后各保留一个空行；表标题必须单独成行。
-8. 语言风格保持学术、克制、清晰，不做口语化渲染。
+7. 同一张图片在整篇报告中最多只允许插入一次；首次插入后，后文如需再次引用，只能用文字写“见图X”，不得重复插图。
+8. 表格前后各保留一个空行；表标题必须单独成行。
+9. 语言风格保持学术、克制、清晰，不做口语化渲染。
 
 【报告结构】
 # 论文全维度深度透视报告
@@ -1878,6 +1880,39 @@ def serialize_report_blocks(blocks: List[Tuple[str, object]], doc_title: str) ->
     return normalize_report_markdown('\n'.join(lines))
 
 
+def normalize_report_image_key(image_key: str) -> str:
+    value = (image_key or '').strip().replace('\\', '/')
+    value = value.split('#', 1)[0].split('?', 1)[0]
+    value = value.split('/')[-1]
+    return re.sub(r'\s+', '', value).lower()
+
+
+def deduplicate_report_image_blocks(blocks: List[Tuple[str, object]]) -> List[Tuple[str, object]]:
+    deduped: List[Tuple[str, object]] = []
+    seen_image_keys = set()
+
+    for block_type, payload in blocks:
+        if block_type != 'image':
+            deduped.append((block_type, payload))
+            continue
+
+        caption, key = payload
+        dedup_key = normalize_report_image_key(str(key))
+        if dedup_key and dedup_key in seen_image_keys:
+            if deduped and deduped[-1][0] == 'table_title':
+                last_title = str(deduped[-1][1])
+                caption_text = (caption or '').strip()
+                if not caption_text or captions_equivalent(caption_text, last_title):
+                    deduped.pop()
+            continue
+
+        if dedup_key:
+            seen_image_keys.add(dedup_key)
+        deduped.append(('image', ((caption or '').strip(), key)))
+
+    return deduped
+
+
 def postprocess_generated_report_markdown(md_text: str) -> str:
     doc_title, body = split_title_and_body(md_text)
     blocks = split_markdown_blocks(body)
@@ -1917,9 +1952,8 @@ def postprocess_generated_report_markdown(md_text: str) -> str:
 
         cleaned_blocks.append((block_type, payload))
 
+    cleaned_blocks = deduplicate_report_image_blocks(cleaned_blocks)
     return serialize_report_blocks(cleaned_blocks, doc_title)
-
-
 def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
     """根据图片宽高比选择更合适的显示尺寸。"""
     iw, ih = img_reader.getSize()
@@ -2202,11 +2236,339 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
     return pdf_bytes
 
 # ==========================================
-# 模块 13：论文精读主流程
+# 模块 13：用户账户与历史报告持久化
+# ==========================================
+APP_STORAGE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paper_agent_store")
+USER_DB_PATH = os.path.join(APP_STORAGE_ROOT, "users.json")
+USER_SPACES_ROOT = os.path.join(APP_STORAGE_ROOT, "user_spaces")
+PASSWORD_HASH_ROUNDS = 120000
+
+
+def ensure_app_storage():
+    os.makedirs(APP_STORAGE_ROOT, exist_ok=True)
+    os.makedirs(USER_SPACES_ROOT, exist_ok=True)
+    if not os.path.exists(USER_DB_PATH):
+        with open(USER_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump({"users": {}}, f, ensure_ascii=False, indent=2)
+
+
+
+def load_json_file(path: str, default: Any):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+
+def save_json_file(path: str, data: Any):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+
+def normalize_username(username: str) -> str:
+    return (username or "").strip()
+
+
+
+def canonical_username(username: str) -> str:
+    return normalize_username(username).lower()
+
+
+
+def make_password_hash(password: str, salt_hex: Optional[str] = None) -> Tuple[str, str]:
+    salt_hex = salt_hex or os.urandom(16).hex()
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        (password or "").encode("utf-8"),
+        bytes.fromhex(salt_hex),
+        PASSWORD_HASH_ROUNDS,
+    ).hex()
+    return salt_hex, digest
+
+
+
+def register_user(username: str, password: str) -> Tuple[bool, str]:
+    ensure_app_storage()
+    username = normalize_username(username)
+    password = password or ""
+
+    if not username:
+        return False, "请输入账号。"
+    if len(username) < 3:
+        return False, "账号至少需要 3 个字符。"
+    if len(username) > 32:
+        return False, "账号长度请控制在 32 个字符以内。"
+    if len(password) < 6:
+        return False, "密码至少需要 6 个字符。"
+
+    users_db = load_json_file(USER_DB_PATH, {"users": {}})
+    user_key = canonical_username(username)
+    if user_key in users_db.get("users", {}):
+        return False, "该账号已存在，请直接登录。"
+
+    salt_hex, password_hash = make_password_hash(password)
+    users_db.setdefault("users", {})[user_key] = {
+        "username": username,
+        "salt": salt_hex,
+        "password_hash": password_hash,
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_json_file(USER_DB_PATH, users_db)
+    ensure_user_space(username)
+    return True, username
+
+
+
+def authenticate_user(username: str, password: str) -> Tuple[bool, str]:
+    ensure_app_storage()
+    username = normalize_username(username)
+    password = password or ""
+
+    users_db = load_json_file(USER_DB_PATH, {"users": {}})
+    record = users_db.get("users", {}).get(canonical_username(username))
+    if not record:
+        return False, "账号或密码错误。"
+
+    salt_hex = record.get("salt", "")
+    expected_hash = record.get("password_hash", "")
+    _, actual_hash = make_password_hash(password, salt_hex=salt_hex)
+    if actual_hash != expected_hash:
+        return False, "账号或密码错误。"
+
+    return True, record.get("username") or username
+
+
+
+def get_history_selector_key(username: str) -> str:
+    return f"history_selector_{canonical_username(username)}"
+
+
+
+def reset_user_workspace_view(username: Optional[str] = None):
+    username = normalize_username(username or st.session_state.get("current_user", ""))
+    if not username:
+        return
+    selector_key = get_history_selector_key(username)
+    st.session_state[selector_key] = "__workspace__"
+    st.session_state.selected_history_report_id = None
+
+
+
+def get_user_space_dir(username: str) -> str:
+    ensure_app_storage()
+    user_token = hashlib.sha256(canonical_username(username).encode("utf-8")).hexdigest()
+    return os.path.join(USER_SPACES_ROOT, user_token)
+
+
+
+def ensure_user_space(username: str) -> str:
+    user_dir = get_user_space_dir(username)
+    reports_dir = os.path.join(user_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    index_path = os.path.join(user_dir, "report_index.json")
+    if not os.path.exists(index_path):
+        save_json_file(index_path, {"reports": []})
+    return user_dir
+
+
+
+def get_user_report_index_path(username: str) -> str:
+    return os.path.join(ensure_user_space(username), "report_index.json")
+
+
+
+def get_user_report_file_path(username: str, report_id: str) -> str:
+    return os.path.join(ensure_user_space(username), "reports", f"{report_id}.json")
+
+
+
+def load_user_report_index(username: str) -> List[Dict[str, Any]]:
+    index_path = get_user_report_index_path(username)
+    index_data = load_json_file(index_path, {"reports": []})
+    reports = index_data.get("reports", []) if isinstance(index_data, dict) else []
+    reports = [item for item in reports if isinstance(item, dict)]
+    reports.sort(
+        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+        reverse=True,
+    )
+    return reports
+
+
+
+def get_persistable_analysis_result(analysis_result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_markdown": analysis_result.get("source_markdown", ""),
+        "text_report": analysis_result.get("text_report", ""),
+        "vision_summaries": analysis_result.get("vision_summaries", ""),
+        "images": analysis_result.get("images", {}),
+        "main_report": analysis_result.get("main_report", ""),
+    }
+
+
+
+def save_user_report_record(
+    username: str,
+    source_name: str,
+    cache_key: str,
+    analysis_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    report_index = load_user_report_index(username)
+    existing = next((item for item in report_index if item.get("cache_key") == cache_key), None)
+
+    report_id = (existing or {}).get("report_id") or hashlib.sha256(
+        f"{canonical_username(username)}|{cache_key}".encode("utf-8")
+    ).hexdigest()[:24]
+    report_title, _ = split_title_and_body(analysis_result.get("main_report", ""))
+    now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    meta = {
+        "report_id": report_id,
+        "cache_key": cache_key,
+        "source_name": source_name or (existing or {}).get("source_name") or report_title or "未命名论文",
+        "report_title": report_title or source_name or "论文全维度深度透视报告",
+        "created_at": (existing or {}).get("created_at") or now_text,
+        "updated_at": now_text,
+    }
+
+    payload = {
+        "meta": meta,
+        "analysis_result": get_persistable_analysis_result(analysis_result),
+    }
+    save_json_file(get_user_report_file_path(username, report_id), payload)
+
+    refreshed_index = [meta] + [
+        item for item in report_index
+        if item.get("report_id") != report_id and item.get("cache_key") != cache_key
+    ]
+    refreshed_index.sort(
+        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+        reverse=True,
+    )
+    save_json_file(get_user_report_index_path(username), {"reports": refreshed_index})
+    return meta
+
+
+
+def load_user_report_record(username: str, report_id: str) -> Optional[Dict[str, Any]]:
+    report_path = get_user_report_file_path(username, report_id)
+    payload = load_json_file(report_path, None)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+
+def get_user_cached_report(username: str, cache_key: str) -> Optional[Dict[str, Any]]:
+    for item in load_user_report_index(username):
+        if item.get("cache_key") != cache_key:
+            continue
+        payload = load_user_report_record(username, item.get("report_id", ""))
+        if payload and isinstance(payload.get("analysis_result"), dict):
+            return payload["analysis_result"]
+    return None
+
+
+
+def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
+    value = (text or "").strip()
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + "…"
+
+
+
+def format_report_history_label(meta: Dict[str, Any]) -> str:
+    if not meta:
+        return "当前工作区"
+    display_name = meta.get("source_name") or meta.get("report_title") or "未命名论文"
+    timestamp = (meta.get("updated_at") or meta.get("created_at") or "")[:16]
+    short_name = shorten_sidebar_label(display_name, max_len=18)
+    return f"{short_name}｜{timestamp}" if timestamp else short_name
+
+
+
+def render_auth_ui():
+    st.title("AI 智能论文检索 Agent")
+    st.markdown("请先登录或注册账号。登录后，系统会为每个账号自动保存历史论文解析报告，下一次登录可直接查看，无需重新解析。")
+
+    login_tab, register_tab = st.tabs(["登录", "注册"])
+
+    with login_tab:
+        with st.form("login_form"):
+            login_username = st.text_input("账号", key="login_username")
+            login_password = st.text_input("密码", type="password", key="login_password")
+            login_submit = st.form_submit_button("登录", use_container_width=True)
+            if login_submit:
+                ok, result = authenticate_user(login_username, login_password)
+                if ok:
+                    st.session_state.current_user = result
+                    reset_user_workspace_view(result)
+                    st.rerun()
+                else:
+                    st.error(result)
+
+    with register_tab:
+        with st.form("register_form"):
+            register_username = st.text_input("账号", key="register_username")
+            register_password = st.text_input("密码", type="password", key="register_password")
+            confirm_password = st.text_input("确认密码", type="password", key="register_password_confirm")
+            register_submit = st.form_submit_button("注册并进入系统", use_container_width=True)
+            if register_submit:
+                if register_password != confirm_password:
+                    st.error("两次输入的密码不一致。")
+                else:
+                    ok, result = register_user(register_username, register_password)
+                    if ok:
+                        st.session_state.current_user = result
+                        reset_user_workspace_view(result)
+                        st.rerun()
+                    else:
+                        st.error(result)
+
+    st.stop()
+
+
+
+def render_history_sidebar(username: str):
+    history = load_user_report_index(username)
+    selector_key = get_history_selector_key(username)
+    options = ["__workspace__"] + [item.get("report_id", "") for item in history if item.get("report_id")]
+    meta_map = {item.get("report_id", ""): item for item in history if item.get("report_id")}
+
+    if selector_key not in st.session_state or st.session_state[selector_key] not in options:
+        st.session_state[selector_key] = "__workspace__"
+
+    st.header("历史报告记录")
+    selected_id = st.radio(
+        "历史报告记录",
+        options=options,
+        format_func=lambda option_id: "当前工作区" if option_id == "__workspace__" else format_report_history_label(meta_map.get(option_id, {})),
+        key=selector_key,
+        label_visibility="collapsed",
+    )
+    st.session_state.selected_history_report_id = None if selected_id == "__workspace__" else selected_id
+
+    if history:
+        st.caption("重新登录后也可在这里直接打开历史报告。")
+    else:
+        st.caption("当前账号还没有历史报告。")
+
+
+# ==========================================
+# 模块 14：论文精读主流程
 # ==========================================
 def get_pdf_cache_key(pdf_bytes: bytes) -> str:
     """为每篇论文生成稳定缓存键，支持多文件分别缓存。"""
     return hashlib.sha256(ANALYSIS_CACHE_VERSION.encode('utf-8') + pdf_bytes).hexdigest()
+
 
 
 def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
@@ -2216,7 +2578,6 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
     2. Text Agent 输出 FACT_BANK + 文本综述
     3. Vision Agent 输出 FIGURE_CARD
     4. 主报告逐节生成
-    5. 服务器端生成高清 PDF
     """
     result = analyze_pdf_with_modal(pdf_bytes)
     if not (result and result.get("status") == "success"):
@@ -2283,32 +2644,40 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
             )
             final_main_report = postprocess_generated_report_markdown(normalize_report_markdown(report))
 
-    with st.spinner("正在服务器端排版并生成高清 PDF……"):
-        final_pdf_bytes = build_pdf_bytes_from_markdown(final_main_report, images_dict)
-
     return {
         "source_markdown": md_content,
         "text_report": text_report,
         "vision_summaries": vision_summaries,
         "images": images_dict,
         "main_report": final_main_report,
-        "pdf_bytes": final_pdf_bytes,
     }
 
 
-def get_or_create_analysis_result(pdf_bytes: bytes) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """读取或创建单篇论文分析结果，支持多文件分别缓存。"""
+
+def get_or_create_analysis_result(pdf_bytes: bytes, source_name: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
+    """读取或创建单篇论文分析结果，优先复用当前账号下的历史记录。"""
     cache_key = get_pdf_cache_key(pdf_bytes)
     cache_pool = st.session_state.analysis_results
     if cache_key in cache_pool and cache_pool[cache_key] is not None:
-        return cache_key, cache_pool[cache_key]
+        return cache_key, cache_pool[cache_key], "session_cache"
+
+    current_user = st.session_state.get("current_user", "")
+    if current_user:
+        cached_report = get_user_cached_report(current_user, cache_key)
+        if cached_report is not None:
+            cache_pool[cache_key] = cached_report
+            return cache_key, cached_report, "history_cache"
 
     analysis_result = build_analysis_result(pdf_bytes)
     if analysis_result is not None:
         cache_pool[cache_key] = analysis_result
-    else:
-        cache_pool.pop(cache_key, None)
-    return cache_key, analysis_result
+        if current_user:
+            save_user_report_record(current_user, source_name, cache_key, analysis_result)
+        return cache_key, analysis_result, "new"
+
+    cache_pool.pop(cache_key, None)
+    return cache_key, None, "failed"
+
 
 
 def build_export_filename(source_name: str, suffix: str) -> str:
@@ -2356,54 +2725,59 @@ def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
     return entries
 
 
-def safe_download_button(**kwargs):
-    params = dict(kwargs)
-    try:
-        if "on_click" in inspect.signature(st.download_button).parameters:
-            params["on_click"] = "ignore"
-    except Exception:
-        pass
-    return st.download_button(**params)
-
 
 def render_single_analysis_result(
     analysis_result: Dict[str, Any],
     cache_key: str,
     source_name: str,
     show_paper_title: bool = False,
+    status_text: str = "论文深度透视报告已生成！",
 ):
     if show_paper_title:
         st.markdown(f"### {source_name}")
-    st.success("论文深度透视报告已生成！")
+    st.success(status_text)
     render_report_with_images(analysis_result["main_report"], analysis_result["images"])
 
     st.divider()
-    st.markdown("### 导出与下载")
-    col1, col2 = st.columns(2)
-    with col1:
-        safe_download_button(
-            label="下载报告原文（Markdown）",
-            data=analysis_result["main_report"],
-            file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
-            mime="text/markdown",
-            use_container_width=True,
-            key=f"download_md_{cache_key}",
-        )
-    with col2:
-        safe_download_button(
-            label="下载高清 PDF 报告",
-            data=analysis_result["pdf_bytes"],
-            file_name=build_export_filename(source_name, "_论文全维度深度透视报告.pdf"),
-            mime="application/pdf",
-            use_container_width=True,
-            key=f"download_pdf_{cache_key}",
-        )
+    st.markdown("### 导出")
+    st.download_button(
+        label="下载报告原文（Markdown）",
+        data=analysis_result["main_report"],
+        file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
+        mime="text/markdown",
+        use_container_width=True,
+        key=f"download_md_{cache_key}",
+    )
+
+
+
+def render_saved_history_report(username: str, report_id: str):
+    payload = load_user_report_record(username, report_id)
+    if not payload:
+        st.warning("未找到这条历史报告记录，请重新解析论文。")
+        return
+
+    meta = payload.get("meta", {})
+    analysis_result = payload.get("analysis_result", {})
+    source_name = meta.get("source_name") or meta.get("report_title") or "历史报告"
+    timestamp = meta.get("updated_at") or meta.get("created_at") or "未知时间"
+
+    st.info(f"已载入历史报告：{source_name}（保存时间：{timestamp}）。")
+    render_single_analysis_result(
+        analysis_result=analysis_result,
+        cache_key=meta.get("cache_key", report_id),
+        source_name=source_name,
+        show_paper_title=True,
+        status_text="历史报告已载入，无需重新解析。",
+    )
+
+
 
 def render_analysis_ui(pdf_inputs):
     """
     上传论文后的主工作流：
     - 支持单篇 PDF 分析
-    - 支持多篇 PDF 同时上传，并分别生成各自报告与 PDF
+    - 支持多篇 PDF 同时上传，并分别生成各自报告
     """
     entries = collect_pdf_entries(pdf_inputs)
     if not entries:
@@ -2413,7 +2787,9 @@ def render_analysis_ui(pdf_inputs):
     for idx, (paper_name, pdf_bytes) in enumerate(entries, start=1):
         if multi_mode:
             st.markdown(f"## 第 {idx} 篇论文")
-        cache_key, analysis_result = get_or_create_analysis_result(pdf_bytes)
+        cache_key, analysis_result, result_source = get_or_create_analysis_result(pdf_bytes, paper_name)
+        if result_source == "history_cache":
+            st.info(f"检测到当前账号下已存在《{paper_name}》的历史报告，已直接读取，无需重新解析。")
         if analysis_result:
             render_single_analysis_result(
                 analysis_result=analysis_result,
@@ -2424,13 +2800,71 @@ def render_analysis_ui(pdf_inputs):
         if multi_mode and idx < len(entries):
             st.divider()
 
+
 # ==========================================
-# 模块 14：前端 UI
+# 模块 15：状态初始化
+# ==========================================
+ensure_app_storage()
+
+if "current_user" not in st.session_state:
+    st.session_state.current_user = ""
+if "selected_history_report_id" not in st.session_state:
+    st.session_state.selected_history_report_id = None
+if "app_state" not in st.session_state:
+    st.session_state.app_state = "IDLE"
+if "prompt_history" not in st.session_state:
+    st.session_state.prompt_history = []
+if "agent" not in st.session_state:
+    st.session_state.agent = None
+if "final_result" not in st.session_state:
+    st.session_state.final_result = ""
+if "loop_count" not in st.session_state:
+    st.session_state.loop_count = 0
+if "has_provided_feedback" not in st.session_state:
+    st.session_state.has_provided_feedback = False
+if "ui_logs" not in st.session_state:
+    st.session_state.ui_logs = []
+if "current_pdf_hash" not in st.session_state:
+    st.session_state.current_pdf_hash = None
+if "final_main_report" not in st.session_state:
+    st.session_state.final_main_report = ""
+if "temp_images" not in st.session_state:
+    st.session_state.temp_images = {}
+if "source_markdown" not in st.session_state:
+    st.session_state.source_markdown = ""
+if "text_report" not in st.session_state:
+    st.session_state.text_report = ""
+if "vision_summaries" not in st.session_state:
+    st.session_state.vision_summaries = ""
+if "analysis_results" not in st.session_state:
+    st.session_state.analysis_results = {}
+if "feedback_start_time" not in st.session_state:
+    st.session_state.feedback_start_time = None
+if "sidebar_direct_entries" not in st.session_state:
+    st.session_state.sidebar_direct_entries = []
+if "bottom_direct_entries" not in st.session_state:
+    st.session_state.bottom_direct_entries = []
+
+if not st.session_state.current_user:
+    render_auth_ui()
+
+
+# ==========================================
+# 模块 16：前端 UI
 # ==========================================
 st.title("AI 智能论文检索 Agent")
-st.markdown("基于大模型的多轮深度挖掘，为您精准匹配 Top 6 核心前沿文献。")
+st.markdown("基于大模型的多轮深度挖掘，为您精准匹配 Top 6 核心前沿文献，并为每个账号自动保留历史解析报告。")
 
 with st.sidebar:
+    st.success(f"当前账号：{st.session_state.current_user}")
+    if st.button("退出登录", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+
+    st.divider()
+    render_history_sidebar(st.session_state.current_user)
+
+    st.divider()
     st.header("检索配置")
 
     user_topic = st.text_input("研究方向", value="")
@@ -2456,7 +2890,7 @@ with st.sidebar:
         "上传本地 PDF 进行结构化解析",
         type="pdf",
         key="sb_pdf",
-        help="跳过检索步骤，直接对已有文献生成精读报告",
+        help="跳过检索步骤，直接对已有文献生成精读报告，并保存到当前账号的历史记录",
         accept_multiple_files=True,
     )
 
@@ -2470,50 +2904,11 @@ with st.sidebar:
 
 
 # ==========================================
-# 模块 15：状态初始化
-# ==========================================
-if "app_state" not in st.session_state:
-    st.session_state.app_state = "IDLE"
-if "prompt_history" not in st.session_state:
-    st.session_state.prompt_history = []
-if "agent" not in st.session_state:
-    st.session_state.agent = None
-if "final_result" not in st.session_state:
-    st.session_state.final_result = ""
-if "loop_count" not in st.session_state:
-    st.session_state.loop_count = 0
-if "has_provided_feedback" not in st.session_state:
-    st.session_state.has_provided_feedback = False
-if "ui_logs" not in st.session_state:
-    st.session_state.ui_logs = []
-if "current_pdf_hash" not in st.session_state:
-    st.session_state.current_pdf_hash = None
-if "final_main_report" not in st.session_state:
-    st.session_state.final_main_report = ""
-if "final_pdf_bytes" not in st.session_state:
-    st.session_state.final_pdf_bytes = None
-if "temp_images" not in st.session_state:
-    st.session_state.temp_images = {}
-if "source_markdown" not in st.session_state:
-    st.session_state.source_markdown = ""
-if "text_report" not in st.session_state:
-    st.session_state.text_report = ""
-if "vision_summaries" not in st.session_state:
-    st.session_state.vision_summaries = ""
-if "analysis_results" not in st.session_state:
-    st.session_state.analysis_results = {}
-if "feedback_start_time" not in st.session_state:
-    st.session_state.feedback_start_time = None
-
-if "sidebar_direct_entries" not in st.session_state:
-    st.session_state.sidebar_direct_entries = []
-if "bottom_direct_entries" not in st.session_state:
-    st.session_state.bottom_direct_entries = []
-
-# ==========================================
-# 模块 16：业务路由与检索循环
+# 模块 17：业务路由与检索循环
 # ==========================================
 if start_analyze_button and sidebar_pdf:
+    reset_user_workspace_view(st.session_state.current_user)
+    st.session_state.app_state = "IDLE"
     st.session_state.bottom_direct_entries = []
     st.session_state.sidebar_direct_entries = collect_pdf_entries(sidebar_pdf)
     st.rerun()
@@ -2522,6 +2917,7 @@ if start_button:
     if not user_topic:
         st.warning("请填写研究方向！")
     else:
+        reset_user_workspace_view(st.session_state.current_user)
         seen_paper_ids.clear()
         st.session_state.sidebar_direct_entries = []
         st.session_state.bottom_direct_entries = []
@@ -2546,11 +2942,20 @@ if st.session_state.sidebar_direct_entries:
     render_analysis_ui(st.session_state.sidebar_direct_entries)
     st.stop()
 
+if (
+    st.session_state.selected_history_report_id
+    and st.session_state.app_state == "IDLE"
+    and not st.session_state.bottom_direct_entries
+):
+    st.markdown("---")
+    render_saved_history_report(st.session_state.current_user, st.session_state.selected_history_report_id)
+    st.stop()
+
 if st.session_state.app_state == "IDLE":
     st.markdown("""
 ### 系统使用指南
 
-欢迎使用 AI 智能论文检索 Agent。本系统旨在通过深度信息挖掘与多轮交互，为您精准匹配最具参考价值的前沿文献。为获得最佳体验，请参考以下操作规范：
+欢迎使用 AI 智能论文检索 Agent。本系统旨在通过深度信息挖掘与多轮交互，为您精准匹配最具参考价值的前沿文献。每个账号都会自动拥有独立的历史报告空间，重新登录后可直接查看之前的解析结果。为获得最佳体验，请参考以下操作规范：
 
 **一、 智能文献检索**
 
@@ -2566,7 +2971,7 @@ if st.session_state.app_state == "IDLE":
 **二、 既有文献直读**
 
 * **本地 PDF 深度解析**
-  若您已有确定的目标文献，可跳过检索环节。直接通过左侧边栏底部的“上传 PDF 立即深度解读”入口提交文件，系统将自动提取文本并生成结构化的文献精读分析报告。
+  若您已有确定的目标文献，可跳过检索环节。直接通过左侧边栏底部的“上传 PDF 立即深度解读”入口提交文件，系统将自动提取文本并生成结构化的文献精读分析报告，同时写入当前账号的历史报告记录，便于下次登录直接查看。
 """)
 
 if st.session_state.app_state != "IDLE":
@@ -2583,7 +2988,7 @@ if st.session_state.app_state == "RUNNING":
         while True:
             st.session_state.loop_count += 1
             i = st.session_state.loop_count
-            
+
             if i == 1:
                 loop_reminder = "系统提示: 第一次循环开始，请直接使用用户的原始研究方向作为query执行search_and_detail_papers。"
             else:
@@ -2634,7 +3039,7 @@ if st.session_state.app_state == "RUNNING":
                     import inspect
                     allowed_keys = inspect.signature(available_tools[tool_name]).parameters.keys()
                     kwargs = {k: v for k, v in raw_kwargs.items() if k in allowed_keys}
-                    
+
                     if "query" in kwargs:
                         observation = available_tools[tool_name](**kwargs)
                     else:
@@ -2643,15 +3048,14 @@ if st.session_state.app_state == "RUNNING":
                     observation = f"错误:未定义的工具 '{tool_name}'"
             else:
                 observation = "错误:Action格式无法解析。"
-                
+
             st.session_state.prompt_history.append(f"Observation: {observation}")
 
 elif st.session_state.app_state == "WAITING_FEEDBACK":
-    # --- 超时检测逻辑 ---
     if st.session_state.feedback_start_time:
         elapsed_time = time.time() - st.session_state.feedback_start_time
         remaining_time = 1800 - elapsed_time
-        
+
         if remaining_time <= 0:
             st.session_state.app_state = "COMPLETED"
             st.rerun()
@@ -2661,19 +3065,19 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
 
     st.markdown("### 阶段性检索结果展示")
     st.write("请审阅 Agent 挑选出的文献，判断是否符合您的要求：")
-    
+
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
-    
+
     st.divider()
     st.markdown("#### 您对当前的文献组合满意吗？")
-    
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("满意，结束检索", use_container_width=True):
             st.session_state.app_state = "COMPLETED"
             st.rerun()
-            
+
     with col2:
         with st.popover("不满意，修改要求", use_container_width=True):
             new_req = st.text_area("请指出不符合要求的地方：")
@@ -2681,7 +3085,7 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
                 if new_req.strip():
                     feedback_prompt = f"用户反馈: 【{new_req}】。请基于此继续筛选 Top 6。"
                     st.session_state.prompt_history.append(feedback_prompt)
-                    st.session_state.has_provided_feedback = True 
+                    st.session_state.has_provided_feedback = True
                     st.session_state.app_state = "RUNNING"
                     st.rerun()
 
@@ -2697,7 +3101,7 @@ elif st.session_state.app_state == "COMPLETED":
 
     st.divider()
     st.header("开启深度解读工作流")
-    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 8 节精读报告，并导出各自的高清 PDF。")
+    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 8 节精读报告，并自动存入当前账号的历史报告记录。")
 
     uploaded_pdf = st.file_uploader("上传 PDF 文件以获取精读报告", type="pdf", key="bottom_pdf", accept_multiple_files=True)
     bottom_start_btn = st.button(
@@ -2707,6 +3111,7 @@ elif st.session_state.app_state == "COMPLETED":
         use_container_width=True,
     )
     if bottom_start_btn and uploaded_pdf:
+        reset_user_workspace_view(st.session_state.current_user)
         st.session_state.bottom_direct_entries = collect_pdf_entries(uploaded_pdf)
         st.rerun()
 
@@ -2715,5 +3120,8 @@ elif st.session_state.app_state == "COMPLETED":
         render_analysis_ui(st.session_state.bottom_direct_entries)
 
     if st.button("开启全新检索轮次", type="primary"):
+        current_user = st.session_state.get("current_user", "")
         st.session_state.clear()
+        if current_user:
+            st.session_state.current_user = current_user
         st.rerun()
