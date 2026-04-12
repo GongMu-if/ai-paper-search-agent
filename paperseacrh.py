@@ -52,7 +52,7 @@ QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 MODAL_API_URL = st.secrets["MODAL_API_URL"]
 
-ANALYSIS_CACHE_VERSION = "20260412_formula_render_v3"
+ANALYSIS_CACHE_VERSION = "20260412_md_formula_wrap_v4"
 
 # 检索时避免重复论文
 seen_paper_ids = set()
@@ -1397,6 +1397,118 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
 
     return ''.join(parts)
 
+def formula_inline_markdown(formula_text: str, display: bool = False) -> str:
+    expr = sanitize_formula_for_render(formula_text)
+    if not expr:
+        expr = extract_formula_text(formula_text)
+    expr = (expr or '').strip()
+    if not expr:
+        return (formula_text or '').strip()
+
+    if display or '\n' in expr:
+        return f"$$\n{expr}\n$$"
+    return f"${expr}$"
+
+
+def wrap_plain_text_for_markdown(text: str) -> str:
+    if not text:
+        return ''
+
+    working = collapse_spaced_math_braces(normalize_formula_spacing(text))
+    parts: List[str] = []
+    cursor = 0
+
+    def find_parenthetical_formula(start_pos: int):
+        match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
+        if not match:
+            return None
+        candidate = match.group(0).strip()
+        inner = candidate[1:-1].strip()
+        if looks_like_formula_text(inner) or '�' in inner or any(
+            ch in inner for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS
+        ):
+            return match
+        return None
+
+    while cursor < len(working):
+        candidate_matches = []
+        auto_match = AUTO_FORMULA_RUN_RE.search(working, cursor)
+        if auto_match:
+            candidate_matches.append(auto_match)
+
+        special_match = SPECIAL_FORMULA_RUN_RE.search(working, cursor)
+        if special_match:
+            candidate_matches.append(special_match)
+
+        paren_match = find_parenthetical_formula(cursor)
+        if paren_match:
+            candidate_matches.append(paren_match)
+
+        if not candidate_matches:
+            parts.append(working[cursor:])
+            break
+
+        match = min(candidate_matches, key=lambda m: (m.start(), -(m.end() - m.start())))
+        start, end = match.span()
+        candidate = match.group(0).strip()
+
+        if start > cursor:
+            parts.append(working[cursor:start])
+
+        if (
+            not is_list_enumerator_text(candidate)
+            and (
+                should_auto_render_formula(candidate)
+                or '�' in candidate
+                or any(ch in candidate for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)
+                or candidate[:1] in {'(', '（'}
+            )
+        ):
+            parts.append(formula_inline_markdown(candidate, display=False))
+        else:
+            parts.append(candidate)
+
+        cursor = end
+
+    return ''.join(parts)
+
+
+def convert_inline_formula_markup_to_markdown(text: str) -> str:
+    value = text or ''
+    if not value:
+        return ''
+
+    parts: List[str] = []
+    start = 0
+    for match in INLINE_MARKUP_TOKEN_RE.finditer(value):
+        if match.start() > start:
+            parts.append(wrap_plain_text_for_markdown(value[start:match.start()]))
+
+        token = match.group(0)
+        if token.startswith('**') and token.endswith('**'):
+            parts.append(f"**{convert_inline_formula_markup_to_markdown(token[2:-2])}**")
+        elif token.startswith('__') and token.endswith('__'):
+            parts.append(f"__{convert_inline_formula_markup_to_markdown(token[2:-2])}__")
+        elif token.startswith('$') and token.endswith('$'):
+            parts.append(formula_inline_markdown(token[1:-1], display=False))
+        elif token.startswith(r'\(') and token.endswith(r'\)'):
+            parts.append(formula_inline_markdown(token[2:-2], display=False))
+        elif token.startswith(r'\[') and token.endswith(r'\]'):
+            parts.append(formula_inline_markdown(token[2:-2], display=True))
+        elif token.startswith('`') and token.endswith('`'):
+            inner = token[1:-1]
+            if looks_like_formula_text(inner):
+                parts.append(formula_inline_markdown(inner, display=False))
+            else:
+                parts.append(token)
+        start = match.end()
+
+    if start < len(value):
+        parts.append(wrap_plain_text_for_markdown(value[start:]))
+
+    return ''.join(parts)
+
+
 def build_pdf_styles():
     """构造 PDF 所有样式，标题字号明显大于正文，并启用 keepWithNext。"""
     register_pdf_fonts()
@@ -1722,6 +1834,90 @@ def split_title_and_body(md_text: str) -> Tuple[str, str]:
     if lines and lines[0].startswith("# "):
         return lines[0][2:].strip(), "\n".join(lines[1:]).strip()
     return "论文全维度深度透视报告", text
+
+
+def convert_inline_formulas_in_table_line(line: str) -> str:
+    stripped = (line or '').strip()
+    if not stripped.startswith('|'):
+        return line
+
+    cells = [cell.strip() for cell in stripped.strip('|').split('|')]
+    if cells and all(re.fullmatch(r'[:\- ]+', cell) for cell in cells):
+        return stripped
+
+    rendered_cells = [convert_inline_formula_markup_to_markdown(cell) for cell in cells]
+    return '| ' + ' | '.join(rendered_cells) + ' |'
+
+
+def serialize_report_blocks(blocks: List[Tuple[str, object]], doc_title: str) -> str:
+    lines: List[str] = [f"# {doc_title}"]
+
+    for block_type, payload in blocks:
+        if block_type == 'h2':
+            lines.extend(['', f"## {convert_inline_formula_markup_to_markdown(str(payload))}"])
+        elif block_type == 'h3':
+            lines.extend(['', f"### {convert_inline_formula_markup_to_markdown(str(payload))}"])
+        elif block_type == 'table_title':
+            lines.extend(['', convert_inline_formula_markup_to_markdown(normalize_table_title_line(str(payload)))])
+        elif block_type == 'paragraph':
+            lines.extend(['', convert_inline_formula_markup_to_markdown(str(payload))])
+        elif block_type == 'list_item':
+            lines.extend(['', convert_inline_formula_markup_to_markdown(str(payload))])
+        elif block_type == 'math_block':
+            lines.extend(['', formula_inline_markdown(str(payload), display=True)])
+        elif block_type == 'image':
+            caption, key = payload
+            rendered_caption = convert_inline_formula_markup_to_markdown(str(caption)) if caption else ''
+            lines.extend(['', f"![{rendered_caption}]({key})"])
+        elif block_type == 'md_table':
+            lines.append('')
+            lines.extend([convert_inline_formulas_in_table_line(str(row)) for row in payload])
+        else:
+            lines.extend(['', str(payload)])
+
+    return normalize_report_markdown('\n'.join(lines))
+
+
+def postprocess_generated_report_markdown(md_text: str) -> str:
+    doc_title, body = split_title_and_body(md_text)
+    blocks = split_markdown_blocks(body)
+    cleaned_blocks: List[Tuple[str, object]] = []
+
+    for idx, (block_type, payload) in enumerate(blocks):
+        prev = cleaned_blocks[-1] if cleaned_blocks else None
+        next_block = blocks[idx + 1] if idx + 1 < len(blocks) else None
+
+        if block_type == 'table_title':
+            current_title = normalize_table_title_line(str(payload))
+            if prev and prev[0] == 'table_title' and captions_equivalent(current_title, str(prev[1])):
+                continue
+            cleaned_blocks.append(('table_title', current_title))
+            continue
+
+        if block_type == 'paragraph':
+            paragraph_text = str(payload).strip()
+            if prev and prev[0] == 'table_title' and captions_equivalent(paragraph_text, str(prev[1])):
+                continue
+            if is_table_title_line(paragraph_text) and next_block and next_block[0] in {'image', 'md_table'}:
+                normalized_title = normalize_table_title_line(paragraph_text)
+                if not (prev and prev[0] == 'table_title' and captions_equivalent(normalized_title, str(prev[1]))):
+                    cleaned_blocks.append(('table_title', normalized_title))
+                continue
+            cleaned_blocks.append((block_type, paragraph_text))
+            continue
+
+        if block_type == 'image':
+            caption, key = payload
+            caption_text = (caption or '').strip()
+            if prev and prev[0] == 'table_title' and caption_text and captions_equivalent(caption_text, str(prev[1])):
+                cleaned_blocks.append(('image', ('', key)))
+                continue
+            cleaned_blocks.append(('image', (caption_text, key)))
+            continue
+
+        cleaned_blocks.append((block_type, payload))
+
+    return serialize_report_blocks(cleaned_blocks, doc_title)
 
 
 def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
@@ -2075,7 +2271,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
             vision_summaries=vision_summaries,
             image_ids=list(images_dict.keys()),
         )
-        final_main_report = normalize_report_markdown(report)
+        final_main_report = postprocess_generated_report_markdown(normalize_report_markdown(report))
 
     if is_report_truncated(final_main_report):
         with st.spinner("检测到报告可能截断，正在补全缺失内容……"):
@@ -2085,7 +2281,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
                 vision_summaries=vision_summaries,
                 image_ids=list(images_dict.keys()),
             )
-            final_main_report = normalize_report_markdown(report)
+            final_main_report = postprocess_generated_report_markdown(normalize_report_markdown(report))
 
     with st.spinner("正在服务器端排版并生成高清 PDF……"):
         final_pdf_bytes = build_pdf_bytes_from_markdown(final_main_report, images_dict)
