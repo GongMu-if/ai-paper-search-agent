@@ -1,4 +1,4 @@
-    # ==========================================
+# ==========================================
 # 模块 1：依赖导入与页面配置
 # ==========================================
 import re
@@ -8,9 +8,10 @@ import html
 import base64
 import hashlib
 import tempfile
+import unicodedata
 from io import BytesIO
 from typing import Any, Dict, List, Tuple, Optional
-import datetime
+
 import requests
 import streamlit as st
 from openai import OpenAI
@@ -784,12 +785,40 @@ INLINE_MARKUP_TOKEN_RE = re.compile(
     flags=re.S,
 )
 ASCII_TEXT_RE = re.compile(r'([A-Za-z0-9\.\,\:\;\-\+\=\(\)\/_%#@&\[\]\{\}<>\'\"\s]+)')
-MATH_UNICODE_HINT_RE = re.compile(
-    r'[\u0300-\u036F\u0370-\u03FF\u2070-\u209F\u2100-\u214F\u2190-\u22FF\u27C0-\u27EF\u2980-\u2AFF\U0001D400-\U0001D7FF]'
+MATH_UNICODE_RANGE = "𝐀-𝟿"
+FORMULA_BRACE_EXPR = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+FORMULA_COMBINING_MARKS = r'[\u0300-\u036F]*'
+FORMULA_SUBSUP_PATTERN = (
+    rf'(?:[_^](?:{FORMULA_BRACE_EXPR}|\\[A-Za-z]+|[A-Za-z0-9Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+{FORMULA_COMBINING_MARKS}))+'
 )
-RAW_INLINE_FORMULA_SCAN_RE = re.compile(
-    r'[A-Za-z0-9\u0300-\u036F\u0370-\u03FF\u2070-\u209F\u2100-\u214F\u2190-\u22FF\u27C0-\u27EF\u2980-\u2AFF\U0001D400-\U0001D7FF_\\\^=+\-*/(){}\[\]<>|% ]+'
+FORMULA_TERM_PATTERN = (
+    rf'(?:'
+    rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*(?:{FORMULA_SUBSUP_PATTERN})*'
+    rf'|'
+    rf'[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+{FORMULA_COMBINING_MARKS}(?:{FORMULA_SUBSUP_PATTERN})*'
+    rf'|'
+    rf'[A-Za-z][A-Za-z0-9]*{FORMULA_COMBINING_MARKS}(?:{FORMULA_SUBSUP_PATTERN})'
+    rf'|'
+    rf'\d+(?:\.\d+)?(?:{FORMULA_SUBSUP_PATTERN})'
+    rf')'
 )
+AUTO_FORMULA_RUN_RE = re.compile(
+    rf'{FORMULA_TERM_PATTERN}'
+    rf'(?:\s*(?:=|<|>|/|\+|\*|·|×|÷|\\cdot)\s*(?:{FORMULA_TERM_PATTERN}|\d+(?:\.\d+)?))*'
+    rf'(?:\s+{FORMULA_TERM_PATTERN})*'
+)
+GREEK_LATEX_MAP = {
+    'α': r'\alpha', 'β': r'\beta', 'γ': r'\gamma', 'δ': r'\delta', 'ε': r'\epsilon',
+    'θ': r'\theta', 'λ': r'\lambda', 'μ': r'\mu', 'µ': r'\mu', 'σ': r'\sigma', 'ω': r'\omega',
+    'π': r'\pi', 'η': r'\eta', 'τ': r'\tau', 'φ': r'\phi', 'ψ': r'\psi', 'ρ': r'\rho',
+    'ν': r'\nu', 'κ': r'\kappa', 'ξ': r'\xi', 'Δ': r'\Delta', 'Γ': r'\Gamma',
+    'Λ': r'\Lambda', 'Σ': r'\Sigma', 'Π': r'\Pi', 'Ω': r'\Omega', 'Φ': r'\Phi', 'Ψ': r'\Psi',
+}
+SPECIAL_FORMULA_CHAR_MAP = {
+    'ℒ': r'\mathcal{L}', '·': r'\cdot', '×': r'\times', '÷': r'\div', '≤': r'\le',
+    '≥': r'\ge', '≠': r'\neq', '±': r'\pm', '∞': r'\infty', '∑': r'\sum',
+    '∏': r'\prod', '√': r'\sqrt',
+}
 
 
 def strip_outer_markdown_markers(text: str) -> str:
@@ -826,35 +855,55 @@ def is_table_title_line(text: str) -> bool:
     return bool(TABLE_TITLE_LINE_RE.match(normalize_table_title_line(text)))
 
 
-def looks_like_raw_inline_formula(text: str) -> bool:
-    candidate = strip_outer_markdown_markers(text).strip()
-    if not candidate:
-        return False
+def normalize_formula_spacing(text: str) -> str:
+    value = (text or '').replace('\r\n', '\n').replace('\r', '\n')
+    value = re.sub(r'\s*_\s*', '_', value)
+    value = re.sub(r'\s*\^\s*', '^', value)
+    value = re.sub(r'(\\[A-Za-z]+)\s+\{', r'\1{', value)
+    return value
 
-    candidate = re.sub(r'\s+', ' ', candidate)
-    if len(candidate) > 96:
-        return False
 
-    if MATH_UNICODE_HINT_RE.search(candidate):
-        return True
+def collapse_spaced_math_braces(text: str) -> str:
+    def _collapse(match):
+        inner = match.group(1)
+        tokens = inner.split()
+        if len(tokens) >= 2 and all(re.fullmatch(r'[A-Za-z0-9]', tok) for tok in tokens):
+            return '{' + ''.join(tokens) + '}'
+        return '{' + inner.strip() + '}'
 
-    has_ascii_letter = bool(re.search(r'[A-Za-z]', candidate))
-    if not has_ascii_letter:
-        return False
+    previous = None
+    value = text
+    while previous != value:
+        previous = value
+        value = re.sub(r'\{([^{}]+)\}', _collapse, value)
+    return value
 
-    if ('\\' in candidate) or ('_' in candidate) or ('^' in candidate) or ('=' in candidate):
-        return True
 
-    if '/' in candidate:
-        parts = [part.strip() for part in candidate.split('/') if part.strip()]
-        if 2 <= len(parts) <= 3 and all(
-            re.fullmatch(r'[A-Za-z0-9]{1,12}', part) or
-            re.fullmatch(r'[A-Za-z0-9]{1,12}_[A-Za-z0-9]{1,12}', part)
-            for part in parts
-        ):
-            return True
+def normalize_math_unicode_to_latex(text: str) -> str:
+    value = text
+    for raw, latex in SPECIAL_FORMULA_CHAR_MAP.items():
+        value = value.replace(raw, latex)
 
-    return False
+    value = unicodedata.normalize('NFKD', value)
+
+    accent_map = {
+        '\u0302': r'\hat',
+        '\u0303': r'\tilde',
+        '\u0304': r'\bar',
+        '\u0307': r'\dot',
+    }
+    for mark, cmd in accent_map.items():
+        value = re.sub(
+            rf'(\\[A-Za-z]+|[A-Za-zΑ-Ωα-ω]){mark}',
+            lambda m, cmd=cmd: cmd + '{' + m.group(1) + '}',
+            value,
+        )
+
+    value = re.sub(r'[\u0300-\u036F]+', '', value)
+
+    for raw, latex in GREEK_LATEX_MAP.items():
+        value = value.replace(raw, latex)
+    return value
 
 
 def looks_like_formula_text(text: str) -> bool:
@@ -862,7 +911,8 @@ def looks_like_formula_text(text: str) -> bool:
     if not candidate:
         return False
 
-    if looks_like_raw_inline_formula(candidate):
+    normalized = collapse_spaced_math_braces(normalize_formula_spacing(candidate))
+    if AUTO_FORMULA_RUN_RE.fullmatch(normalized):
         return True
 
     explicit_tokens = [
@@ -872,11 +922,14 @@ def looks_like_formula_text(text: str) -> bool:
         r'\right', r'\begin', r'\end', r'\log', r'\exp', r'\arg', r'\max',
         r'\min',
     ]
-    if any(token in candidate for token in explicit_tokens):
+    if any(token in normalized for token in explicit_tokens):
         return True
 
-    operator_count = sum(ch in candidate for ch in '=<>^_\\+-*/')
-    has_letter = bool(re.search(r'[A-Za-zΑ-Ωα-ω]', candidate))
+    if re.search(r'[Α-Ωα-ωℒμµ]', normalized):
+        return True
+
+    operator_count = sum(ch in normalized for ch in "=<>^_+-*/\\")
+    has_letter = bool(re.search(r'[A-Za-zΑ-Ωα-ω]', normalized))
     return has_letter and operator_count >= 1
 
 
@@ -906,6 +959,10 @@ def sanitize_formula_for_render(text: str) -> str:
     if not expr:
         return ''
 
+    expr = normalize_formula_spacing(expr)
+    expr = collapse_spaced_math_braces(expr)
+    expr = normalize_math_unicode_to_latex(expr)
+
     expr = re.sub(r'\\begin\{[^{}]+\}', '', expr)
     expr = re.sub(r'\\end\{[^{}]+\}', '', expr)
     expr = expr.replace('&', ' ')
@@ -915,6 +972,7 @@ def sanitize_formula_for_render(text: str) -> str:
     expr = re.sub(r'\\label\{.*?\}', '', expr)
     expr = re.sub(r'\\tag\{.*?\}', '', expr)
     expr = re.sub(r'\\nonumber\b', '', expr)
+    expr = re.sub(r'(?<=\d)\s+(?=\d)', '', expr)
     expr = re.sub(
         r'\\text\s*\{([^{}]*)\}',
         lambda m: r'\mathrm{' + m.group(1).replace(' ', r'\ ') + '}',
@@ -925,6 +983,16 @@ def sanitize_formula_for_render(text: str) -> str:
         lambda m: r'\mathrm{' + m.group(1).replace(' ', r'\ ') + '}',
         expr,
     )
+    expr = re.sub(
+        r'\\mathrm\{([^{}]*)\}',
+        lambda m: r'\mathrm{' + ''.join(m.group(1).split()) + '}',
+        expr,
+    )
+    expr = re.sub(r'_(?!\{)\s*(\\[A-Za-z]+)', r'_{\1}', expr)
+    expr = re.sub(r'\^(?!\{)\s*(\\[A-Za-z]+)', r'^{\1}', expr)
+    expr = re.sub(r'_(?!\{)\s*([A-Za-z0-9]{2,})', r'_{\1}', expr)
+    expr = re.sub(r'\^(?!\{)\s*([A-Za-z0-9]{2,})', r'^{\1}', expr)
+    expr = re.sub(r'\s*\*\s*', lambda m: r' \cdot ', expr)
     expr = re.sub(r'\s+', ' ', expr).strip()
     return expr
 
@@ -976,7 +1044,7 @@ def render_formula_image(
         return None
 
 
-def wrap_plain_text_for_paragraph(text: str, bold: bool = False) -> str:
+def wrap_plain_text_basic(text: str, bold: bool = False) -> str:
     """
     将普通文本转换为 ReportLab Paragraph 可识别的安全行内标记。
 
@@ -1003,44 +1071,51 @@ def wrap_plain_text_for_paragraph(text: str, bold: bool = False) -> str:
                 parts.append(f'<font name="STSong-Light">{chunk}</font>')
     return ''.join(parts)
 
-def wrap_plain_text_with_auto_formula(text: str, asset_ctx: Dict[str, Any], bold: bool = False) -> str:
-    """
-    对普通文本做二次扫描：
-    - 常规中英文仍按原字体逻辑输出；
-    - 对未被 $...$ 包裹、但明显是公式的原始片段（如 μ_d、ℒ_sup、𝑧_𝑡、L_d / L_t）
-      自动转成行内公式图片，避免在 PDF 里变成方框或乱码。
-    """
-    value = text or ''
-    if not value:
+
+def should_auto_render_formula(candidate: str) -> bool:
+    stripped = extract_formula_text(candidate)
+    if not stripped:
+        return False
+    if re.fullmatch(r'[A-Z]{2,}(?:-[A-Z]{2,})*', stripped):
+        return False
+    if re.fullmatch(r'[A-Za-z]{2,}', stripped):
+        return False
+    return True
+
+
+def wrap_plain_text_for_paragraph(
+    text: str,
+    asset_ctx: Optional[Dict[str, Any]] = None,
+    bold: bool = False,
+) -> str:
+    if not text:
         return ''
 
+    if asset_ctx is None:
+        return wrap_plain_text_basic(text, bold=bold)
+
+    working = collapse_spaced_math_braces(normalize_formula_spacing(text))
     parts: List[str] = []
-    start = 0
-    for match in RAW_INLINE_FORMULA_SCAN_RE.finditer(value):
-        token = match.group(0)
-        if not looks_like_raw_inline_formula(token):
-            continue
+    cursor = 0
 
-        if match.start() > start:
-            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()], bold=bold))
+    while cursor < len(working):
+        match = AUTO_FORMULA_RUN_RE.search(working, cursor)
+        if not match:
+            parts.append(wrap_plain_text_basic(working[cursor:], bold=bold))
+            break
 
-        leading_ws = token[: len(token) - len(token.lstrip())]
-        trailing_ws = token[len(token.rstrip()):]
-        core = token.strip()
+        start, end = match.span()
+        candidate = match.group(0).strip()
 
-        if leading_ws:
-            parts.append(wrap_plain_text_for_paragraph(leading_ws, bold=bold))
+        if start > cursor:
+            parts.append(wrap_plain_text_basic(working[cursor:start], bold=bold))
 
-        if core:
-            parts.append(inline_math_markup(core, asset_ctx))
+        if should_auto_render_formula(candidate):
+            parts.append(inline_math_markup(candidate, asset_ctx))
+        else:
+            parts.append(wrap_plain_text_basic(candidate, bold=bold))
 
-        if trailing_ws:
-            parts.append(wrap_plain_text_for_paragraph(trailing_ws, bold=bold))
-
-        start = match.end()
-
-    if start < len(value):
-        parts.append(wrap_plain_text_for_paragraph(value[start:], bold=bold))
+        cursor = end
 
     return ''.join(parts)
 
@@ -1049,7 +1124,7 @@ def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: 
     asset = render_formula_image(formula_text, asset_ctx, font_size=font_size, display=False)
     if not asset:
         fallback = extract_formula_text(formula_text)
-        return wrap_plain_text_for_paragraph(fallback)
+        return wrap_plain_text_basic(fallback)
 
     return (
         f'<img src="{html.escape(asset["path"], quote=True)}" '
@@ -1061,7 +1136,7 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
     渲染 ReportLab Paragraph 可识别的行内富文本：
     - 普通文本保留中英文字体切换
     - **bold** / __bold__ 会转为真正的加粗样式
-    - $...$ / \(...\) / `公式` 会优先渲染为公式图片
+    - $...$ / \\(...\\) / `公式` 会优先渲染为公式图片
     - 非公式代码使用标准 Courier / Courier-Bold，避免依赖环境字体导致崩溃
     """
     value = text or ''
@@ -1075,7 +1150,7 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
     start = 0
     for match in INLINE_MARKUP_TOKEN_RE.finditer(value):
         if match.start() > start:
-            parts.append(wrap_plain_text_with_auto_formula(value[start:match.start()], asset_ctx, bold=bold))
+            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()], asset_ctx=asset_ctx, bold=bold))
 
         token = match.group(0)
         if token.startswith('**') and token.endswith('**'):
@@ -1098,7 +1173,7 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
         start = match.end()
 
     if start < len(value):
-        parts.append(wrap_plain_text_with_auto_formula(value[start:], asset_ctx, bold=bold))
+        parts.append(wrap_plain_text_for_paragraph(value[start:], asset_ctx=asset_ctx, bold=bold))
 
     return ''.join(parts)
 
@@ -1177,6 +1252,7 @@ def build_pdf_styles():
         "caption": caption_style,
         "table_title": table_title_style,
     }
+
 
 # ==========================================
 # 模块 10：Markdown 自定义块解析
@@ -1570,6 +1646,7 @@ def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_c
     emit_pending_table_title()
     return story
 
+
 # ==========================================
 # 模块 12：PDF 文档模板
 # ==========================================
@@ -1724,6 +1801,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
         "pdf_bytes": final_pdf_bytes,
     }
 
+
 def get_or_create_analysis_result(pdf_bytes: bytes) -> Tuple[str, Optional[Dict[str, Any]]]:
     """读取或创建单篇论文分析结果，支持多文件分别缓存。"""
     cache_key = get_pdf_cache_key(pdf_bytes)
@@ -1778,6 +1856,7 @@ def render_single_analysis_result(
             key=f"download_pdf_{cache_key}",
         )
 
+
 def render_analysis_ui(pdf_inputs):
     """
     上传论文后的主工作流：
@@ -1815,6 +1894,7 @@ def render_analysis_ui(pdf_inputs):
             )
         if multi_mode and idx < len(entries):
             st.divider()
+
 
 # ==========================================
 # 模块 14：前端 UI
