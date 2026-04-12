@@ -268,6 +268,7 @@ def get_system_prompt(requirements, preprint_rule):
 3. 每次阅读完一批论文后，学习同义词或近义词，作为下一次的 `search_and_detail_papers` 查询词。【警告】：新query必须是纯粹同义词，严禁加入用户要求中的关键词！
 4. 如果不符合或无法获取摘要：摒弃该论文。
 5. 最终在备选池中选出最好的六篇来作为结果。
+6. 必须满足用户的要求。此外如果选择了排除预定本则一定要排除预定本。
 
 # 用户的具体筛选要求：
 {requirements}
