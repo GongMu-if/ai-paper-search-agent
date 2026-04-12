@@ -284,7 +284,7 @@ search_and_detail_papers(query="关键词")
 
 2. 已经选够6篇好论文结束时输出：
 Finish:
-在此处使用 Markdown 格式直接列出选出的 6 篇论文（必须包含 1.标题 2.Venue 3.DOI 4.推荐理由）。不要写多余的话。
+在此处使用 Markdown 格式直接列出选出的 6 篇论文（必须包含 1.标题 2.Venue 3.DOI 4.完整摘要 5.推荐理由）。不要写多余的话。
 """
 
 
@@ -365,7 +365,7 @@ def search_and_detail_papers(query: str) -> str:
                 f"Title: {title}\n"
                 f"  - Venue: {venue}\n"
                 f"  - S2_ID: {paper_id} | DOI: {doi}{openalex_mark}\n"
-                f"  - Abstract: {final_abstract[:800]}..."
+                f"  - Abstract: {final_abstract}..."
             )
             if len(results) >= 30:
                 break
@@ -1917,7 +1917,7 @@ with st.sidebar:
 
     allow_preprint = st.radio(
         "文献收录标准",
-        ("仅限同行评审文献 (排除预印本)", "接受预印本 (如 arXiv)"),
+        ("排除预印本 (仅限正规期刊/会议)", "接受预印本 (如 arXiv)"),
     )
 
     start_button = st.button("开始智能检索", type="primary", use_container_width=True)
@@ -1998,7 +1998,7 @@ if start_button:
             model="deepseek-chat",
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
-            max_tokens=2500,
+            max_tokens=6000,
         )
         st.session_state.prompt_history = [f"用户请求: {user_topic}"]
         st.session_state.app_state = "RUNNING"
