@@ -2366,6 +2366,22 @@ def reset_user_workspace_view(username: Optional[str] = None):
     st.session_state.selected_history_report_id = None
 
 
+def start_fresh_workspace(username: Optional[str] = None):
+    username = normalize_username(username or st.session_state.get("current_user", ""))
+    reset_user_workspace_view(username)
+    seen_paper_ids.clear()
+    st.session_state.app_state = "IDLE"
+    st.session_state.prompt_history = []
+    st.session_state.agent = None
+    st.session_state.final_result = ""
+    st.session_state.loop_count = 0
+    st.session_state.has_provided_feedback = False
+    st.session_state.ui_logs = []
+    st.session_state.feedback_start_time = None
+    st.session_state.sidebar_direct_entries = []
+    st.session_state.bottom_direct_entries = []
+
+
 
 def get_user_space_dir(username: str) -> str:
     ensure_app_storage()
@@ -2810,6 +2826,11 @@ def render_analysis_ui(pdf_inputs):
             )
         if multi_mode and idx < len(entries):
             st.divider()
+
+    st.divider()
+    if st.button("开始全新探索", type="primary", key="start_fresh_workspace_after_analysis"):
+        start_fresh_workspace(st.session_state.get("current_user", ""))
+        st.rerun()
 
 
 # ==========================================
