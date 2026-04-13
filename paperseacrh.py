@@ -2612,7 +2612,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
         with st.spinner(f"视觉专家正在分析 {len(images_dict)} 张关键图表……"):
             vision_agent = LLMClient(
                 sys_prompt=VISION_AGENT_PROMPT,
-                model="qwen3.6-plus",
+                model="qwen3.6-plus-2026-04-02",
                 api_key=QWEN_API_KEY,
                 base_url=QWEN_BASE_URL,
                 max_tokens=3000,
