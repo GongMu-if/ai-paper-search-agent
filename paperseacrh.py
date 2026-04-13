@@ -2238,49 +2238,189 @@ def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> 
 # ==========================================
 # 模块 13：用户账户与历史报告持久化
 # ==========================================
-APP_STORAGE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paper_agent_store")
-USER_DB_PATH = os.path.join(APP_STORAGE_ROOT, "users.json")
-USER_SPACES_ROOT = os.path.join(APP_STORAGE_ROOT, "user_spaces")
+import uuid
+
+try:
+    import psycopg
+    _PG_DRIVER = "psycopg"
+except Exception:
+    psycopg = None
+    try:
+        import psycopg2
+        _PG_DRIVER = "psycopg2"
+    except Exception:
+        psycopg2 = None
+        _PG_DRIVER = None
+
+SUPABASE_DB_URL = (st.secrets.get("SUPABASE_DB_URL", "") or "").strip()
 PASSWORD_HASH_ROUNDS = 120000
+_DB_BOOTSTRAPPED = False
+_DB_BOOTSTRAP_ERROR = ""
+
+
+def normalize_supabase_db_url(db_url: str) -> str:
+    value = (db_url or "").strip()
+    if value and "sslmode=" not in value:
+        value = f"{value}{'&' if '?' in value else '?'}sslmode=require"
+    return value
+
+
+SUPABASE_DB_URL = normalize_supabase_db_url(SUPABASE_DB_URL)
+
+
+def get_db_connection():
+    if not SUPABASE_DB_URL:
+        raise RuntimeError("未在 Streamlit secrets 中配置 SUPABASE_DB_URL。")
+    if _PG_DRIVER == "psycopg":
+        return psycopg.connect(SUPABASE_DB_URL)
+    if _PG_DRIVER == "psycopg2":
+        return psycopg2.connect(SUPABASE_DB_URL)
+    raise RuntimeError("未检测到 PostgreSQL 驱动。请在 requirements 中安装 psycopg[binary] 或 psycopg2-binary。")
+
+
+def _rows_to_dicts(cursor, rows):
+    columns = [desc[0] for desc in (cursor.description or [])]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def db_fetch_one(query: str, params: Optional[Tuple[Any, ...]] = None) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return _rows_to_dicts(cursor, [row])[0]
+    finally:
+        conn.close()
+
+
+def db_fetch_all(query: str, params: Optional[Tuple[Any, ...]] = None) -> List[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+            rows = cursor.fetchall()
+            return _rows_to_dicts(cursor, rows)
+    finally:
+        conn.close()
+
+
+def db_execute(query: str, params: Optional[Tuple[Any, ...]] = None):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def format_db_timestamp(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo:
+            value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return ""
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo:
+                parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return value[:19].replace("T", " ")
+    return str(value)
+
+
+def normalize_json_field(value: Any, default: Any):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
 
 
 def ensure_app_storage():
-    os.makedirs(APP_STORAGE_ROOT, exist_ok=True)
-    os.makedirs(USER_SPACES_ROOT, exist_ok=True)
-    if not os.path.exists(USER_DB_PATH):
-        with open(USER_DB_PATH, "w", encoding="utf-8") as f:
-            json.dump({"users": {}}, f, ensure_ascii=False, indent=2)
+    global _DB_BOOTSTRAPPED, _DB_BOOTSTRAP_ERROR
+    if _DB_BOOTSTRAPPED:
+        return
+    if _DB_BOOTSTRAP_ERROR:
+        raise RuntimeError(_DB_BOOTSTRAP_ERROR)
 
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS public.users (
+            id UUID PRIMARY KEY,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON public.users ((LOWER(username)))",
+        """
+        CREATE TABLE IF NOT EXISTS public.analysis_jobs (
+            id UUID PRIMARY KEY,
+            user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+            task_no INTEGER NOT NULL,
+            title TEXT,
+            pdf_name TEXT,
+            pdf_path TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            progress_text TEXT DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "ALTER TABLE public.analysis_jobs ADD COLUMN IF NOT EXISTS cache_key TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_jobs_user_task_unique ON public.analysis_jobs(user_id, task_no)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_jobs_user_cache_key ON public.analysis_jobs(user_id, cache_key) WHERE cache_key IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_jobs_user_id ON public.analysis_jobs(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON public.analysis_jobs(status)",
+        """
+        CREATE TABLE IF NOT EXISTS public.analysis_reports (
+            id UUID PRIMARY KEY,
+            job_id UUID NOT NULL UNIQUE REFERENCES public.analysis_jobs(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+            report_markdown TEXT,
+            parsed_markdown TEXT,
+            text_agent_output TEXT,
+            vision_output TEXT,
+            images_manifest JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_analysis_reports_user_id ON public.analysis_reports(user_id)",
+    ]
 
-
-def load_json_file(path: str, default: Any):
-    if not os.path.exists(path):
-        return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-
-def save_json_file(path: str, data: Any):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
-
+        for statement in statements:
+            db_execute(statement)
+        _DB_BOOTSTRAPPED = True
+    except Exception as e:
+        _DB_BOOTSTRAP_ERROR = f"Supabase 数据库初始化失败：{str(e)}"
+        raise RuntimeError(_DB_BOOTSTRAP_ERROR)
 
 
 def normalize_username(username: str) -> str:
     return (username or "").strip()
 
 
-
 def canonical_username(username: str) -> str:
     return normalize_username(username).lower()
-
 
 
 def make_password_hash(password: str, salt_hex: Optional[str] = None) -> Tuple[str, str]:
@@ -2294,9 +2434,37 @@ def make_password_hash(password: str, salt_hex: Optional[str] = None) -> Tuple[s
     return salt_hex, digest
 
 
+def pack_password_hash(password: str) -> str:
+    salt_hex, digest = make_password_hash(password)
+    return f"{salt_hex}${digest}"
+
+
+def verify_password_hash(password: str, packed_hash: str) -> bool:
+    packed_hash = (packed_hash or "").strip()
+    if "$" not in packed_hash:
+        return False
+    salt_hex, expected_hash = packed_hash.split("$", 1)
+    _, actual_hash = make_password_hash(password, salt_hex=salt_hex)
+    return actual_hash == expected_hash
+
+
+def get_user_record(username: str) -> Optional[Dict[str, Any]]:
+    username = normalize_username(username)
+    if not username:
+        return None
+    ensure_app_storage()
+    return db_fetch_one(
+        """
+        SELECT id, username, password_hash, created_at
+        FROM public.users
+        WHERE LOWER(username) = LOWER(%s)
+        LIMIT 1
+        """,
+        (username,),
+    )
+
 
 def register_user(username: str, password: str) -> Tuple[bool, str]:
-    ensure_app_storage()
     username = normalize_username(username)
     password = password or ""
 
@@ -2309,52 +2477,48 @@ def register_user(username: str, password: str) -> Tuple[bool, str]:
     if len(password) < 6:
         return False, "密码至少需要 6 个字符。"
 
-    users_db = load_json_file(USER_DB_PATH, {"users": {}})
-    user_key = canonical_username(username)
-    if user_key in users_db.get("users", {}):
-        return False, "该账号已存在，请直接登录。"
+    try:
+        ensure_app_storage()
+        if get_user_record(username):
+            return False, "该账号已存在，请直接登录。"
 
-    salt_hex, password_hash = make_password_hash(password)
-    users_db.setdefault("users", {})[user_key] = {
-        "username": username,
-        "salt": salt_hex,
-        "password_hash": password_hash,
-        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    save_json_file(USER_DB_PATH, users_db)
-    ensure_user_space(username)
-    return True, username
-
+        db_execute(
+            """
+            INSERT INTO public.users (id, username, password_hash, created_at)
+            VALUES (%s, %s, %s, NOW())
+            """,
+            (str(uuid.uuid4()), username, pack_password_hash(password)),
+        )
+        return True, username
+    except Exception as e:
+        if "idx_users_username_lower" in str(e) or "duplicate key" in str(e).lower():
+            return False, "该账号已存在，请直接登录。"
+        return False, f"注册失败：{str(e)}"
 
 
 def authenticate_user(username: str, password: str) -> Tuple[bool, str]:
-    ensure_app_storage()
     username = normalize_username(username)
     password = password or ""
 
-    users_db = load_json_file(USER_DB_PATH, {"users": {}})
-    record = users_db.get("users", {}).get(canonical_username(username))
+    try:
+        ensure_app_storage()
+        record = get_user_record(username)
+    except Exception as e:
+        return False, f"登录失败：{str(e)}"
+
     if not record:
         return False, "账号或密码错误。"
-
-    salt_hex = record.get("salt", "")
-    expected_hash = record.get("password_hash", "")
-    _, actual_hash = make_password_hash(password, salt_hex=salt_hex)
-    if actual_hash != expected_hash:
+    if not verify_password_hash(password, record.get("password_hash", "")):
         return False, "账号或密码错误。"
-
     return True, record.get("username") or username
-
 
 
 def get_history_selector_key(username: str) -> str:
     return f"history_selector_{canonical_username(username)}"
 
 
-
 def get_history_reset_flag_key(username: str) -> str:
     return f"history_reset_pending_{canonical_username(username)}"
-
 
 
 def reset_user_workspace_view(username: Optional[str] = None):
@@ -2382,46 +2546,60 @@ def start_fresh_workspace(username: Optional[str] = None):
     st.session_state.bottom_direct_entries = []
 
 
-
 def get_user_space_dir(username: str) -> str:
-    ensure_app_storage()
-    user_token = hashlib.sha256(canonical_username(username).encode("utf-8")).hexdigest()
-    return os.path.join(USER_SPACES_ROOT, user_token)
-
+    return canonical_username(username)
 
 
 def ensure_user_space(username: str) -> str:
-    user_dir = get_user_space_dir(username)
-    reports_dir = os.path.join(user_dir, "reports")
-    os.makedirs(reports_dir, exist_ok=True)
-    index_path = os.path.join(user_dir, "report_index.json")
-    if not os.path.exists(index_path):
-        save_json_file(index_path, {"reports": []})
-    return user_dir
-
+    ensure_app_storage()
+    return get_user_space_dir(username)
 
 
 def get_user_report_index_path(username: str) -> str:
-    return os.path.join(ensure_user_space(username), "report_index.json")
-
+    return canonical_username(username)
 
 
 def get_user_report_file_path(username: str, report_id: str) -> str:
-    return os.path.join(ensure_user_space(username), "reports", f"{report_id}.json")
-
+    return f"{canonical_username(username)}:{report_id}"
 
 
 def load_user_report_index(username: str) -> List[Dict[str, Any]]:
-    index_path = get_user_report_index_path(username)
-    index_data = load_json_file(index_path, {"reports": []})
-    reports = index_data.get("reports", []) if isinstance(index_data, dict) else []
-    reports = [item for item in reports if isinstance(item, dict)]
-    reports.sort(
-        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
-        reverse=True,
-    )
-    return reports
+    username = normalize_username(username)
+    if not username:
+        return []
 
+    try:
+        ensure_app_storage()
+        rows = db_fetch_all(
+            """
+            SELECT
+                j.id AS report_id,
+                j.cache_key,
+                COALESCE(NULLIF(j.pdf_name, ''), NULLIF(j.title, ''), '未命名论文') AS source_name,
+                COALESCE(NULLIF(j.title, ''), NULLIF(j.pdf_name, ''), '论文全维度深度透视报告') AS report_title,
+                j.created_at,
+                COALESCE(j.updated_at, r.created_at, j.created_at) AS updated_at
+            FROM public.analysis_jobs j
+            JOIN public.users u ON u.id = j.user_id
+            JOIN public.analysis_reports r ON r.job_id = j.id
+            WHERE LOWER(u.username) = LOWER(%s)
+            ORDER BY COALESCE(j.updated_at, r.created_at, j.created_at) DESC
+            """,
+            (username,),
+        )
+        history = []
+        for row in rows:
+            history.append({
+                "report_id": row.get("report_id", ""),
+                "cache_key": row.get("cache_key", "") or "",
+                "source_name": row.get("source_name", "") or "未命名论文",
+                "report_title": row.get("report_title", "") or "论文全维度深度透视报告",
+                "created_at": format_db_timestamp(row.get("created_at")),
+                "updated_at": format_db_timestamp(row.get("updated_at")),
+            })
+        return history
+    except Exception:
+        return []
 
 
 def get_persistable_analysis_result(analysis_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -2434,6 +2612,24 @@ def get_persistable_analysis_result(analysis_result: Dict[str, Any]) -> Dict[str
     }
 
 
+def get_next_task_no(user_id: str) -> int:
+    row = db_fetch_one(
+        "SELECT COALESCE(MAX(task_no), 0) + 1 AS next_task_no FROM public.analysis_jobs WHERE user_id = %s",
+        (user_id,),
+    )
+    return int((row or {}).get("next_task_no") or 1)
+
+
+def build_report_meta_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "report_id": row.get("report_id") or row.get("job_id") or "",
+        "cache_key": row.get("cache_key", "") or "",
+        "source_name": row.get("source_name") or row.get("pdf_name") or row.get("report_title") or "未命名论文",
+        "report_title": row.get("report_title") or row.get("title") or row.get("source_name") or "论文全维度深度透视报告",
+        "created_at": format_db_timestamp(row.get("created_at") or row.get("job_created_at") or row.get("report_created_at")),
+        "updated_at": format_db_timestamp(row.get("updated_at") or row.get("report_created_at") or row.get("job_created_at") or row.get("created_at")),
+    }
+
 
 def save_user_report_record(
     username: str,
@@ -2441,61 +2637,201 @@ def save_user_report_record(
     cache_key: str,
     analysis_result: Dict[str, Any],
 ) -> Dict[str, Any]:
-    report_index = load_user_report_index(username)
-    existing = next((item for item in report_index if item.get("cache_key") == cache_key), None)
+    ensure_app_storage()
+    username = normalize_username(username)
+    user_record = get_user_record(username)
+    if not user_record:
+        raise RuntimeError("当前账号不存在，无法保存历史报告。")
 
-    report_id = (existing or {}).get("report_id") or hashlib.sha256(
-        f"{canonical_username(username)}|{cache_key}".encode("utf-8")
-    ).hexdigest()[:24]
+    user_id = user_record["id"]
+    source_name = (source_name or "").strip() or "未命名论文"
     report_title, _ = split_title_and_body(analysis_result.get("main_report", ""))
-    now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_title = (report_title or source_name or "论文全维度深度透视报告").strip()
+    report_payload = get_persistable_analysis_result(analysis_result)
+    images_manifest_text = json.dumps(report_payload.get("images", {}), ensure_ascii=False)
 
-    meta = {
-        "report_id": report_id,
-        "cache_key": cache_key,
-        "source_name": source_name or (existing or {}).get("source_name") or report_title or "未命名论文",
-        "report_title": report_title or source_name or "论文全维度深度透视报告",
-        "created_at": (existing or {}).get("created_at") or now_text,
-        "updated_at": now_text,
-    }
-
-    payload = {
-        "meta": meta,
-        "analysis_result": get_persistable_analysis_result(analysis_result),
-    }
-    save_json_file(get_user_report_file_path(username, report_id), payload)
-
-    refreshed_index = [meta] + [
-        item for item in report_index
-        if item.get("report_id") != report_id and item.get("cache_key") != cache_key
-    ]
-    refreshed_index.sort(
-        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
-        reverse=True,
+    existing_job = db_fetch_one(
+        """
+        SELECT id AS job_id, task_no, created_at, updated_at
+        FROM public.analysis_jobs
+        WHERE user_id = %s AND cache_key = %s
+        LIMIT 1
+        """,
+        (user_id, cache_key),
     )
-    save_json_file(get_user_report_index_path(username), {"reports": refreshed_index})
-    return meta
 
+    if existing_job:
+        job_id = existing_job["job_id"]
+        task_no = int(existing_job.get("task_no") or 1)
+        created_at_value = existing_job.get("created_at")
+        db_execute(
+            """
+            UPDATE public.analysis_jobs
+            SET title = %s,
+                pdf_name = %s,
+                status = 'finished',
+                progress_text = '解析完成',
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (report_title, source_name, job_id),
+        )
+    else:
+        task_no = get_next_task_no(user_id)
+        job_id = str(uuid.uuid4())
+        created_at_value = datetime.datetime.now()
+        db_execute(
+            """
+            INSERT INTO public.analysis_jobs (
+                id, user_id, task_no, title, pdf_name, pdf_path, cache_key,
+                status, progress_text, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'finished', '解析完成', NOW(), NOW())
+            """,
+            (job_id, user_id, task_no, report_title, source_name, "", cache_key),
+        )
+
+    existing_report = db_fetch_one(
+        "SELECT id, created_at FROM public.analysis_reports WHERE job_id = %s LIMIT 1",
+        (job_id,),
+    )
+
+    if existing_report:
+        db_execute(
+            """
+            UPDATE public.analysis_reports
+            SET user_id = %s,
+                report_markdown = %s,
+                parsed_markdown = %s,
+                text_agent_output = %s,
+                vision_output = %s,
+                images_manifest = %s::jsonb
+            WHERE job_id = %s
+            """,
+            (
+                user_id,
+                report_payload.get("main_report", ""),
+                report_payload.get("source_markdown", ""),
+                report_payload.get("text_report", ""),
+                report_payload.get("vision_summaries", ""),
+                images_manifest_text,
+                job_id,
+            ),
+        )
+    else:
+        db_execute(
+            """
+            INSERT INTO public.analysis_reports (
+                id, job_id, user_id, report_markdown, parsed_markdown,
+                text_agent_output, vision_output, images_manifest, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
+            """,
+            (
+                str(uuid.uuid4()),
+                job_id,
+                user_id,
+                report_payload.get("main_report", ""),
+                report_payload.get("source_markdown", ""),
+                report_payload.get("text_report", ""),
+                report_payload.get("vision_summaries", ""),
+                images_manifest_text,
+            ),
+        )
+
+    return {
+        "report_id": job_id,
+        "cache_key": cache_key,
+        "source_name": source_name,
+        "report_title": report_title,
+        "created_at": format_db_timestamp(created_at_value),
+        "updated_at": format_db_timestamp(datetime.datetime.now()),
+        "task_no": task_no,
+    }
 
 
 def load_user_report_record(username: str, report_id: str) -> Optional[Dict[str, Any]]:
-    report_path = get_user_report_file_path(username, report_id)
-    payload = load_json_file(report_path, None)
-    if isinstance(payload, dict):
-        return payload
-    return None
+    username = normalize_username(username)
+    report_id = (report_id or "").strip()
+    if not username or not report_id:
+        return None
 
+    try:
+        ensure_app_storage()
+        row = db_fetch_one(
+            """
+            SELECT
+                j.id AS report_id,
+                j.cache_key,
+                j.title AS report_title,
+                j.pdf_name AS source_name,
+                j.created_at AS job_created_at,
+                j.updated_at,
+                r.created_at AS report_created_at,
+                r.report_markdown,
+                r.parsed_markdown,
+                r.text_agent_output,
+                r.vision_output,
+                r.images_manifest
+            FROM public.analysis_jobs j
+            JOIN public.users u ON u.id = j.user_id
+            JOIN public.analysis_reports r ON r.job_id = j.id
+            WHERE LOWER(u.username) = LOWER(%s) AND j.id = %s
+            LIMIT 1
+            """,
+            (username, report_id),
+        )
+        if not row:
+            return None
+
+        meta = build_report_meta_from_row({
+            "report_id": row.get("report_id"),
+            "cache_key": row.get("cache_key"),
+            "source_name": row.get("source_name"),
+            "report_title": row.get("report_title"),
+            "created_at": row.get("job_created_at"),
+            "updated_at": row.get("updated_at") or row.get("report_created_at") or row.get("job_created_at"),
+        })
+        analysis_result = {
+            "source_markdown": row.get("parsed_markdown", "") or "",
+            "text_report": row.get("text_agent_output", "") or "",
+            "vision_summaries": row.get("vision_output", "") or "",
+            "images": normalize_json_field(row.get("images_manifest"), {}),
+            "main_report": row.get("report_markdown", "") or "",
+        }
+        return {"meta": meta, "analysis_result": analysis_result}
+    except Exception:
+        return None
 
 
 def get_user_cached_report(username: str, cache_key: str) -> Optional[Dict[str, Any]]:
-    for item in load_user_report_index(username):
-        if item.get("cache_key") != cache_key:
-            continue
-        payload = load_user_report_record(username, item.get("report_id", ""))
+    username = normalize_username(username)
+    cache_key = (cache_key or "").strip()
+    if not username or not cache_key:
+        return None
+
+    try:
+        ensure_app_storage()
+        row = db_fetch_one(
+            """
+            SELECT j.id AS report_id
+            FROM public.analysis_jobs j
+            JOIN public.users u ON u.id = j.user_id
+            JOIN public.analysis_reports r ON r.job_id = j.id
+            WHERE LOWER(u.username) = LOWER(%s) AND j.cache_key = %s
+            ORDER BY COALESCE(j.updated_at, r.created_at, j.created_at) DESC
+            LIMIT 1
+            """,
+            (username, cache_key),
+        )
+        if not row:
+            return None
+        payload = load_user_report_record(username, row.get("report_id", ""))
         if payload and isinstance(payload.get("analysis_result"), dict):
             return payload["analysis_result"]
-    return None
-
+        return None
+    except Exception:
+        return None
 
 
 def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
@@ -2505,7 +2841,6 @@ def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
     return value[: max_len - 1] + "…"
 
 
-
 def format_report_history_label(meta: Dict[str, Any]) -> str:
     if not meta:
         return "当前工作区"
@@ -2513,7 +2848,6 @@ def format_report_history_label(meta: Dict[str, Any]) -> str:
     timestamp = (meta.get("updated_at") or meta.get("created_at") or "")[:16]
     short_name = shorten_sidebar_label(display_name, max_len=18)
     return f"{short_name}｜{timestamp}" if timestamp else short_name
-
 
 
 def render_auth_ui():
@@ -2557,7 +2891,6 @@ def render_auth_ui():
     st.stop()
 
 
-
 def render_history_sidebar(username: str):
     history = load_user_report_index(username)
     selector_key = get_history_selector_key(username)
@@ -2587,7 +2920,6 @@ def render_history_sidebar(username: str):
         st.caption("重新登录后也可在这里直接打开历史报告。")
     else:
         st.caption("当前账号还没有历史报告。")
-
 
 # ==========================================
 # 模块 14：论文精读主流程
@@ -2836,7 +3168,11 @@ def render_analysis_ui(pdf_inputs):
 # ==========================================
 # 模块 15：状态初始化
 # ==========================================
-ensure_app_storage()
+try:
+    ensure_app_storage()
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
 if "current_user" not in st.session_state:
     st.session_state.current_user = ""
