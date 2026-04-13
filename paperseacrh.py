@@ -2253,9 +2253,10 @@ except Exception:
         _PG_DRIVER = None
 
 SUPABASE_DB_URL = (st.secrets.get("SUPABASE_DB_URL", "") or "").strip()
+ASYNC_MODAL_API_URL = (st.secrets.get("ASYNC_MODAL_API_URL", "") or st.secrets.get("MODAL_JOB_API_URL", "") or "").strip()
 PASSWORD_HASH_ROUNDS = 120000
-_DB_BOOTSTRAPPED = False
-_DB_BOOTSTRAP_ERROR = ""
+JOB_STATUS_REFRESH_INTERVAL_MS = 4000
+DB_READ_CACHE_TTL_SECONDS = 6
 
 
 def normalize_supabase_db_url(db_url: str) -> str:
@@ -2268,14 +2269,18 @@ def normalize_supabase_db_url(db_url: str) -> str:
 SUPABASE_DB_URL = normalize_supabase_db_url(SUPABASE_DB_URL)
 
 
-def get_db_connection():
-    if not SUPABASE_DB_URL:
+def _open_db_connection(db_url: str):
+    if not db_url:
         raise RuntimeError("未在 Streamlit secrets 中配置 SUPABASE_DB_URL。")
     if _PG_DRIVER == "psycopg":
-        return psycopg.connect(SUPABASE_DB_URL)
+        return psycopg.connect(db_url)
     if _PG_DRIVER == "psycopg2":
-        return psycopg2.connect(SUPABASE_DB_URL)
+        return psycopg2.connect(db_url)
     raise RuntimeError("未检测到 PostgreSQL 驱动。请在 requirements 中安装 psycopg[binary] 或 psycopg2-binary。")
+
+
+def get_db_connection():
+    return _open_db_connection(SUPABASE_DB_URL)
 
 
 def _rows_to_dicts(cursor, rows):
@@ -2283,84 +2288,7 @@ def _rows_to_dicts(cursor, rows):
     return [dict(zip(columns, row)) for row in rows]
 
 
-def db_fetch_one(query: str, params: Optional[Tuple[Any, ...]] = None) -> Optional[Dict[str, Any]]:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params or ())
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return _rows_to_dicts(cursor, [row])[0]
-    finally:
-        conn.close()
-
-
-def db_fetch_all(query: str, params: Optional[Tuple[Any, ...]] = None) -> List[Dict[str, Any]]:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params or ())
-            rows = cursor.fetchall()
-            return _rows_to_dicts(cursor, rows)
-    finally:
-        conn.close()
-
-
-def db_execute(query: str, params: Optional[Tuple[Any, ...]] = None):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params or ())
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def format_db_timestamp(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, datetime.datetime):
-        if value.tzinfo:
-            value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return ""
-        try:
-            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo:
-                parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-            return parsed.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return value[:19].replace("T", " ")
-    return str(value)
-
-
-def normalize_json_field(value: Any, default: Any):
-    if value is None:
-        return default
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except Exception:
-            return default
-    return default
-
-
-def ensure_app_storage():
-    global _DB_BOOTSTRAPPED, _DB_BOOTSTRAP_ERROR
-    if _DB_BOOTSTRAPPED:
-        return
-    if _DB_BOOTSTRAP_ERROR:
-        raise RuntimeError(_DB_BOOTSTRAP_ERROR)
-
+def _execute_bootstrap_statements(db_url: str):
     statements = [
         """
         CREATE TABLE IF NOT EXISTS public.users (
@@ -2406,13 +2334,110 @@ def ensure_app_storage():
         "CREATE INDEX IF NOT EXISTS idx_analysis_reports_user_id ON public.analysis_reports(user_id)",
     ]
 
+    conn = _open_db_connection(db_url)
     try:
-        for statement in statements:
-            db_execute(statement)
-        _DB_BOOTSTRAPPED = True
-    except Exception as e:
-        _DB_BOOTSTRAP_ERROR = f"Supabase 数据库初始化失败：{str(e)}"
-        raise RuntimeError(_DB_BOOTSTRAP_ERROR)
+        with conn.cursor() as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return True
+
+
+@st.cache_resource(show_spinner=False)
+def _bootstrap_database_once(db_url: str):
+    return _execute_bootstrap_statements(db_url)
+
+
+def ensure_app_storage():
+    if not SUPABASE_DB_URL:
+        raise RuntimeError("未在 Streamlit secrets 中配置 SUPABASE_DB_URL。")
+    _bootstrap_database_once(SUPABASE_DB_URL)
+
+
+def db_fetch_one(query: str, params: Optional[Tuple[Any, ...]] = None) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return _rows_to_dicts(cursor, [row])[0]
+    finally:
+        conn.close()
+
+
+def db_fetch_all(query: str, params: Optional[Tuple[Any, ...]] = None) -> List[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+            rows = cursor.fetchall()
+            return _rows_to_dicts(cursor, rows)
+    finally:
+        conn.close()
+
+
+def format_db_timestamp(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo:
+            value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return ""
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo:
+                parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return value[:19].replace("T", " ")
+    return str(value)
+
+
+def normalize_json_field(value: Any, default: Any):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
+
+
+def clear_db_read_caches():
+    _get_user_record_cached.clear()
+    _load_user_report_index_cached.clear()
+    _get_user_job_state_cached.clear()
+    _get_user_job_by_cache_key_cached.clear()
+    _load_user_report_record_cached.clear()
+    _get_user_cached_report_cached.clear()
+
+
+def db_execute(query: str, params: Optional[Tuple[Any, ...]] = None):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    clear_db_read_caches()
 
 
 def normalize_username(username: str) -> str:
@@ -2448,11 +2473,8 @@ def verify_password_hash(password: str, packed_hash: str) -> bool:
     return actual_hash == expected_hash
 
 
-def get_user_record(username: str) -> Optional[Dict[str, Any]]:
-    username = normalize_username(username)
-    if not username:
-        return None
-    ensure_app_storage()
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _get_user_record_cached(username: str) -> Optional[Dict[str, Any]]:
     return db_fetch_one(
         """
         SELECT id, username, password_hash, created_at
@@ -2462,6 +2484,14 @@ def get_user_record(username: str) -> Optional[Dict[str, Any]]:
         """,
         (username,),
     )
+
+
+def get_user_record(username: str) -> Optional[Dict[str, Any]]:
+    username = normalize_username(username)
+    if not username:
+        return None
+    ensure_app_storage()
+    return _get_user_record_cached(username)
 
 
 def register_user(username: str, password: str) -> Tuple[bool, str]:
@@ -2563,43 +2593,53 @@ def get_user_report_file_path(username: str, report_id: str) -> str:
     return f"{canonical_username(username)}:{report_id}"
 
 
+def build_report_meta_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "report_id": row.get("report_id") or row.get("job_id") or "",
+        "cache_key": row.get("cache_key", "") or "",
+        "source_name": row.get("source_name") or row.get("pdf_name") or row.get("report_title") or "未命名论文",
+        "report_title": row.get("report_title") or row.get("title") or row.get("source_name") or "论文全维度深度透视报告",
+        "created_at": format_db_timestamp(row.get("created_at") or row.get("job_created_at") or row.get("report_created_at")),
+        "updated_at": format_db_timestamp(row.get("updated_at") or row.get("report_created_at") or row.get("job_created_at") or row.get("created_at")),
+        "status": (row.get("status") or "").lower(),
+        "progress_text": row.get("progress_text") or "",
+        "has_report": bool(row.get("has_report")),
+        "task_no": row.get("task_no"),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _load_user_report_index_cached(username: str) -> List[Dict[str, Any]]:
+    rows = db_fetch_all(
+        """
+        SELECT
+            j.id AS report_id,
+            j.task_no,
+            j.cache_key,
+            COALESCE(NULLIF(j.pdf_name, ''), NULLIF(j.title, ''), '未命名论文') AS source_name,
+            COALESCE(NULLIF(j.title, ''), NULLIF(j.pdf_name, ''), '论文全维度深度透视报告') AS report_title,
+            j.status,
+            j.progress_text,
+            j.created_at,
+            COALESCE(j.updated_at, r.created_at, j.created_at) AS updated_at,
+            CASE WHEN r.job_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_report
+        FROM public.analysis_jobs j
+        JOIN public.users u ON u.id = j.user_id
+        LEFT JOIN public.analysis_reports r ON r.job_id = j.id
+        WHERE LOWER(u.username) = LOWER(%s)
+        ORDER BY COALESCE(j.updated_at, r.created_at, j.created_at) DESC
+        """,
+        (username,),
+    )
+    return [build_report_meta_from_row(row) for row in rows]
+
+
 def load_user_report_index(username: str) -> List[Dict[str, Any]]:
     username = normalize_username(username)
     if not username:
         return []
-
-    try:
-        ensure_app_storage()
-        rows = db_fetch_all(
-            """
-            SELECT
-                j.id AS report_id,
-                j.cache_key,
-                COALESCE(NULLIF(j.pdf_name, ''), NULLIF(j.title, ''), '未命名论文') AS source_name,
-                COALESCE(NULLIF(j.title, ''), NULLIF(j.pdf_name, ''), '论文全维度深度透视报告') AS report_title,
-                j.created_at,
-                COALESCE(j.updated_at, r.created_at, j.created_at) AS updated_at
-            FROM public.analysis_jobs j
-            JOIN public.users u ON u.id = j.user_id
-            JOIN public.analysis_reports r ON r.job_id = j.id
-            WHERE LOWER(u.username) = LOWER(%s)
-            ORDER BY COALESCE(j.updated_at, r.created_at, j.created_at) DESC
-            """,
-            (username,),
-        )
-        history = []
-        for row in rows:
-            history.append({
-                "report_id": row.get("report_id", ""),
-                "cache_key": row.get("cache_key", "") or "",
-                "source_name": row.get("source_name", "") or "未命名论文",
-                "report_title": row.get("report_title", "") or "论文全维度深度透视报告",
-                "created_at": format_db_timestamp(row.get("created_at")),
-                "updated_at": format_db_timestamp(row.get("updated_at")),
-            })
-        return history
-    except Exception:
-        return []
+    ensure_app_storage()
+    return _load_user_report_index_cached(username)
 
 
 def get_persistable_analysis_result(analysis_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -2618,17 +2658,6 @@ def get_next_task_no(user_id: str) -> int:
         (user_id,),
     )
     return int((row or {}).get("next_task_no") or 1)
-
-
-def build_report_meta_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "report_id": row.get("report_id") or row.get("job_id") or "",
-        "cache_key": row.get("cache_key", "") or "",
-        "source_name": row.get("source_name") or row.get("pdf_name") or row.get("report_title") or "未命名论文",
-        "report_title": row.get("report_title") or row.get("title") or row.get("source_name") or "论文全维度深度透视报告",
-        "created_at": format_db_timestamp(row.get("created_at") or row.get("job_created_at") or row.get("report_created_at")),
-        "updated_at": format_db_timestamp(row.get("updated_at") or row.get("report_created_at") or row.get("job_created_at") or row.get("created_at")),
-    }
 
 
 def save_user_report_record(
@@ -2747,7 +2776,259 @@ def save_user_report_record(
         "created_at": format_db_timestamp(created_at_value),
         "updated_at": format_db_timestamp(datetime.datetime.now()),
         "task_no": task_no,
+        "status": "finished",
+        "progress_text": "解析完成",
+        "has_report": True,
     }
+
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _get_user_job_state_cached(username: str, report_id: str) -> Optional[Dict[str, Any]]:
+    row = db_fetch_one(
+        """
+        SELECT
+            j.id AS report_id,
+            j.task_no,
+            j.cache_key,
+            j.title AS report_title,
+            j.pdf_name AS source_name,
+            j.status,
+            j.progress_text,
+            j.created_at,
+            j.updated_at,
+            CASE WHEN r.job_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_report
+        FROM public.analysis_jobs j
+        JOIN public.users u ON u.id = j.user_id
+        LEFT JOIN public.analysis_reports r ON r.job_id = j.id
+        WHERE LOWER(u.username) = LOWER(%s) AND j.id = %s
+        LIMIT 1
+        """,
+        (username, report_id),
+    )
+    if not row:
+        return None
+    return build_report_meta_from_row(row)
+
+
+def get_user_job_state(username: str, report_id: str) -> Optional[Dict[str, Any]]:
+    username = normalize_username(username)
+    report_id = (report_id or "").strip()
+    if not username or not report_id:
+        return None
+    ensure_app_storage()
+    return _get_user_job_state_cached(username, report_id)
+
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _get_user_job_by_cache_key_cached(username: str, cache_key: str) -> Optional[Dict[str, Any]]:
+    row = db_fetch_one(
+        """
+        SELECT
+            j.id AS report_id,
+            j.task_no,
+            j.cache_key,
+            j.title AS report_title,
+            j.pdf_name AS source_name,
+            j.status,
+            j.progress_text,
+            j.created_at,
+            j.updated_at,
+            CASE WHEN r.job_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_report
+        FROM public.analysis_jobs j
+        JOIN public.users u ON u.id = j.user_id
+        LEFT JOIN public.analysis_reports r ON r.job_id = j.id
+        WHERE LOWER(u.username) = LOWER(%s) AND j.cache_key = %s
+        LIMIT 1
+        """,
+        (username, cache_key),
+    )
+    if not row:
+        return None
+    return build_report_meta_from_row(row)
+
+
+def get_user_job_by_cache_key(username: str, cache_key: str) -> Optional[Dict[str, Any]]:
+    username = normalize_username(username)
+    cache_key = (cache_key or "").strip()
+    if not username or not cache_key:
+        return None
+    ensure_app_storage()
+    return _get_user_job_by_cache_key_cached(username, cache_key)
+
+
+def focus_latest_user_job(username: str):
+    username = normalize_username(username)
+    selector_key = get_history_selector_key(username)
+    reset_flag_key = get_history_reset_flag_key(username)
+    history = load_user_report_index(username)
+    if history:
+        latest_id = history[0].get("report_id", "")
+        if latest_id:
+            st.session_state[selector_key] = latest_id
+            st.session_state.selected_history_report_id = latest_id
+            st.session_state[reset_flag_key] = False
+            return
+    reset_user_workspace_view(username)
+
+
+def update_analysis_job_status(job_id: str, status: str, progress_text: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return
+    safe_status = (status or "").strip().lower()
+    if safe_status not in {"queued", "processing", "finished", "failed"}:
+        safe_status = "processing"
+    db_execute(
+        """
+        UPDATE public.analysis_jobs
+        SET status = %s,
+            progress_text = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (safe_status, (progress_text or "").strip()[:1000], job_id),
+    )
+
+
+def create_or_reuse_analysis_job(username: str, source_name: str, cache_key: str) -> Tuple[Dict[str, Any], bool]:
+    ensure_app_storage()
+    username = normalize_username(username)
+    user_record = get_user_record(username)
+    if not user_record:
+        raise RuntimeError("当前账号不存在，无法创建后台解析任务。")
+
+    source_name = (source_name or "").strip() or "未命名论文"
+    user_id = user_record["id"]
+    existing_job = get_user_job_by_cache_key(username, cache_key)
+    if existing_job:
+        existing_status = (existing_job.get("status") or "").lower()
+        if existing_status in {"queued", "processing"}:
+            return existing_job, False
+        if existing_status == "finished" and existing_job.get("has_report"):
+            return existing_job, False
+
+        update_analysis_job_status(existing_job["report_id"], "queued", "任务已重新提交，等待后台启动")
+        db_execute(
+            """
+            UPDATE public.analysis_jobs
+            SET title = %s,
+                pdf_name = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (source_name, source_name, existing_job["report_id"]),
+        )
+        refreshed_job = get_user_job_state(username, existing_job["report_id"]) or existing_job
+        return refreshed_job, True
+
+    task_no = get_next_task_no(user_id)
+    job_id = str(uuid.uuid4())
+    db_execute(
+        """
+        INSERT INTO public.analysis_jobs (
+            id, user_id, task_no, title, pdf_name, pdf_path, cache_key,
+            status, progress_text, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', '任务已提交，等待后台启动', NOW(), NOW())
+        """,
+        (job_id, user_id, task_no, source_name, source_name, "", cache_key),
+    )
+    created_job = get_user_job_state(username, job_id)
+    if not created_job:
+        raise RuntimeError("后台解析任务创建成功，但未能回读任务记录。")
+    return created_job, True
+
+
+def submit_analysis_job_to_modal(job_id: str, source_name: str, cache_key: str, pdf_bytes: bytes):
+    submit_url = (ASYNC_MODAL_API_URL or "").strip()
+    if not submit_url:
+        raise RuntimeError("未在 Streamlit secrets 中配置 ASYNC_MODAL_API_URL。")
+
+    files = {
+        "file": (source_name or "paper.pdf", pdf_bytes, "application/pdf"),
+    }
+    data = {
+        "job_id": job_id,
+        "source_name": source_name or "未命名论文",
+        "cache_key": cache_key,
+    }
+
+    response = requests.post(submit_url, data=data, files=files, timeout=120)
+    if response.status_code != 200:
+        raise RuntimeError(f"后台任务提交失败：HTTP {response.status_code}")
+
+    try:
+        payload = response.json()
+    except Exception as e:
+        raise RuntimeError(f"后台任务返回了无法解析的响应：{str(e)}")
+
+    if payload.get("status") not in {"accepted", "queued", "processing"}:
+        raise RuntimeError(payload.get("message") or "后台任务未被接受。")
+
+
+def render_pending_job_notice(job_meta: Dict[str, Any], show_title: bool = False):
+    source_name = job_meta.get("source_name") or job_meta.get("report_title") or "未命名论文"
+    if show_title:
+        st.markdown(f"### {source_name}")
+
+    status = (job_meta.get("status") or "").lower()
+    progress_text = job_meta.get("progress_text") or ""
+    if status == "failed":
+        st.error(progress_text or f"《{source_name}》解析失败。")
+        return
+
+    display_text = progress_text or "后台任务正在运行中。"
+    st.info(f"《{source_name}》当前状态：{display_text}")
+    st.caption("该任务已提交到后台 Modal。您现在可以直接关闭页面，稍后重新登录查看状态或结果。")
+
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _load_user_report_record_cached(username: str, report_id: str) -> Optional[Dict[str, Any]]:
+    row = db_fetch_one(
+        """
+        SELECT
+            j.id AS report_id,
+            j.cache_key,
+            j.title AS report_title,
+            j.pdf_name AS source_name,
+            j.created_at AS job_created_at,
+            j.updated_at,
+            r.created_at AS report_created_at,
+            r.report_markdown,
+            r.parsed_markdown,
+            r.text_agent_output,
+            r.vision_output,
+            r.images_manifest
+        FROM public.analysis_jobs j
+        JOIN public.users u ON u.id = j.user_id
+        JOIN public.analysis_reports r ON r.job_id = j.id
+        WHERE LOWER(u.username) = LOWER(%s) AND j.id = %s
+        LIMIT 1
+        """,
+        (username, report_id),
+    )
+    if not row:
+        return None
+
+    meta = build_report_meta_from_row({
+        "report_id": row.get("report_id"),
+        "cache_key": row.get("cache_key"),
+        "source_name": row.get("source_name"),
+        "report_title": row.get("report_title"),
+        "created_at": row.get("job_created_at"),
+        "updated_at": row.get("updated_at") or row.get("report_created_at") or row.get("job_created_at"),
+        "status": "finished",
+        "progress_text": "解析完成",
+        "has_report": True,
+    })
+    analysis_result = {
+        "source_markdown": row.get("parsed_markdown", "") or "",
+        "text_report": row.get("text_agent_output", "") or "",
+        "vision_summaries": row.get("vision_output", "") or "",
+        "images": normalize_json_field(row.get("images_manifest"), {}),
+        "main_report": row.get("report_markdown", "") or "",
+    }
+    return {"meta": meta, "analysis_result": analysis_result}
 
 
 def load_user_report_record(username: str, report_id: str) -> Optional[Dict[str, Any]]:
@@ -2755,53 +3036,30 @@ def load_user_report_record(username: str, report_id: str) -> Optional[Dict[str,
     report_id = (report_id or "").strip()
     if not username or not report_id:
         return None
+    ensure_app_storage()
+    return _load_user_report_record_cached(username, report_id)
 
-    try:
-        ensure_app_storage()
-        row = db_fetch_one(
-            """
-            SELECT
-                j.id AS report_id,
-                j.cache_key,
-                j.title AS report_title,
-                j.pdf_name AS source_name,
-                j.created_at AS job_created_at,
-                j.updated_at,
-                r.created_at AS report_created_at,
-                r.report_markdown,
-                r.parsed_markdown,
-                r.text_agent_output,
-                r.vision_output,
-                r.images_manifest
-            FROM public.analysis_jobs j
-            JOIN public.users u ON u.id = j.user_id
-            JOIN public.analysis_reports r ON r.job_id = j.id
-            WHERE LOWER(u.username) = LOWER(%s) AND j.id = %s
-            LIMIT 1
-            """,
-            (username, report_id),
-        )
-        if not row:
-            return None
 
-        meta = build_report_meta_from_row({
-            "report_id": row.get("report_id"),
-            "cache_key": row.get("cache_key"),
-            "source_name": row.get("source_name"),
-            "report_title": row.get("report_title"),
-            "created_at": row.get("job_created_at"),
-            "updated_at": row.get("updated_at") or row.get("report_created_at") or row.get("job_created_at"),
-        })
-        analysis_result = {
-            "source_markdown": row.get("parsed_markdown", "") or "",
-            "text_report": row.get("text_agent_output", "") or "",
-            "vision_summaries": row.get("vision_output", "") or "",
-            "images": normalize_json_field(row.get("images_manifest"), {}),
-            "main_report": row.get("report_markdown", "") or "",
-        }
-        return {"meta": meta, "analysis_result": analysis_result}
-    except Exception:
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _get_user_cached_report_cached(username: str, cache_key: str) -> Optional[Dict[str, Any]]:
+    row = db_fetch_one(
+        """
+        SELECT j.id AS report_id
+        FROM public.analysis_jobs j
+        JOIN public.users u ON u.id = j.user_id
+        JOIN public.analysis_reports r ON r.job_id = j.id
+        WHERE LOWER(u.username) = LOWER(%s) AND j.cache_key = %s
+        ORDER BY COALESCE(j.updated_at, r.created_at, j.created_at) DESC
+        LIMIT 1
+        """,
+        (username, cache_key),
+    )
+    if not row:
         return None
+    payload = _load_user_report_record_cached(username, row.get("report_id", ""))
+    if payload and isinstance(payload.get("analysis_result"), dict):
+        return payload["analysis_result"]
+    return None
 
 
 def get_user_cached_report(username: str, cache_key: str) -> Optional[Dict[str, Any]]:
@@ -2809,29 +3067,8 @@ def get_user_cached_report(username: str, cache_key: str) -> Optional[Dict[str, 
     cache_key = (cache_key or "").strip()
     if not username or not cache_key:
         return None
-
-    try:
-        ensure_app_storage()
-        row = db_fetch_one(
-            """
-            SELECT j.id AS report_id
-            FROM public.analysis_jobs j
-            JOIN public.users u ON u.id = j.user_id
-            JOIN public.analysis_reports r ON r.job_id = j.id
-            WHERE LOWER(u.username) = LOWER(%s) AND j.cache_key = %s
-            ORDER BY COALESCE(j.updated_at, r.created_at, j.created_at) DESC
-            LIMIT 1
-            """,
-            (username, cache_key),
-        )
-        if not row:
-            return None
-        payload = load_user_report_record(username, row.get("report_id", ""))
-        if payload and isinstance(payload.get("analysis_result"), dict):
-            return payload["analysis_result"]
-        return None
-    except Exception:
-        return None
+    ensure_app_storage()
+    return _get_user_cached_report_cached(username, cache_key)
 
 
 def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
@@ -2841,13 +3078,20 @@ def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
     return value[: max_len - 1] + "…"
 
 
+
 def format_report_history_label(meta: Dict[str, Any]) -> str:
     if not meta:
         return "当前工作区"
     display_name = meta.get("source_name") or meta.get("report_title") or "未命名论文"
-    timestamp = (meta.get("updated_at") or meta.get("created_at") or "")[:16]
     short_name = shorten_sidebar_label(display_name, max_len=18)
+    status = (meta.get("status") or "").lower()
+    if status in {"queued", "processing"}:
+        return f"{short_name}｜正在解析中"
+    if status == "failed":
+        return f"{short_name}｜解析失败"
+    timestamp = (meta.get("updated_at") or meta.get("created_at") or "")[:16]
     return f"{short_name}｜{timestamp}" if timestamp else short_name
+
 
 
 def render_auth_ui():
@@ -2865,7 +3109,7 @@ def render_auth_ui():
                 ok, result = authenticate_user(login_username, login_password)
                 if ok:
                     st.session_state.current_user = result
-                    reset_user_workspace_view(result)
+                    focus_latest_user_job(result)
                     st.rerun()
                 else:
                     st.error(result)
@@ -2889,6 +3133,7 @@ def render_auth_ui():
                         st.error(result)
 
     st.stop()
+
 
 
 def render_history_sidebar(username: str):
@@ -2938,7 +3183,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
     3. Vision Agent 输出 FIGURE_CARD
     4. 主报告逐节生成
     """
-    result = analyze_pdf_with_modal(pdf_bytes)
+    result = analyze_pdf_with_modal(pdf_file_bytes=pdf_bytes)
     if not (result and result.get("status") == "success"):
         return None
 
@@ -3014,34 +3259,58 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
 
 
 def get_or_create_analysis_result(pdf_bytes: bytes, source_name: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
-    """读取或创建单篇论文分析结果，优先复用当前账号下的历史记录。"""
+    """读取、提交或轮询单篇论文分析结果。"""
     cache_key = get_pdf_cache_key(pdf_bytes)
     cache_pool = st.session_state.analysis_results
     if cache_key in cache_pool and cache_pool[cache_key] is not None:
         return cache_key, cache_pool[cache_key], "session_cache"
 
-    current_user = st.session_state.get("current_user", "")
-    if current_user:
-        cached_report = get_user_cached_report(current_user, cache_key)
-        if cached_report is not None:
-            cache_pool[cache_key] = cached_report
-            return cache_key, cached_report, "history_cache"
+    current_user = normalize_username(st.session_state.get("current_user", ""))
+    if not current_user:
+        return cache_key, None, "failed"
 
-    analysis_result = build_analysis_result(pdf_bytes)
-    if analysis_result is not None:
-        cache_pool[cache_key] = analysis_result
-        if current_user:
-            save_user_report_record(current_user, source_name, cache_key, analysis_result)
-        return cache_key, analysis_result, "new"
+    cached_report = get_user_cached_report(current_user, cache_key)
+    if cached_report is not None:
+        cache_pool[cache_key] = cached_report
+        return cache_key, cached_report, "history_cache"
 
-    cache_pool.pop(cache_key, None)
-    return cache_key, None, "failed"
+    existing_job = get_user_job_by_cache_key(current_user, cache_key)
+    if existing_job:
+        existing_status = (existing_job.get("status") or "").lower()
+        if existing_status in {"queued", "processing"}:
+            return cache_key, None, "pending"
+        if existing_status == "failed":
+            return cache_key, None, "failed"
+        if existing_status == "finished":
+            return cache_key, None, "processing_finalize"
+
+    try:
+        job_meta, should_submit = create_or_reuse_analysis_job(current_user, source_name, cache_key)
+        if should_submit:
+            submit_analysis_job_to_modal(job_meta["report_id"], source_name, cache_key, pdf_bytes)
+            update_analysis_job_status(job_meta["report_id"], "processing", "后台任务已启动，等待离线解析完成")
+            return cache_key, None, "submitted"
+        status = (job_meta.get("status") or "").lower()
+        if status in {"queued", "processing"}:
+            return cache_key, None, "pending"
+        if status == "finished" and job_meta.get("has_report"):
+            cached_report = get_user_cached_report(current_user, cache_key)
+            if cached_report is not None:
+                cache_pool[cache_key] = cached_report
+                return cache_key, cached_report, "history_cache"
+        return cache_key, None, "pending"
+    except Exception as e:
+        existing_job = get_user_job_by_cache_key(current_user, cache_key)
+        if existing_job:
+            update_analysis_job_status(existing_job["report_id"], "failed", f"后台任务提交失败：{str(e)}")
+        cache_pool.pop(cache_key, None)
+        return cache_key, None, "failed"
 
 
 
 def build_export_filename(source_name: str, suffix: str) -> str:
     base_name = re.sub(r'(?i)\.pdf$', '', (source_name or '').strip())
-    base_name = re.sub(r'[\\/:*?"<>|]+', '_', base_name).strip() or '论文'
+    base_name = re.sub(r'[\/:*?"<>|]+', '_', base_name).strip() or '论文'
     return f"{base_name}{suffix}"
 
 
@@ -3111,14 +3380,31 @@ def render_single_analysis_result(
 
 
 def render_saved_history_report(username: str, report_id: str):
+    job_meta = get_user_job_state(username, report_id)
+    if not job_meta:
+        st.warning("未找到这条历史报告记录，请重新解析论文。")
+        return
+
+    status = (job_meta.get("status") or "").lower()
+    source_name = job_meta.get("source_name") or job_meta.get("report_title") or "历史报告"
+
+    if status in {"queued", "processing"}:
+        render_pending_job_notice(job_meta, show_title=True)
+        st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"job_status_poll_{report_id}")
+        return
+
+    if status == "failed":
+        render_pending_job_notice(job_meta, show_title=True)
+        return
+
     payload = load_user_report_record(username, report_id)
     if not payload:
-        st.warning("未找到这条历史报告记录，请重新解析论文。")
+        st.info(f"《{source_name}》的后台任务已完成，正在同步最终报告，请稍候自动刷新。")
+        st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"job_finalize_poll_{report_id}")
         return
 
     meta = payload.get("meta", {})
     analysis_result = payload.get("analysis_result", {})
-    source_name = meta.get("source_name") or meta.get("report_title") or "历史报告"
     timestamp = meta.get("updated_at") or meta.get("created_at") or "未知时间"
 
     st.info(f"已载入历史报告：{source_name}（保存时间：{timestamp}）。")
@@ -3132,32 +3418,136 @@ def render_saved_history_report(username: str, report_id: str):
 
 
 
+def render_batch_status_overview(batch_rows: List[Dict[str, Any]]):
+    st.markdown("### 批量解析进度")
+    for row in batch_rows:
+        idx = row.get("index")
+        source_name = row.get("source_name") or "未命名论文"
+        status = (row.get("status") or "").lower()
+        progress_text = row.get("progress_text") or ""
+        if status == "finished":
+            icon = "✅"
+            text = progress_text or "解析完成"
+        elif status in {"queued", "processing"}:
+            icon = "⏳"
+            text = progress_text or "正在解析中"
+        else:
+            icon = "❌"
+            text = progress_text or "解析失败"
+        st.markdown(f"**{icon} 第 {idx} 篇《{source_name}》：** {text}")
+
+
+
 def render_analysis_ui(pdf_inputs):
     """
     上传论文后的主工作流：
     - 支持单篇 PDF 分析
     - 支持多篇 PDF 同时上传，并分别生成各自报告
+    - 任务会立即写入 analysis_jobs，并交给新的后台 Modal 继续运行
+    - 多篇 PDF 场景下，全部完成后再统一展示所有报告
     """
     entries = collect_pdf_entries(pdf_inputs)
     if not entries:
         return
 
+    current_user = normalize_username(st.session_state.get("current_user", ""))
     multi_mode = len(entries) > 1
+    should_poll = False
+    batch_rows: List[Dict[str, Any]] = []
+    ready_reports: List[Dict[str, Any]] = []
+
     for idx, (paper_name, pdf_bytes) in enumerate(entries, start=1):
-        if multi_mode:
-            st.markdown(f"## 第 {idx} 篇论文")
         cache_key, analysis_result, result_source = get_or_create_analysis_result(pdf_bytes, paper_name)
-        if result_source == "history_cache":
-            st.info(f"检测到当前账号下已存在《{paper_name}》的历史报告，已直接读取，无需重新解析。")
-        if analysis_result:
-            render_single_analysis_result(
-                analysis_result=analysis_result,
-                cache_key=cache_key,
-                source_name=paper_name,
-                show_paper_title=multi_mode,
-            )
-        if multi_mode and idx < len(entries):
+        job_meta = get_user_job_by_cache_key(current_user, cache_key) if current_user else None
+
+        row = {
+            "index": idx,
+            "source_name": paper_name,
+            "cache_key": cache_key,
+            "status": "processing",
+            "progress_text": "任务正在初始化中，请稍候。",
+        }
+
+        if analysis_result is not None:
+            row.update({"status": "finished", "progress_text": "解析完成"})
+            ready_reports.append({
+                "index": idx,
+                "source_name": paper_name,
+                "cache_key": cache_key,
+                "analysis_result": analysis_result,
+                "result_source": result_source,
+            })
+        else:
+            if job_meta:
+                row.update({
+                    "status": job_meta.get("status") or "processing",
+                    "progress_text": job_meta.get("progress_text") or row["progress_text"],
+                })
+            elif result_source == "failed":
+                row.update({"status": "failed", "progress_text": "后台任务提交或执行失败，请稍后重试。"})
+            elif result_source == "submitted":
+                row.update({"status": "processing", "progress_text": "后台任务已创建，正在等待离线解析。"})
+            elif result_source == "processing_finalize":
+                row.update({"status": "processing", "progress_text": "任务已完成，正在同步最终报告。"})
+
+        if row["status"] in {"queued", "processing"}:
+            should_poll = True
+
+        batch_rows.append(row)
+
+    if multi_mode:
+        render_batch_status_overview(batch_rows)
+        pending_exists = any((row.get("status") or "").lower() in {"queued", "processing"} for row in batch_rows)
+        if pending_exists:
+            finished_count = sum(1 for row in batch_rows if (row.get("status") or "").lower() == "finished")
+            if finished_count:
+                st.info("已有部分论文解析完成。为避免界面混乱，系统会在全部任务完成后统一展示所有 PDF 的解析报告。")
+            if should_poll:
+                st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key="pending_analysis_refresh")
+                st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会自动刷新状态。")
+        else:
             st.divider()
+            st.markdown("### 全部 PDF 解析结果")
+            rendered_sections = 0
+            total_sections = len(ready_reports) + sum(1 for row in batch_rows if (row.get("status") or "").lower() == "failed")
+            for report_item in ready_reports:
+                rendered_sections += 1
+                st.markdown(f"## 第 {report_item['index']} 篇论文")
+                if report_item["result_source"] == "history_cache":
+                    st.info(f"检测到当前账号下已存在《{report_item['source_name']}》的历史报告，已直接读取，无需重新解析。")
+                render_single_analysis_result(
+                    analysis_result=report_item["analysis_result"],
+                    cache_key=report_item["cache_key"],
+                    source_name=report_item["source_name"],
+                    show_paper_title=False,
+                )
+                if rendered_sections < total_sections:
+                    st.divider()
+            for row in batch_rows:
+                if (row.get("status") or "").lower() != "failed":
+                    continue
+                rendered_sections += 1
+                st.markdown(f"## 第 {row['index']} 篇论文")
+                st.error(f"《{row['source_name']}》解析失败：{row.get('progress_text') or '未知错误'}")
+                if rendered_sections < total_sections:
+                    st.divider()
+    else:
+        report_item = ready_reports[0] if ready_reports else None
+        row = batch_rows[0]
+        if report_item:
+            if report_item["result_source"] == "history_cache":
+                st.info(f"检测到当前账号下已存在《{report_item['source_name']}》的历史报告，已直接读取，无需重新解析。")
+            render_single_analysis_result(
+                analysis_result=report_item["analysis_result"],
+                cache_key=report_item["cache_key"],
+                source_name=report_item["source_name"],
+                show_paper_title=False,
+            )
+        else:
+            render_pending_job_notice(row, show_title=False)
+            if should_poll:
+                st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key="pending_analysis_refresh")
+                st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会自动刷新状态。")
 
     st.divider()
     if st.button("开始全新探索", type="primary", key="start_fresh_workspace_after_analysis"):
