@@ -65,10 +65,9 @@ CORE_SECTION_SPECS = [
     "## 3. 方法总览与整体数据流",
     "## 4. 关键模块逐层机制剖析",
     "## 5. 实验设计、关键证据与论点验证",
-    "## 6. 复现要点与方法适用边界",
-    "## 7. 局限性与未解决问题",
+    "## 6. 局限性与未解决问题",
 ]
-RESEARCH_SECTION_SPEC = "## 8. 面向后续研究的可执行创新路线"
+RESEARCH_SECTION_SPEC = "## 7. 面向后续研究的可执行创新路线"
 
 # PDF 页面与版式参数
 PDF_LAYOUT = {
@@ -212,10 +211,7 @@ MAIN_AGENT_PROMPT = """
 ## 5. 实验设计、关键证据与论点验证
 交代数据集、评价指标、对照组、主实验、消融实验。每写一个结论，都要明确指出它由哪一组结果支持，并解释这项结果验证了哪条方法主张。关键图表在对应段落后插入。
 
-## 6. 复现要点与方法适用边界
-用多个自然段归纳读者若要复现本文，最不能忽视的输入条件、训练设置、模块依赖和评测前提。同时说明该方法适用于什么情形、不适用于什么情形。
-
-## 7. 局限性与未解决问题
+## 6. 局限性与未解决问题
 区分“作者明确承认的局限”和“从实验设计中可以直接看出的未解决问题”，但后者也必须基于论文证据，而不是外部常识。
 """
 
@@ -225,7 +221,7 @@ RESEARCH_AGENT_PROMPT = """
 1. 原始论文 markdown
 2. FACT_BANK 与文本综述
 3. FIGURE_CARD
-4. 已生成的第1-7节主报告
+4. 已生成的第1-6节主报告
 
 硬性规则：
 1. 禁止把研究设想写成原文事实。
@@ -234,7 +230,7 @@ RESEARCH_AGENT_PROMPT = """
 4. 语言要学术、克制、可执行。
 
 请只输出：
-## 8. 面向后续研究的可执行创新路线
+## 7. 面向后续研究的可执行创新路线
 并先用一段简短声明说明：以下内容属于基于本文机制的研究设想，不是原文结论。
 """
 
@@ -631,8 +627,8 @@ def generate_section(main_agent: LLMClient, base_context: str, section_spec: str
 def generate_full_report(md_content: str, text_report: str, vision_summaries: str, image_ids: List[str]) -> str:
     """
     生成完整报告：
-    1) 第 1-7 节逐节生成
-    2) 第 8 节单独生成
+    1) 第 1-6 节逐节生成
+    2) 第 7 节单独生成
     3) 若缺节，则按缺失章节补生成
     4) 经过审校后再做修订
     """
@@ -666,16 +662,16 @@ def generate_full_report(md_content: str, text_report: str, vision_summaries: st
     research_prompt = f"""
 {base_context}
 
-【已生成的第1-7节主报告】
+【已生成的第1-6节主报告】
 {chr(10).join(sections)}
 
 请只输出：
 {RESEARCH_SECTION_SPEC}
 """
-    section8 = research_agent.generate([research_prompt]).strip()
-    if RESEARCH_SECTION_SPEC not in section8:
-        section8 = RESEARCH_SECTION_SPEC + "\n" + section8
-    sections.append(section8)
+    section7 = research_agent.generate([research_prompt]).strip()
+    if RESEARCH_SECTION_SPEC not in section7:
+        section7 = RESEARCH_SECTION_SPEC + "\n" + section7
+    sections.append(section7)
 
     report = normalize_report_markdown("\n\n".join(sections))
 
@@ -729,7 +725,7 @@ def generate_full_report(md_content: str, text_report: str, vision_summaries: st
 {audit}
 
 请在不丢失已有有效内容的前提下修订整篇报告。
-必须保留完整 8 个章节标题。
+必须保留完整 7个章节标题。
 只输出修订后的完整 Markdown 报告。
 """
         report = normalize_report_markdown(main_agent.generate([revise_prompt]))
