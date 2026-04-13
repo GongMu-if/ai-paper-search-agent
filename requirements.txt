@@ -6,3 +6,4 @@ beautifulsoup4
 Pillow
 reportlab
 streamlit-autorefresh
+psycopg2-binary
