@@ -1098,36 +1098,97 @@ def formula_has_strong_signal(text: str) -> bool:
 
 
 def normalize_formula_script_groups(expr: str) -> str:
-    """修复 L_{augmented_i}、z_{drug}_{specific} 这类会导致 KaTeX/MathText 报错的下标。"""
+    r"""修复 L_aug_i、L_{aug}_i、L_{\mathrm{aug}_i} 这类会导致 KaTeX/MathText 报错的下标。"""
     value = expr or ''
 
-    # 先把连续下标/上标合并，避免 z_{drug}_{specific} 触发 Double subscript。
+    script_body_pattern = r'(?:[^{}]|\\[A-Za-z]+\{[^{}]*\})+'
+
+    def _strip_outer_script_braces(script: str) -> str:
+        script = (script or '').strip()
+        if script.startswith('{') and script.endswith('}'):
+            return script[1:-1].strip()
+        return script
+
+    def _merge_script_parts(op: str, left: str, right: str) -> str:
+        left = _strip_outer_script_braces(left)
+        right = _strip_outer_script_braces(right)
+        return f'{op}{{{left},{right}}}'
+
+    # 合并连续的下标/上标，覆盖 z_{drug}_{specific}、L_{aug}_i、L_i_{aug}。
     previous = None
     while previous != value:
         previous = value
         value = re.sub(
-            r'([_^])\{([^{}]+)\}\s*\1\{([^{}]+)\}',
-            lambda m: f"{m.group(1)}{{{m.group(2).strip()},{m.group(3).strip()}}}",
+            rf'([_^])\{{({script_body_pattern})\}}\s*\1\{{({script_body_pattern})\}}',
+            lambda m: _merge_script_parts(m.group(1), m.group(2), m.group(3)),
+            value,
+        )
+        value = re.sub(
+            rf'([_^])\{{({script_body_pattern})\}}\s*\1([A-Za-z0-9Α-Ωα-ω]+|\\[A-Za-z]+)',
+            lambda m: _merge_script_parts(m.group(1), m.group(2), m.group(3)),
+            value,
+        )
+        value = re.sub(
+            rf'([_^])([A-Za-z0-9Α-Ωα-ω]+|\\[A-Za-z]+)\s*\1\{{({script_body_pattern})\}}',
+            lambda m: _merge_script_parts(m.group(1), m.group(2), m.group(3)),
             value,
         )
 
+    def _flatten_mathrm_scripts(text: str) -> str:
+        previous_inner = None
+        current = text
+        while previous_inner != current:
+            previous_inner = current
+            current = re.sub(
+                r'\\mathrm\{([^{}]*)\}\s*_\s*\{([^{}]+)\}',
+                lambda m: r'\mathrm{' + m.group(1).replace(r'\_', ',') + ',' + m.group(2).strip() + '}',
+                current,
+            )
+            current = re.sub(
+                r'\\mathrm\{([^{}]*)\}\s*_\s*([A-Za-z0-9Α-Ωα-ω]+)',
+                lambda m: r'\mathrm{' + m.group(1).replace(r'\_', ',') + ',' + m.group(2).strip() + '}',
+                current,
+            )
+            current = re.sub(
+                r'\\mathrm\{([^{}]*?)_([A-Za-z0-9Α-Ωα-ω]+)\}',
+                lambda m: r'\mathrm{' + m.group(1).replace(r'\_', ',') + ',' + m.group(2).strip() + '}',
+                current,
+            )
+        return current
+
+    value = _flatten_mathrm_scripts(value)
+
     def _normalize_script(match):
         op = match.group(1)
-        body = (match.group(2) or '').strip()
+        body = _flatten_mathrm_scripts((match.group(2) or '').strip())
         if not body:
             return match.group(0)
-        if body.startswith('\\') or re.search(r'[+\-*/=<>]', body):
+        if re.fullmatch(r'\\mathrm\{[^{}]*\}', body):
+            return f'{op}{{{body}}}'
+        if body.startswith('\\') and not re.fullmatch(r'\\[A-Za-z]+', body):
+            return f'{op}{{{body}}}'
+        if re.search(r'[+\-*/=<>]', body):
             return f'{op}{{{body}}}'
         if re.search(r'[A-Za-z]{2,}|_', body):
             safe = body.replace('\\', r'\backslash ')
-            safe = safe.replace('_', r'\_')
+            safe = safe.replace('_', ',')
             safe = re.sub(r'\s+', r'\\ ', safe)
             return f'{op}{{\\mathrm{{{safe}}}}}'
         return f'{op}{{{body}}}'
 
-    value = re.sub(r'([_^])\{([^{}]+)\}', _normalize_script, value)
-    return value
+    value = re.sub(rf'([_^])\{{({script_body_pattern})\}}', _normalize_script, value)
+    value = _flatten_mathrm_scripts(value)
 
+    # 最后兜底：把 L_{\mathrm{aug}}_i 合并成 L_{\mathrm{aug,i}}，避免 Double subscript。
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(
+            r'([A-Za-zΑ-Ωα-ω])_\{\\mathrm\{([^{}]+)\}\}\s*_\s*\{?([A-Za-z0-9Α-Ωα-ω]+)\}?',
+            lambda m: f'{m.group(1)}_{{\\mathrm{{{m.group(2)},{m.group(3)}}}}}',
+            value,
+        )
+    return value
 
 def explode_inline_numbered_segments(text: str) -> List[str]:
     value = (text or '').strip()
@@ -1285,6 +1346,8 @@ def sanitize_formula_for_render(text: str) -> str:
     expr = re.sub(r'_(?!\{)\s*([A-Za-z0-9]{2,})', r'_{\1}', expr)
     expr = re.sub(r'\^(?!\{)\s*([A-Za-z0-9]{2,})', r'^{\1}', expr)
     expr = normalize_formula_script_groups(expr)
+    expr = re.sub(r'\\Sigma(?=\s*[({])', r'\\sum', expr)
+    expr = expr.replace('...', r'\ldots')
     expr = re.sub(r'\s*\*\s*', lambda m: r' \cdot ', expr)
     expr = re.sub(r'\s+', ' ', expr).strip()
     return expr
