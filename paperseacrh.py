@@ -856,7 +856,15 @@ ORDERED_LIST_LINE_RE = re.compile(
 INLINE_BULLET_SPLIT_RE = re.compile(
     r'\s+\*\s+(?=(?:对应缺口/模块|改造方案|预期收益|验证方式|技术风险|对应缺口|技术风险)[:：])'
 )
-PAREN_FORMULA_CANDIDATE_RE = re.compile(r'[（(][^（）()\n]{1,80}[）)]')
+PAREN_FORMULA_CANDIDATE_RE = re.compile(r'[（(][^（）()\n]{1,140}[）)]')
+SCRIPTED_FORMULA_TOKEN_RE = re.compile(
+    rf'(?:\\[A-Za-z]+|[A-Za-z][A-Za-z0-9]*|[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+)'
+    rf'(?:\{{[^\{{}}\n]{{1,48}}\}})?'
+    rf'(?:[_^](?:{FORMULA_BRACE_EXPR}|\\[A-Za-z]+|[A-Za-z0-9Α-Ωα-ω]+))+'
+)
+FORMULA_COMMAND_TOKEN_RE = re.compile(
+    rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*(?:{FORMULA_SUBSUP_PATTERN})*'
+)
 
 LIST_ENUMERATOR_ONLY_RE = re.compile(r'^[（(]?[0-9]+[）).、]?$')
 IMPLICIT_SUBSCRIPT_BASE_RE = re.compile(
@@ -1077,11 +1085,24 @@ def looks_like_formula_text(text: str) -> bool:
         return False
 
     normalized = collapse_spaced_math_braces(normalize_formula_spacing(candidate))
-    if AUTO_FORMULA_RUN_RE.fullmatch(normalized) or SPECIAL_FORMULA_RUN_RE.fullmatch(normalized):
+    normalized = normalize_math_unicode_to_latex(normalized)
+    normalized = repair_implicit_subscripts(normalized)
+
+    if (
+        AUTO_FORMULA_RUN_RE.fullmatch(normalized)
+        or SPECIAL_FORMULA_RUN_RE.fullmatch(normalized)
+        or SCRIPTED_FORMULA_TOKEN_RE.fullmatch(normalized)
+    ):
+        return True
+
+    if FORMULA_COMMAND_TOKEN_RE.fullmatch(normalized):
         return True
 
     repaired = repair_broken_formula_glyphs(normalized)
     if repaired != normalized and (AUTO_FORMULA_RUN_RE.search(repaired) or '_' in repaired or '^' in repaired):
+        return True
+
+    if SCRIPTED_FORMULA_TOKEN_RE.search(normalized) or FORMULA_COMMAND_TOKEN_RE.search(normalized):
         return True
 
     explicit_tokens = [
@@ -1100,9 +1121,15 @@ def looks_like_formula_text(text: str) -> bool:
     if any(ch in normalized for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
         return True
 
-    operator_count = sum(ch in normalized for ch in "=<>^_+-*/\\")
     has_letter = bool(re.search(r'[A-Za-zΑ-Ωα-ω]', normalized))
-    return has_letter and operator_count >= 1
+    operator_count = sum(ch in normalized for ch in "=<>^_+-*/\\")
+    brace_count = normalized.count('{') + normalized.count('}')
+
+    if has_letter and ('_' in normalized or '^' in normalized):
+        return True
+    if has_letter and brace_count >= 2 and operator_count >= 1:
+        return True
+    return has_letter and operator_count >= 2
 
 def extract_formula_text(text: str) -> str:
     candidate = (text or '').strip()
@@ -1259,6 +1286,11 @@ def should_auto_render_formula(candidate: str) -> bool:
         return False
     if is_list_enumerator_text(stripped):
         return False
+
+    normalized = collapse_spaced_math_braces(normalize_formula_spacing(stripped))
+    if SCRIPTED_FORMULA_TOKEN_RE.search(normalized) or FORMULA_COMMAND_TOKEN_RE.search(normalized):
+        return True
+
     if '�' in stripped or any(ch in stripped for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
         return True
     if re.fullmatch(r'[A-Z]{2,}(?:-[A-Z]{2,})*', stripped):
@@ -1267,6 +1299,29 @@ def should_auto_render_formula(candidate: str) -> bool:
         return False
     return looks_like_formula_text(stripped)
 
+def find_parenthetical_formula_match(working: str, start_pos: int):
+    match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
+    while match:
+        candidate = match.group(0).strip()
+        inner = candidate[1:-1].strip()
+        if should_auto_render_formula(inner):
+            return match
+        match = PAREN_FORMULA_CANDIDATE_RE.search(working, match.start() + 1)
+    return None
+
+
+def collect_formula_candidate_matches(working: str, cursor: int):
+    candidate_matches = []
+    for pattern in (SCRIPTED_FORMULA_TOKEN_RE, AUTO_FORMULA_RUN_RE, SPECIAL_FORMULA_RUN_RE):
+        match = pattern.search(working, cursor)
+        if match:
+            candidate_matches.append(match)
+
+    paren_match = find_parenthetical_formula_match(working, cursor)
+    if paren_match:
+        candidate_matches.append(paren_match)
+    return candidate_matches
+    
 def wrap_plain_text_for_paragraph(
     text: str,
     asset_ctx: Optional[Dict[str, Any]] = None,
@@ -1282,32 +1337,8 @@ def wrap_plain_text_for_paragraph(
     parts: List[str] = []
     cursor = 0
 
-    def find_parenthetical_formula(start_pos: int):
-        match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
-        if not match:
-            return None
-        candidate = match.group(0).strip()
-        inner = candidate[1:-1].strip()
-        if looks_like_formula_text(inner) or '�' in inner or any(
-            ch in inner for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS
-        ):
-            return match
-        return None
-
     while cursor < len(working):
-        candidate_matches = []
-        auto_match = AUTO_FORMULA_RUN_RE.search(working, cursor)
-        if auto_match:
-            candidate_matches.append(auto_match)
-
-        special_match = SPECIAL_FORMULA_RUN_RE.search(working, cursor)
-        if special_match:
-            candidate_matches.append(special_match)
-
-        paren_match = find_parenthetical_formula(cursor)
-        if paren_match:
-            candidate_matches.append(paren_match)
-
+        candidate_matches = collect_formula_candidate_matches(working, cursor)
         if not candidate_matches:
             parts.append(wrap_plain_text_basic(working[cursor:], bold=bold))
             break
@@ -1335,7 +1366,6 @@ def wrap_plain_text_for_paragraph(
         cursor = end
 
     return ''.join(parts)
-
 
 
 def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: float = 12.0) -> str:
@@ -1383,7 +1413,7 @@ def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, b
             parts.append(inline_math_markup(token[2:-2], asset_ctx))
         elif token.startswith('`') and token.endswith('`'):
             inner = token[1:-1]
-            if looks_like_formula_text(inner):
+            if should_auto_render_formula(inner):
                 parts.append(inline_math_markup(inner, asset_ctx))
             else:
                 code_font = 'Courier-Bold' if bold else 'Courier'
@@ -1416,32 +1446,8 @@ def wrap_plain_text_for_markdown(text: str) -> str:
     parts: List[str] = []
     cursor = 0
 
-    def find_parenthetical_formula(start_pos: int):
-        match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
-        if not match:
-            return None
-        candidate = match.group(0).strip()
-        inner = candidate[1:-1].strip()
-        if looks_like_formula_text(inner) or '�' in inner or any(
-            ch in inner for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS
-        ):
-            return match
-        return None
-
     while cursor < len(working):
-        candidate_matches = []
-        auto_match = AUTO_FORMULA_RUN_RE.search(working, cursor)
-        if auto_match:
-            candidate_matches.append(auto_match)
-
-        special_match = SPECIAL_FORMULA_RUN_RE.search(working, cursor)
-        if special_match:
-            candidate_matches.append(special_match)
-
-        paren_match = find_parenthetical_formula(cursor)
-        if paren_match:
-            candidate_matches.append(paren_match)
-
+        candidate_matches = collect_formula_candidate_matches(working, cursor)
         if not candidate_matches:
             parts.append(working[cursor:])
             break
@@ -1495,7 +1501,7 @@ def convert_inline_formula_markup_to_markdown(text: str) -> str:
             parts.append(formula_inline_markdown(token[2:-2], display=True))
         elif token.startswith('`') and token.endswith('`'):
             inner = token[1:-1]
-            if looks_like_formula_text(inner):
+            if should_auto_render_formula(inner):
                 parts.append(formula_inline_markdown(inner, display=False))
             else:
                 parts.append(token)
