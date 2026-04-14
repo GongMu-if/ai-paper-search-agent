@@ -208,7 +208,7 @@ MAIN_AGENT_PROMPT = """
 结合原始文本和图表证据，说明系统从输入到输出的完整链路。若有总架构图，应在这里插入。
 
 ## 4. 关键模块逐层机制剖析
-按照模型真实工作顺序拆解每个关键模块。每个模块都要说明：输入是什么、变换是什么、它为何必要、它与其他模块如何耦合、它预期改善了什么问题。若有模块结构图，应在对应段落处插入。
+按照模型真实工作顺序拆解每个关键模块。每个模块都要说明：输入是什么、变换是什么、它为何必要、它与其他模块如何耦合、它预期改善了什么问题。若有模块结构图，应在对应段落处插入。不要描述实验内容，实验内容应该是在第五章才说的，这章只说模块机制就行了。
 
 ## 5. 实验设计、关键证据与论点验证
 交代数据集、评价指标、对照组、主实验、消融实验。每写一个结论，都要明确指出它由哪一组结果支持，并解释这项结果验证了哪条方法主张。关键图表在对应段落后插入。
@@ -406,6 +406,114 @@ def build_source_pack(md_content: str, max_chars: int = 50000) -> str:
     return "\n\n".join(kept) if kept else md_content[:max_chars]
 
 
+def translate_fullwidth_digits(text: str) -> str:
+    return (text or '').translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+
+
+ROMAN_NUMERAL_RE = re.compile(r'^[IVXLCDM]+$', flags=re.I)
+CHINESE_NUMERAL_CHARS = '零〇一二三四五六七八九十百千万两'
+
+
+def int_to_roman(num: int) -> str:
+    if num <= 0 or num > 3999:
+        return ''
+    values = [
+        (1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'),
+        (100, 'C'), (90, 'XC'), (50, 'L'), (40, 'XL'),
+        (10, 'X'), (9, 'IX'), (5, 'V'), (4, 'IV'), (1, 'I'),
+    ]
+    result = []
+    rest = num
+    for value, symbol in values:
+        while rest >= value:
+            result.append(symbol)
+            rest -= value
+    return ''.join(result)
+
+
+def roman_to_int(value: str) -> Optional[int]:
+    token = (value or '').strip().upper()
+    if not token or not ROMAN_NUMERAL_RE.fullmatch(token):
+        return None
+    roman_map = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+    total = 0
+    previous = 0
+    for ch in reversed(token):
+        current = roman_map.get(ch, 0)
+        if current < previous:
+            total -= current
+        else:
+            total += current
+            previous = current
+    return total if int_to_roman(total) == token else None
+
+
+def chinese_to_int(value: str) -> Optional[int]:
+    token = (value or '').strip().replace('两', '二').replace('〇', '零')
+    if not token or any(ch not in CHINESE_NUMERAL_CHARS for ch in token):
+        return None
+    digit_map = {'零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+    if token in digit_map:
+        return digit_map[token]
+    total = 0
+    section = 0
+    number = 0
+    unit_map = {'十': 10, '百': 100, '千': 1000, '万': 10000}
+    for ch in token:
+        if ch in digit_map:
+            number = digit_map[ch]
+        elif ch in unit_map:
+            unit = unit_map[ch]
+            if unit == 10000:
+                section = (section + number) or 1
+                total += section * unit
+                section = 0
+            else:
+                section += (number or 1) * unit
+            number = 0
+    return total + section + number
+
+
+def int_to_chinese(num: int) -> str:
+    if num < 0 or num > 99:
+        return ''
+    digits = '零一二三四五六七八九'
+    if num < 10:
+        return digits[num]
+    tens, ones = divmod(num, 10)
+    if num < 20:
+        return '十' + (digits[ones] if ones else '')
+    return digits[tens] + '十' + (digits[ones] if ones else '')
+
+
+def normalize_report_number_token(number: str) -> str:
+    return re.sub(r'\s+', '', translate_fullwidth_digits(str(number or '').strip()))
+
+
+def report_number_variants(number: str) -> List[str]:
+    raw = normalize_report_number_token(number)
+    if not raw:
+        return []
+    variants = {raw, raw.upper()}
+    numeric_value: Optional[int] = None
+    if raw.isdigit():
+        numeric_value = int(raw)
+    elif ROMAN_NUMERAL_RE.fullmatch(raw):
+        numeric_value = roman_to_int(raw)
+    elif all(ch in CHINESE_NUMERAL_CHARS for ch in raw):
+        numeric_value = chinese_to_int(raw)
+
+    if numeric_value is not None and numeric_value > 0:
+        variants.add(str(numeric_value))
+        roman = int_to_roman(numeric_value)
+        if roman:
+            variants.add(roman)
+        chinese = int_to_chinese(numeric_value)
+        if chinese:
+            variants.add(chinese)
+    return sorted({x for x in variants if x}, key=lambda x: (len(x), x))
+
+
 def find_image_line_index_and_caption(md_content: str, image_id: str) -> Tuple[Optional[int], str, List[str]]:
     lines = md_content.splitlines()
     target_key = normalize_report_image_key(image_id)
@@ -457,6 +565,26 @@ def extract_caption_label_for_image(md_content: str, image_id: str) -> Optional[
     return None
 
 
+def build_report_reference_patterns(kind: str, number: str) -> List[re.Pattern]:
+    variants = report_number_variants(number)
+    if not variants:
+        return []
+    patterns: List[re.Pattern] = []
+    if kind == '表':
+        english_names = [r'Table', r'Tab\.?']
+        chinese_name = '表'
+    else:
+        english_names = [r'Figure', r'Fig\.?']
+        chinese_name = '图'
+    english_alt = '|'.join(english_names)
+
+    for variant in variants:
+        escaped = re.escape(variant)
+        patterns.append(re.compile(rf'(?<![A-Za-z0-9])(?:{english_alt})\.?\s*{escaped}(?![A-Za-z0-9])', flags=re.I))
+        patterns.append(re.compile(rf'{chinese_name}\s*{escaped}'))
+    return patterns
+
+
 def extract_nearest_heading_before_position(md_content: str, position: int) -> str:
     prefix = md_content[:max(0, position)]
     headings = re.findall(r'^(#{1,6}\s+.+)$', prefix, flags=re.MULTILINE)
@@ -475,10 +603,9 @@ def find_body_reference_position(md_content: str, image_id: str, kind: str, numb
             line_text = lines[line_idx].strip() if 0 <= line_idx < len(lines) else ''
             if image_line_idx == line_idx:
                 continue
-            if abs(line_idx - image_line_idx) <= 2 and (
-                is_standalone_figure_table_caption_line(line_text)
-                or normalize_report_image_key(image_id) in normalize_report_image_key(line_text)
-            ):
+            if is_standalone_figure_table_caption_line(line_text):
+                continue
+            if normalize_report_image_key(image_id) in normalize_report_image_key(line_text):
                 continue
             if best_position is None or match.start() < best_position:
                 best_position = match.start()
@@ -486,6 +613,7 @@ def find_body_reference_position(md_content: str, image_id: str, kind: str, numb
 
 
 def extract_local_context(md_content: str, image_id: str, window: int = 1800) -> str:
+    """按 caption 识别图表编号，再以正文引用位置为中心提取上下文。"""
     label_info = extract_caption_label_for_image(md_content, image_id)
     if not label_info:
         return ''
@@ -518,7 +646,6 @@ def collect_cited_images_by_reference(md_content: str, ordered_images: List[Tupl
     return kept, context_map
 
 
-
 def sort_images_by_doc_order(md_content: str, images_dict: Dict[str, str]) -> List[Tuple[str, str]]:
     """按图片在 markdown 中出现的先后顺序排序。"""
     def sort_key(item):
@@ -538,6 +665,27 @@ def normalize_report_markdown(md_text: str) -> str:
     text = re.sub(r'^\s*0\s*$', '', text, flags=re.M)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def get_adaptive_web_image_width(image_bytes: bytes) -> Optional[int]:
+    """网页报告图片按原始像素自适应显示：小图不放大，大图按类型设上限。"""
+    try:
+        reader = ImageReader(BytesIO(image_bytes))
+        iw, ih = reader.getSize()
+    except Exception:
+        return None
+
+    if iw <= 0 or ih <= 0:
+        return None
+
+    ratio = iw / max(ih, 1)
+    if iw <= 520:
+        return int(iw)
+    if ratio > 1.8:
+        return int(min(iw, 960))
+    if ratio < 0.72:
+        return int(min(iw, 560))
+    return int(min(iw, 760))
 
 
 def render_report_with_images(report_md: str, images_dict: Dict[str, str]):
@@ -564,7 +712,12 @@ def render_report_with_images(report_md: str, images_dict: Dict[str, str]):
         matched = False
         for name, b64 in images_dict.items():
             if img_key == name or img_key in name or name in img_key:
-                st.image(base64.b64decode(b64), caption=caption, use_container_width=True)
+                image_bytes = base64.b64decode(b64)
+                display_width = get_adaptive_web_image_width(image_bytes)
+                if display_width:
+                    st.image(image_bytes, caption=caption, width=display_width)
+                else:
+                    st.image(image_bytes, caption=caption, use_container_width=True)
                 matched = True
                 break
 
@@ -2310,195 +2463,28 @@ def deduplicate_report_image_blocks(blocks: List[Tuple[str, object]]) -> List[Tu
 
 
 
-REPORT_FULLWIDTH_DIGIT_TRANS = str.maketrans("０１２３４５６７８９", "0123456789")
-REPORT_ASCII_TO_FULLWIDTH_DIGIT_TRANS = str.maketrans("0123456789", "０１２３４５６７８９")
-REPORT_ARABIC_NUMBER_RE = r'[0-9０-９]+'
-REPORT_ROMAN_NUMBER_RE = r'[IVXLCDM]+'
-REPORT_CHINESE_NUMBER_RE = r'[零〇一二三四五六七八九十百千万兩两]+'
-REPORT_NUMBER_TOKEN_RE = rf'(?:{REPORT_ARABIC_NUMBER_RE}|{REPORT_ROMAN_NUMBER_RE}|{REPORT_CHINESE_NUMBER_RE})'
 REPORT_IMAGE_LINE_RE = re.compile(r'^!\[(?P<caption>.*?)\]\((?P<key>.*?)\)\s*$')
-REPORT_FIG_TABLE_LABEL_RE = re.compile(rf'(图|表)\s*({REPORT_NUMBER_TOKEN_RE})', flags=re.I)
-REPORT_EN_LABEL_RE = re.compile(rf'\b(Figure|Fig\.?|Table|Tab\.?)\s*\.?\s*({REPORT_NUMBER_TOKEN_RE})\b', flags=re.I)
+REPORT_FIG_TABLE_LABEL_RE = re.compile(r'(图|表)\s*([0-9一二三四五六七八九十百千万]+)')
+REPORT_EN_LABEL_RE = re.compile(r'\b(Figure|Fig\.?|Table)\s*([0-9]+)\b', flags=re.I)
 REPORT_IMAGE_ID_LIKE_RE = re.compile(
     r'(?:image[_\-]?[0-9a-f]{6,}|fig(?:ure)?[_\-]?\d+|table[_\-]?\d+|[0-9a-f]{16,}|[\w\-.]+\.(?:png|jpg|jpeg|webp))',
     flags=re.I,
 )
 
 
-def normalize_report_number_token(number: str) -> str:
-    value = re.sub(r'\s+', '', str(number or '').strip())
-    value = value.translate(REPORT_FULLWIDTH_DIGIT_TRANS)
-    value = value.replace('兩', '二').replace('两', '二')
-    if re.fullmatch(r'[0-9]+', value):
-        return str(int(value))
-    if re.fullmatch(r'[ivxlcdm]+', value, flags=re.I):
-        return value.upper()
-    return value
-
-
 def normalize_report_label(kind: str, number: str) -> str:
-    clean_kind = (kind or '图').strip()
-    clean_number = normalize_report_number_token(number)
-    return f"{clean_kind}{clean_number}"
-
-
-def roman_to_int(text: str) -> Optional[int]:
-    value = normalize_report_number_token(text)
-    if not re.fullmatch(r'[IVXLCDM]+', value, flags=re.I):
-        return None
-    roman_map = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
-    total = 0
-    prev = 0
-    for ch in reversed(value.upper()):
-        cur = roman_map[ch]
-        if cur < prev:
-            total -= cur
-        else:
-            total += cur
-            prev = cur
-    return total or None
-
-
-def chinese_to_int(text: str) -> Optional[int]:
-    value = normalize_report_number_token(text)
-    if not re.fullmatch(REPORT_CHINESE_NUMBER_RE, value):
-        return None
-    digit_map = {'零': 0, '〇': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
-    unit_map = {'十': 10, '百': 100, '千': 1000, '万': 10000}
-    if value in digit_map:
-        return digit_map[value]
-    total = 0
-    section = 0
-    number = 0
-    for ch in value:
-        if ch in digit_map:
-            number = digit_map[ch]
-        elif ch in unit_map:
-            unit = unit_map[ch]
-            if unit == 10000:
-                section = (section + (number or 0)) * unit
-                total += section
-                section = 0
-                number = 0
-            else:
-                if number == 0:
-                    number = 1
-                section += number * unit
-                number = 0
-        else:
-            return None
-    return total + section + number
-
-
-def report_number_to_int(number: str) -> Optional[int]:
-    value = normalize_report_number_token(number)
-    if re.fullmatch(r'[0-9]+', value):
-        return int(value)
-    roman_value = roman_to_int(value)
-    if roman_value is not None:
-        return roman_value
-    return chinese_to_int(value)
-
-
-def int_to_roman(number: int) -> str:
-    if not isinstance(number, int) or number <= 0:
-        return ''
-    mapping = [
-        (1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'),
-        (100, 'C'), (90, 'XC'), (50, 'L'), (40, 'XL'),
-        (10, 'X'), (9, 'IX'), (5, 'V'), (4, 'IV'), (1, 'I'),
-    ]
-    result = []
-    remaining = number
-    for value, token in mapping:
-        while remaining >= value:
-            result.append(token)
-            remaining -= value
-    return ''.join(result)
-
-
-def int_to_chinese(number: int) -> str:
-    if not isinstance(number, int) or number <= 0:
-        return ''
-    digits = '零一二三四五六七八九'
-    units = ['', '十', '百', '千']
-    if number < 10:
-        return digits[number]
-    if number < 10000:
-        parts = []
-        num = number
-        zero_pending = False
-        unit_idx = 0
-        while num > 0:
-            num, digit = divmod(num, 10)
-            if digit == 0:
-                if parts and parts[-1] != '零':
-                    zero_pending = True
-            else:
-                token = digits[digit] + units[unit_idx]
-                if zero_pending:
-                    parts.append('零')
-                    zero_pending = False
-                parts.append(token)
-            unit_idx += 1
-        result = ''.join(reversed(parts)).replace('一十', '十')
-        return result or digits[0]
-    return str(number)
-
-
-def build_report_number_variants(number: str) -> List[str]:
-    base = normalize_report_number_token(number)
-    variants: List[str] = []
-    if base:
-        variants.append(base)
-    numeric_value = report_number_to_int(base)
-    if numeric_value is not None:
-        extra = [
-            str(numeric_value),
-            str(numeric_value).translate(REPORT_ASCII_TO_FULLWIDTH_DIGIT_TRANS),
-            int_to_roman(numeric_value),
-            int_to_chinese(numeric_value),
-        ]
-        for candidate in extra:
-            candidate = normalize_report_number_token(candidate)
-            if candidate and candidate not in variants:
-                variants.append(candidate)
-    return variants
-
-
-def build_report_reference_patterns(kind: str, number: str) -> List[re.Pattern]:
-    variants: List[str] = []
-    for token in build_report_number_variants(number):
-        if (kind or '图') == '表':
-            variants.extend([
-                f'Table {token}', f'Table. {token}', f'Tab. {token}', f'Tab {token}',
-                f'表{token}', f'表 {token}',
-            ])
-        else:
-            variants.extend([
-                f'Figure {token}', f'Figure. {token}', f'Fig. {token}', f'Fig {token}',
-                f'图{token}', f'图 {token}',
-            ])
-    seen = set()
-    patterns: List[re.Pattern] = []
-    for variant in variants:
-        if variant in seen:
-            continue
-        seen.add(variant)
-        escaped = re.escape(variant).replace(r'\ ', r'\s*')
-        patterns.append(re.compile(escaped, flags=re.I))
-    return patterns
+    return f"{(kind or '图').strip()}{re.sub(r'\\s+', '', str(number or '').strip())}"
 
 
 def extract_report_label(text: str) -> Optional[Tuple[str, str]]:
     value = text or ''
     match = REPORT_FIG_TABLE_LABEL_RE.search(value)
     if match:
-        return match.group(1), normalize_report_number_token(match.group(2))
+        return match.group(1), re.sub(r'\s+', '', match.group(2))
     match = REPORT_EN_LABEL_RE.search(value)
     if match:
-        kind = '表' if match.group(1).lower().startswith(('table', 'tab')) else '图'
-        return kind, normalize_report_number_token(match.group(2))
+        kind = '表' if match.group(1).lower().startswith('table') else '图'
+        return kind, match.group(2)
     return None
 
 
@@ -2509,7 +2495,7 @@ def is_table_like_figure_text(text: str) -> bool:
         'table', 'tabular', '表格', '数据表', '结果表', '对比表', '消融表', '指标表', '性能表', '统计表'
     ]
     figure_keywords = ['figure', 'fig.', '架构图', '流程图', '曲线图', '示意图', '模块图', '框图', '散点图', '折线图']
-    if any(keyword in lower for keyword in ['table', 'tabular', 'tab.']) or any(keyword in value for keyword in table_keywords[2:]):
+    if any(keyword in lower for keyword in ['table', 'tabular']) or any(keyword in value for keyword in table_keywords[2:]):
         return True
     if any(keyword in lower for keyword in ['figure', 'fig.']) or any(keyword in value for keyword in figure_keywords[2:]):
         return False
@@ -2566,8 +2552,8 @@ def parse_vision_figure_metadata(vision_summaries: str) -> Dict[str, Dict[str, s
 
 def strip_label_prefix(text: str) -> str:
     value = (text or '').strip()
-    value = re.sub(rf'^(?:图|表)\s*{REPORT_NUMBER_TOKEN_RE}\s*[：:：.．\-—–]?\s*', '', value, flags=re.I)
-    value = re.sub(rf'^(?:Figure|Fig\.?|Table|Tab\.?)\s*\.?\s*{REPORT_NUMBER_TOKEN_RE}\s*[：:：.．\-—–]?\s*', '', value, flags=re.I)
+    value = re.sub(r'^(?:图|表)\s*[0-9一二三四五六七八九十百千万]+\s*[：:：.．\-—–]?\s*', '', value)
+    value = re.sub(r'^(?:Figure|Fig\.?|Table)\s*[0-9]+\s*[：:：.．\-—–]?\s*', '', value, flags=re.I)
     return value.strip()
 
 
@@ -2584,14 +2570,13 @@ def strip_internal_asset_references(text: str, known_image_keys: Optional[List[s
         return match.group(0)
 
     value = re.sub(
-        rf'((?:图|表)\s*{REPORT_NUMBER_TOKEN_RE})\s*[（(]\s*([^）)]{{3,220}})\s*[）)]',
+        r'((?:图|表)\s*[0-9一二三四五六七八九十百千万]+)\s*[（(]\s*([^）)]{3,220})\s*[）)]',
         _paren_repl,
         value,
-        flags=re.I,
     )
     value = re.sub(
-        rf'\b(?:Figure|Fig\.?|Table|Tab\.?)\s*\.?\s*({REPORT_NUMBER_TOKEN_RE})\s*[（(]\s*([^）)]{{3,220}})\s*[）)]',
-        lambda m: f"{'表' if m.group(0).lower().startswith(('table', 'tab')) else '图'}{normalize_report_number_token(m.group(1))}"
+        r'\b(?:Figure|Fig\.?|Table)\s*([0-9]+)\s*[（(]\s*([^）)]{3,220})\s*[）)]',
+        lambda m: f"{'表' if m.group(0).lower().startswith('table') else '图'}{m.group(1)}"
         if REPORT_IMAGE_ID_LIKE_RE.search(m.group(2)) else m.group(0),
         value,
         flags=re.I,
@@ -2626,9 +2611,9 @@ def is_standalone_figure_table_caption_line(line: str) -> bool:
         return False
     if REPORT_IMAGE_LINE_RE.match(stripped):
         return True
-    if re.match(rf'^(?:图|表)\s*{REPORT_NUMBER_TOKEN_RE}\s*[：:：.．\-—–]', stripped, flags=re.I):
+    if re.match(r'^(?:图|表)\s*[0-9一二三四五六七八九十百千万]+\s*[：:：.．\-—–]', stripped):
         return True
-    if re.match(rf'^(?:Figure|Fig\.?|Table|Tab\.?)\s*\.?\s*{REPORT_NUMBER_TOKEN_RE}\s*[：:：.．\-—–]', stripped, flags=re.I):
+    if re.match(r'^(?:Figure|Fig\.?|Table)\s*[0-9]+\s*[：:：.．\-—–]', stripped, flags=re.I):
         return True
     return False
 
