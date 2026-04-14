@@ -187,10 +187,12 @@ MAIN_AGENT_PROMPT = """
 3. 不得捏造论文没有给出的公式、模块、参数、结果、作者动机或实验结论。
 4. 每个章节必须由多个自然段组成，不能把整章写成一个大段。
 5. 每次解释方法或实验时，都要回答四个问题：它要解决什么问题、具体怎么做、证据是什么、边界在哪里。
-6. 插图必须使用 Markdown 图片语法，且图片占位符必须从提供的图片ID列表中原样复制，格式为：
-   ![图X：学术化图注](图片ID)
-7. 同一张图片在整篇报告中最多只允许插入一次；首次插入后，后文如需再次引用，只能用文字写“见图X”，不得重复插图。
-8. 表格前后各保留一个空行；表标题必须单独成行。
+6. 图表必须使用 Markdown 图片语法，且图片占位符必须从提供的图片ID列表中原样复制，格式为：
+   ![图X：学术化图注](图片ID) 或 ![表X：学术化表注](图片ID)
+   如果 FIGURE_CARD 的图表类型或原文编号显示它是表格、对比表、结果表或消融表，正文引用和图片 caption 必须写“表X”，不得写“图X”。
+7. 正文引用图表时只能写“如图X所示”“见表X”等自然表达，严禁把图片ID、文件名或长代码名称写进正文。
+8. 报告中凡是正文引用的图表，必须在首次引用段落之后立即插入对应 Markdown 图片；未被正文引用的图片不得插入。同一张图片在整篇报告中最多只允许插入一次。
+9. 表格前后各保留一个空行；表标题必须单独成行。
 9. 语言风格保持学术、克制、清晰，不做口语化渲染。
 
 【报告结构】
@@ -2126,9 +2128,14 @@ def normalize_report_sections_to_current_schema(md_text: str) -> str:
     return normalize_report_markdown("\n".join(rebuilt_lines))
 
 
-def prepare_report_markdown_for_display(md_text: str) -> str:
+def prepare_report_markdown_for_display(
+    md_text: str,
+    images_dict: Optional[Dict[str, str]] = None,
+    vision_summaries: str = '',
+) -> str:
     normalized_sections = normalize_report_sections_to_current_schema(md_text)
-    return postprocess_generated_report_markdown(normalized_sections)
+    image_ids = list((images_dict or {}).keys())
+    return postprocess_generated_report_markdown(normalized_sections, image_ids=image_ids, vision_summaries=vision_summaries)
 
 
 def convert_inline_formulas_in_table_line(line: str) -> str:
@@ -2206,7 +2213,326 @@ def deduplicate_report_image_blocks(blocks: List[Tuple[str, object]]) -> List[Tu
     return deduped
 
 
-def postprocess_generated_report_markdown(md_text: str) -> str:
+
+REPORT_IMAGE_LINE_RE = re.compile(r'^!\[(?P<caption>.*?)\]\((?P<key>.*?)\)\s*$')
+REPORT_FIG_TABLE_LABEL_RE = re.compile(r'(图|表)\s*([0-9一二三四五六七八九十百千万]+)')
+REPORT_EN_LABEL_RE = re.compile(r'\b(Figure|Fig\.?|Table)\s*([0-9]+)\b', flags=re.I)
+REPORT_IMAGE_ID_LIKE_RE = re.compile(
+    r'(?:image[_\-]?[0-9a-f]{6,}|fig(?:ure)?[_\-]?\d+|table[_\-]?\d+|[0-9a-f]{16,}|[\w\-.]+\.(?:png|jpg|jpeg|webp))',
+    flags=re.I,
+)
+
+
+def normalize_report_label(kind: str, number: str) -> str:
+    return f"{(kind or '图').strip()}{re.sub(r'\\s+', '', str(number or '').strip())}"
+
+
+def extract_report_label(text: str) -> Optional[Tuple[str, str]]:
+    value = text or ''
+    match = REPORT_FIG_TABLE_LABEL_RE.search(value)
+    if match:
+        return match.group(1), re.sub(r'\s+', '', match.group(2))
+    match = REPORT_EN_LABEL_RE.search(value)
+    if match:
+        kind = '表' if match.group(1).lower().startswith('table') else '图'
+        return kind, match.group(2)
+    return None
+
+
+def is_table_like_figure_text(text: str) -> bool:
+    value = (text or '').strip()
+    lower = value.lower()
+    table_keywords = [
+        'table', 'tabular', '表格', '数据表', '结果表', '对比表', '消融表', '指标表', '性能表', '统计表'
+    ]
+    figure_keywords = ['figure', 'fig.', '架构图', '流程图', '曲线图', '示意图', '模块图', '框图', '散点图', '折线图']
+    if any(keyword in lower for keyword in ['table', 'tabular']) or any(keyword in value for keyword in table_keywords[2:]):
+        return True
+    if any(keyword in lower for keyword in ['figure', 'fig.']) or any(keyword in value for keyword in figure_keywords[2:]):
+        return False
+    label = extract_report_label(value)
+    return bool(label and label[0] == '表')
+
+
+def parse_vision_figure_metadata(vision_summaries: str) -> Dict[str, Dict[str, str]]:
+    metadata: Dict[str, Dict[str, str]] = {}
+    text = vision_summaries or ''
+    if not text.strip():
+        return metadata
+
+    chunks = re.split(r'\n\s*---\s*图表标识\s*:\s*(.*?)\s*---\s*\n', text)
+    pairs: List[Tuple[str, str]] = []
+    if len(chunks) >= 3:
+        for idx in range(1, len(chunks), 2):
+            pairs.append((chunks[idx].strip(), chunks[idx + 1] if idx + 1 < len(chunks) else ''))
+    else:
+        card_chunks = re.split(r'(?=<FIGURE_CARD>)', text)
+        pairs = [('', chunk) for chunk in card_chunks if chunk.strip()]
+
+    for fallback_key, chunk in pairs:
+        key = fallback_key
+        id_match = re.search(r'图像ID\s*[：:]\s*(.+)', chunk)
+        if id_match:
+            candidate = id_match.group(1).strip().splitlines()[0].strip()
+            if candidate and candidate not in {'未显示', '无'}:
+                key = candidate
+        if not key:
+            continue
+
+        type_match = re.search(r'图表类型\s*[：:]\s*(.+)', chunk)
+        type_text = type_match.group(1).strip().splitlines()[0].strip() if type_match else ''
+        original_match = re.search(r'原文编号\s*[：:]\s*(.+)', chunk)
+        original_text = original_match.group(1).strip().splitlines()[0].strip() if original_match else ''
+        caption_match = re.search(r'推荐图注\s*[：:]\s*(.+)', chunk)
+        caption = caption_match.group(1).strip().splitlines()[0].strip() if caption_match else ''
+
+        label = extract_report_label(original_text) or extract_report_label(caption)
+        kind = '表' if is_table_like_figure_text(type_text) or is_table_like_figure_text(original_text) or (label and label[0] == '表') else '图'
+        number = label[1] if label else ''
+
+        metadata[normalize_report_image_key(key)] = {
+            'key': key,
+            'kind': kind,
+            'number': number,
+            'caption': caption,
+            'type_text': type_text,
+            'original_text': original_text,
+        }
+    return metadata
+
+
+def strip_label_prefix(text: str) -> str:
+    value = (text or '').strip()
+    value = re.sub(r'^(?:图|表)\s*[0-9一二三四五六七八九十百千万]+\s*[：:：.．\-—–]?\s*', '', value)
+    value = re.sub(r'^(?:Figure|Fig\.?|Table)\s*[0-9]+\s*[：:：.．\-—–]?\s*', '', value, flags=re.I)
+    return value.strip()
+
+
+def strip_internal_asset_references(text: str, known_image_keys: Optional[List[str]] = None) -> str:
+    value = text or ''
+    normalized_known = [normalize_report_image_key(x) for x in (known_image_keys or []) if x]
+
+    def _paren_repl(match: re.Match) -> str:
+        label = re.sub(r'\s+', '', match.group(1))
+        inner = match.group(2).strip()
+        norm_inner = normalize_report_image_key(inner)
+        if REPORT_IMAGE_ID_LIKE_RE.search(inner) or any(k and (k in norm_inner or norm_inner in k) for k in normalized_known):
+            return label
+        return match.group(0)
+
+    value = re.sub(
+        r'((?:图|表)\s*[0-9一二三四五六七八九十百千万]+)\s*[（(]\s*([^）)]{3,220})\s*[）)]',
+        _paren_repl,
+        value,
+    )
+    value = re.sub(
+        r'\b(?:Figure|Fig\.?|Table)\s*([0-9]+)\s*[（(]\s*([^）)]{3,220})\s*[）)]',
+        lambda m: f"{'表' if m.group(0).lower().startswith('table') else '图'}{m.group(1)}"
+        if REPORT_IMAGE_ID_LIKE_RE.search(m.group(2)) else m.group(0),
+        value,
+        flags=re.I,
+    )
+    return value
+
+
+def replace_report_label_aliases(text: str, aliases: Dict[str, str]) -> str:
+    value = text or ''
+    for old_label, new_label in sorted((aliases or {}).items(), key=lambda item: -len(item[0])):
+        if not old_label or not new_label or old_label == new_label:
+            continue
+        kind, number = old_label[0], re.escape(old_label[1:])
+        pattern = re.compile(rf'{kind}\s*{number}(?![0-9一二三四五六七八九十百千万])')
+        value = pattern.sub(new_label, value)
+    return value
+
+
+def collect_report_labels_from_text(text: str) -> List[str]:
+    labels: List[str] = []
+    for kind, number in REPORT_FIG_TABLE_LABEL_RE.findall(text or ''):
+        labels.append(normalize_report_label(kind, number))
+    for kind_text, number in REPORT_EN_LABEL_RE.findall(text or ''):
+        kind = '表' if kind_text.lower().startswith('table') else '图'
+        labels.append(normalize_report_label(kind, number))
+    return labels
+
+
+def is_standalone_figure_table_caption_line(line: str) -> bool:
+    stripped = (line or '').strip()
+    if not stripped:
+        return False
+    if REPORT_IMAGE_LINE_RE.match(stripped):
+        return True
+    if re.match(r'^(?:图|表)\s*[0-9一二三四五六七八九十百千万]+\s*[：:：.．\-—–]', stripped):
+        return True
+    if re.match(r'^(?:Figure|Fig\.?|Table)\s*[0-9]+\s*[：:：.．\-—–]', stripped, flags=re.I):
+        return True
+    return False
+
+
+def build_report_asset_maps(
+    report_md: str,
+    image_ids: Optional[List[str]] = None,
+    vision_summaries: str = '',
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+    available_keys = list(image_ids or [])
+    vision_meta = parse_vision_figure_metadata(vision_summaries)
+    key_meta: Dict[str, Dict[str, str]] = {}
+
+    for key in available_keys:
+        norm_key = normalize_report_image_key(key)
+        key_meta[norm_key] = {'key': key, 'kind': '图', 'number': '', 'caption': '', 'type_text': '', 'original_text': ''}
+        if norm_key in vision_meta:
+            key_meta[norm_key].update(vision_meta[norm_key])
+            key_meta[norm_key]['key'] = key
+
+    for line in normalize_report_markdown(report_md).splitlines():
+        match = REPORT_IMAGE_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        key = match.group('key').strip()
+        norm_key = normalize_report_image_key(key)
+        if norm_key not in key_meta:
+            key_meta[norm_key] = {'key': key, 'kind': '图', 'number': '', 'caption': '', 'type_text': '', 'original_text': ''}
+        caption = strip_internal_asset_references(match.group('caption').strip(), available_keys)
+        label = extract_report_label(caption)
+        if label:
+            if key_meta[norm_key].get('kind') != '表':
+                key_meta[norm_key]['kind'] = label[0]
+            key_meta[norm_key]['number'] = key_meta[norm_key].get('number') or label[1]
+        if caption and not key_meta[norm_key].get('caption'):
+            key_meta[norm_key]['caption'] = caption
+        if is_table_like_figure_text(caption):
+            key_meta[norm_key]['kind'] = '表'
+
+    counters = {'图': 1, '表': 1}
+    used_numbers = {'图': set(), '表': set()}
+    for meta in key_meta.values():
+        kind = meta.get('kind') or '图'
+        number = str(meta.get('number') or '').strip()
+        if number:
+            used_numbers.setdefault(kind, set()).add(number)
+            if number.isdigit():
+                counters[kind] = max(counters.get(kind, 1), int(number) + 1)
+
+    key_to_label: Dict[str, str] = {}
+    label_to_key: Dict[str, str] = {}
+    label_to_caption: Dict[str, str] = {}
+    aliases: Dict[str, str] = {}
+
+    for norm_key, meta in key_meta.items():
+        kind = meta.get('kind') or '图'
+        number = str(meta.get('number') or '').strip()
+        if not number:
+            while str(counters[kind]) in used_numbers.setdefault(kind, set()):
+                counters[kind] += 1
+            number = str(counters[kind])
+            used_numbers[kind].add(number)
+            counters[kind] += 1
+        label = normalize_report_label(kind, number)
+        key_to_label[norm_key] = label
+        label_to_key.setdefault(label, meta.get('key') or norm_key)
+        caption_core = strip_label_prefix(strip_internal_asset_references(meta.get('caption') or '', available_keys))
+        label_to_caption[label] = caption_core
+
+    for line in normalize_report_markdown(report_md).splitlines():
+        match = REPORT_IMAGE_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        norm_key = normalize_report_image_key(match.group('key').strip())
+        current_label = extract_report_label(match.group('caption').strip())
+        new_label = key_to_label.get(norm_key)
+        if current_label and new_label:
+            old_label = normalize_report_label(*current_label)
+            if old_label != new_label:
+                aliases[old_label] = new_label
+
+    return key_to_label, label_to_key, label_to_caption, aliases
+
+
+def build_report_image_markdown(label: str, key: str, label_to_caption: Dict[str, str]) -> str:
+    caption_core = strip_label_prefix(label_to_caption.get(label, '')).strip()
+    caption = f"{label}：{caption_core}" if caption_core else label
+    return f"![{caption}]({key})"
+
+
+def reconcile_report_figure_table_references(
+    report_md: str,
+    image_ids: Optional[List[str]] = None,
+    vision_summaries: str = '',
+) -> str:
+    text = normalize_report_markdown(report_md)
+    if not text:
+        return text
+
+    available_keys = list(image_ids or [])
+    key_to_label, label_to_key, label_to_caption, aliases = build_report_asset_maps(text, available_keys, vision_summaries)
+    known_keys = available_keys + list(label_to_key.values())
+
+    cleaned_lines: List[str] = []
+    cited_labels = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        img_match = REPORT_IMAGE_LINE_RE.match(stripped)
+        if img_match:
+            cleaned_lines.append(line)
+            continue
+
+        cleaned = strip_internal_asset_references(line, known_keys)
+        cleaned = replace_report_label_aliases(cleaned, aliases)
+        cleaned_lines.append(cleaned)
+
+        if not is_standalone_figure_table_caption_line(cleaned):
+            cited_labels.update(collect_report_labels_from_text(cleaned))
+
+    inserted_labels = set()
+    used_image_keys = set()
+    filtered_lines: List[str] = []
+    for line in cleaned_lines:
+        stripped = line.strip()
+        img_match = REPORT_IMAGE_LINE_RE.match(stripped)
+        if not img_match:
+            filtered_lines.append(line)
+            continue
+
+        caption = strip_internal_asset_references(img_match.group('caption').strip(), known_keys)
+        key = img_match.group('key').strip()
+        norm_key = normalize_report_image_key(key)
+        label = key_to_label.get(norm_key)
+        if not label:
+            caption_label = extract_report_label(caption)
+            label = normalize_report_label(*caption_label) if caption_label else ''
+
+        if label and label in cited_labels and norm_key not in used_image_keys:
+            canonical_key = label_to_key.get(label, key)
+            filtered_lines.append(build_report_image_markdown(label, canonical_key, label_to_caption))
+            inserted_labels.add(label)
+            used_image_keys.add(normalize_report_image_key(canonical_key))
+        else:
+            continue
+
+    missing_labels = [label for label in sorted(cited_labels, key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 10**9, x)) if label in label_to_key and label not in inserted_labels]
+    for label in missing_labels:
+        image_line = build_report_image_markdown(label, label_to_key[label], label_to_caption)
+        inserted = False
+        for idx, line in enumerate(filtered_lines):
+            if REPORT_IMAGE_LINE_RE.match(line.strip()) or is_standalone_figure_table_caption_line(line):
+                continue
+            if label in collect_report_labels_from_text(line):
+                filtered_lines.insert(idx + 1, '')
+                filtered_lines.insert(idx + 2, image_line)
+                inserted = True
+                break
+        if not inserted:
+            filtered_lines.append('')
+            filtered_lines.append(image_line)
+
+    return normalize_report_markdown('\n'.join(filtered_lines))
+
+def postprocess_generated_report_markdown(
+    md_text: str,
+    image_ids: Optional[List[str]] = None,
+    vision_summaries: str = '',
+) -> str:
     doc_title, body = split_title_and_body(md_text)
     blocks = split_markdown_blocks(body)
     cleaned_blocks: List[Tuple[str, object]] = []
@@ -2246,7 +2572,8 @@ def postprocess_generated_report_markdown(md_text: str) -> str:
         cleaned_blocks.append((block_type, payload))
 
     cleaned_blocks = deduplicate_report_image_blocks(cleaned_blocks)
-    return serialize_report_blocks(cleaned_blocks, doc_title)
+    serialized = serialize_report_blocks(cleaned_blocks, doc_title)
+    return reconcile_report_figure_table_references(serialized, image_ids=image_ids, vision_summaries=vision_summaries)
 def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
     """根据图片宽高比选择更合适的显示尺寸。"""
     iw, ih = img_reader.getSize()
@@ -3529,7 +3856,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
             vision_summaries=vision_summaries,
             image_ids=list(images_dict.keys()),
         )
-        final_main_report = prepare_report_markdown_for_display(report)
+        final_main_report = prepare_report_markdown_for_display(report, images_dict=images_dict, vision_summaries=vision_summaries)
 
     if is_report_truncated(final_main_report):
         with st.spinner("检测到报告可能截断，正在补全缺失内容……"):
@@ -3539,7 +3866,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
                 vision_summaries=vision_summaries,
                 image_ids=list(images_dict.keys()),
             )
-            final_main_report = prepare_report_markdown_for_display(report)
+            final_main_report = prepare_report_markdown_for_display(report, images_dict=images_dict, vision_summaries=vision_summaries)
 
     return {
         "source_markdown": md_content,
@@ -3657,7 +3984,11 @@ def render_single_analysis_result(
     if show_paper_title:
         st.markdown(f"### {source_name}")
 
-    display_report_md = prepare_report_markdown_for_display(analysis_result.get("main_report", ""))
+    display_report_md = prepare_report_markdown_for_display(
+        analysis_result.get("main_report", ""),
+        images_dict=analysis_result.get("images", {}),
+        vision_summaries=analysis_result.get("vision_summaries", ""),
+    )
     st.success(status_text)
     render_report_with_images(display_report_md, analysis_result["images"])
 
