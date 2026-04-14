@@ -884,19 +884,23 @@ SCRIPTED_FORMULA_TOKEN_RE = re.compile(
 FORMULA_COMMAND_TOKEN_RE = re.compile(
     rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*(?:{FORMULA_SUBSUP_PATTERN})*'
 )
+FORMULA_NAME_TOKEN_PATTERN = rf'[A-Za-zΑ-Ωα-ωℒμµ{MATH_UNICODE_RANGE}][A-Za-z0-9Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]*'
+FORMULA_SCRIPT_PART_PATTERN = rf'(?:[_^](?:{FORMULA_BRACE_EXPR}|\\[A-Za-z]+|[A-Za-z0-9Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+))*'
 SIMPLE_FORMULA_ATOM_PATTERN = (
     rf'(?:'
-    rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*'
-    rf'|[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+'
+    rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*{FORMULA_SCRIPT_PART_PATTERN}'
+    rf'|{FORMULA_NAME_TOKEN_PATTERN}(?:\([^()\n]{{1,80}}\))?{FORMULA_SCRIPT_PART_PATTERN}'
     rf'|[{MATH_OPERATOR_CHARS_ESC}]'
-    rf'|[{MATH_VARIABLE_CHARS}](?:[_^](?:{FORMULA_BRACE_EXPR}|[A-Za-z0-9]+))?'
-    rf'|\d+(?:\.\d+)?'
+    rf'|\d+(?:\.\d+)?{FORMULA_SCRIPT_PART_PATTERN}'
     rf')'
 )
 INLINE_EQUATION_RUN_RE = re.compile(
     rf'(?<![A-Za-z0-9_])'
     rf'{SIMPLE_FORMULA_ATOM_PATTERN}'
-    rf'(?:\s*(?:=|<|>|/|\+|\-|\*|·|×|÷|\\cdot|[{MATH_OPERATOR_CHARS_ESC}])\s*{SIMPLE_FORMULA_ATOM_PATTERN})+'
+    rf'(?:'
+    rf'\s*(?:=|<|>|/|\+|\-|\*|·|×|÷|\\cdot|[{MATH_OPERATOR_CHARS_ESC}])\s*{SIMPLE_FORMULA_ATOM_PATTERN}'
+    rf'|\s+{SIMPLE_FORMULA_ATOM_PATTERN}'
+    rf')+'
     rf'(?![A-Za-z0-9_])'
 )
 STANDALONE_MATH_SYMBOL_RE = re.compile(
@@ -1078,6 +1082,53 @@ def repair_implicit_subscripts(expr: str) -> str:
     return value
 
 
+def formula_has_strong_signal(text: str) -> bool:
+    value = text or ''
+    if not value.strip():
+        return False
+    if any(ch in value for ch in MATH_OPERATOR_CHARS):
+        return True
+    if any(ch in value for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
+        return True
+    if re.search(r'[=<>^_+*/\\]|\bcdot\b|\\[A-Za-z]+', value):
+        return True
+    if re.search(r'[Α-Ωα-ωℒμµ]', value):
+        return True
+    return False
+
+
+def normalize_formula_script_groups(expr: str) -> str:
+    """修复 L_{augmented_i}、z_{drug}_{specific} 这类会导致 KaTeX/MathText 报错的下标。"""
+    value = expr or ''
+
+    # 先把连续下标/上标合并，避免 z_{drug}_{specific} 触发 Double subscript。
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(
+            r'([_^])\{([^{}]+)\}\s*\1\{([^{}]+)\}',
+            lambda m: f"{m.group(1)}{{{m.group(2).strip()},{m.group(3).strip()}}}",
+            value,
+        )
+
+    def _normalize_script(match):
+        op = match.group(1)
+        body = (match.group(2) or '').strip()
+        if not body:
+            return match.group(0)
+        if body.startswith('\\') or re.search(r'[+\-*/=<>]', body):
+            return f'{op}{{{body}}}'
+        if re.search(r'[A-Za-z]{2,}|_', body):
+            safe = body.replace('\\', r'\backslash ')
+            safe = safe.replace('_', r'\_')
+            safe = re.sub(r'\s+', r'\\ ', safe)
+            return f'{op}{{\\mathrm{{{safe}}}}}'
+        return f'{op}{{{body}}}'
+
+    value = re.sub(r'([_^])\{([^{}]+)\}', _normalize_script, value)
+    return value
+
+
 def explode_inline_numbered_segments(text: str) -> List[str]:
     value = (text or '').strip()
     if not value:
@@ -1198,6 +1249,7 @@ def sanitize_formula_for_render(text: str) -> str:
         return ''
 
     expr = repair_broken_formula_glyphs(expr)
+    expr = expr.replace('$', ' ')
     expr = normalize_formula_spacing(expr)
     expr = collapse_spaced_math_braces(expr)
     expr = normalize_math_unicode_to_latex(expr)
@@ -1232,6 +1284,7 @@ def sanitize_formula_for_render(text: str) -> str:
     expr = re.sub(r'\^(?!\{)\s*(\\[A-Za-z]+)', r'^{\1}', expr)
     expr = re.sub(r'_(?!\{)\s*([A-Za-z0-9]{2,})', r'_{\1}', expr)
     expr = re.sub(r'\^(?!\{)\s*([A-Za-z0-9]{2,})', r'^{\1}', expr)
+    expr = normalize_formula_script_groups(expr)
     expr = re.sub(r'\s*\*\s*', lambda m: r' \cdot ', expr)
     expr = re.sub(r'\s+', ' ', expr).strip()
     return expr
@@ -1330,7 +1383,7 @@ def should_auto_render_formula(candidate: str) -> bool:
     normalized = collapse_spaced_math_braces(normalize_formula_spacing(stripped))
     normalized_latex = normalize_math_unicode_to_latex(normalized)
 
-    if INLINE_EQUATION_RUN_RE.fullmatch(normalized):
+    if INLINE_EQUATION_RUN_RE.fullmatch(normalized) and formula_has_strong_signal(normalized):
         return True
     if SCRIPTED_FORMULA_TOKEN_RE.search(normalized) or FORMULA_COMMAND_TOKEN_RE.search(normalized):
         return True
@@ -1420,6 +1473,7 @@ def wrap_plain_text_for_paragraph(
         return wrap_plain_text_basic(text, bold=bold)
 
     working = collapse_spaced_math_braces(normalize_formula_spacing(text))
+    working = working.replace('$', ' ')
     parts: List[str] = []
     cursor = 0
 
@@ -1529,6 +1583,7 @@ def wrap_plain_text_for_markdown(text: str) -> str:
         return ''
 
     working = collapse_spaced_math_braces(normalize_formula_spacing(text))
+    working = working.replace('$', ' ')
     parts: List[str] = []
     cursor = 0
 
