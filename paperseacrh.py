@@ -1834,6 +1834,93 @@ def split_title_and_body(md_text: str) -> Tuple[str, str]:
     return "论文全维度深度透视报告", text
 
 
+CURRENT_REPORT_SECTION_TITLES = [
+    "研究问题与核心贡献",
+    "背景、研究缺口与前人路线",
+    "方法总览与整体数据流",
+    "关键模块逐层机制剖析",
+    "实验设计、关键证据与论点验证",
+    "局限性与未解决问题",
+    "面向后续研究的可执行创新路线",
+]
+REMOVED_REPORT_SECTION_TITLES = {"复现要点与方法适用边界"}
+
+
+def canonicalize_report_section_core(title: str) -> str:
+    raw = (title or "").strip()
+    raw = re.sub(r'^#+\s*', '', raw)
+    raw = re.sub(r'^\d+\s*[.．、:：\-]?\s*', '', raw)
+    normalized = normalize_compare_text(raw)
+
+    for candidate in CURRENT_REPORT_SECTION_TITLES + list(REMOVED_REPORT_SECTION_TITLES):
+        if normalize_compare_text(candidate) == normalized:
+            return candidate
+    return raw
+
+
+def normalize_report_sections_to_current_schema(md_text: str) -> str:
+    doc_title, body = split_title_and_body(md_text)
+    lines = normalize_report_markdown(body).split("\n") if body else []
+
+    prelude_lines: List[str] = []
+    section_blocks: List[Tuple[str, List[str]]] = []
+    current_header: Optional[str] = None
+    current_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            if current_header is not None:
+                section_blocks.append((current_header, current_lines))
+            current_header = stripped[3:].strip()
+            current_lines = []
+        else:
+            if current_header is None:
+                prelude_lines.append(line)
+            else:
+                current_lines.append(line)
+
+    if current_header is not None:
+        section_blocks.append((current_header, current_lines))
+
+    merged_sections: Dict[str, List[str]] = {}
+    for header, content_lines in section_blocks:
+        core_title = canonicalize_report_section_core(header)
+        if core_title in REMOVED_REPORT_SECTION_TITLES:
+            continue
+        if core_title not in CURRENT_REPORT_SECTION_TITLES:
+            continue
+
+        cleaned_content = list(content_lines)
+        if core_title not in merged_sections:
+            merged_sections[core_title] = cleaned_content
+        else:
+            existing_content = normalize_report_markdown("\n".join(merged_sections[core_title]))
+            incoming_content = normalize_report_markdown("\n".join(cleaned_content))
+            if incoming_content and incoming_content != existing_content:
+                if merged_sections[core_title] and merged_sections[core_title][-1].strip():
+                    merged_sections[core_title].append("")
+                merged_sections[core_title].extend(cleaned_content)
+
+    rebuilt_lines: List[str] = [f"# {doc_title}"]
+    prelude_text = normalize_report_markdown("\n".join(prelude_lines))
+    if prelude_text:
+        rebuilt_lines.extend(["", prelude_text])
+
+    for idx, section_title in enumerate(CURRENT_REPORT_SECTION_TITLES, start=1):
+        if section_title not in merged_sections:
+            continue
+        rebuilt_lines.extend(["", f"## {idx}. {section_title}"])
+        rebuilt_lines.extend(merged_sections[section_title])
+
+    return normalize_report_markdown("\n".join(rebuilt_lines))
+
+
+def prepare_report_markdown_for_display(md_text: str) -> str:
+    normalized_sections = normalize_report_sections_to_current_schema(md_text)
+    return postprocess_generated_report_markdown(normalized_sections)
+
+
 def convert_inline_formulas_in_table_line(line: str) -> str:
     stripped = (line or '').strip()
     if not stripped.startswith('|'):
@@ -3232,7 +3319,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
             vision_summaries=vision_summaries,
             image_ids=list(images_dict.keys()),
         )
-        final_main_report = postprocess_generated_report_markdown(normalize_report_markdown(report))
+        final_main_report = prepare_report_markdown_for_display(report)
 
     if is_report_truncated(final_main_report):
         with st.spinner("检测到报告可能截断，正在补全缺失内容……"):
@@ -3242,7 +3329,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
                 vision_summaries=vision_summaries,
                 image_ids=list(images_dict.keys()),
             )
-            final_main_report = postprocess_generated_report_markdown(normalize_report_markdown(report))
+            final_main_report = prepare_report_markdown_for_display(report)
 
     return {
         "source_markdown": md_content,
@@ -3359,14 +3446,16 @@ def render_single_analysis_result(
 ):
     if show_paper_title:
         st.markdown(f"### {source_name}")
+
+    display_report_md = prepare_report_markdown_for_display(analysis_result.get("main_report", ""))
     st.success(status_text)
-    render_report_with_images(analysis_result["main_report"], analysis_result["images"])
+    render_report_with_images(display_report_md, analysis_result["images"])
 
     st.divider()
     st.markdown("### 导出")
     st.download_button(
         label="下载报告原文（Markdown）",
-        data=analysis_result["main_report"],
+        data=display_report_md,
         file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
         mime="text/markdown",
         use_container_width=True,
@@ -3855,7 +3944,7 @@ elif st.session_state.app_state == "COMPLETED":
 
     st.divider()
     st.header("开启深度解读工作流")
-    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 8 节精读报告，并自动存入当前账号的历史报告记录。")
+    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 7 节精读报告，并自动存入当前账号的历史报告记录。")
 
     uploaded_pdf = st.file_uploader("上传 PDF 文件以获取精读报告", type="pdf", key="bottom_pdf", accept_multiple_files=True)
     bottom_start_btn = st.button(
