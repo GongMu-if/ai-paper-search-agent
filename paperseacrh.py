@@ -817,10 +817,27 @@ GREEK_LATEX_MAP = {
     'Λ': r'\Lambda', 'Σ': r'\Sigma', 'Π': r'\Pi', 'Ω': r'\Omega', 'Φ': r'\Phi', 'Ψ': r'\Psi',
 }
 SPECIAL_FORMULA_CHAR_MAP = {
-    'ℒ': r'\mathcal{L}', '·': r'\cdot', '×': r'\times', '÷': r'\div', '≤': r'\le',
-    '≥': r'\ge', '≠': r'\neq', '±': r'\pm', '∞': r'\infty', '∑': r'\sum',
-    '∏': r'\prod', '√': r'\sqrt',
+    'ℒ': r'\mathcal{L}', '·': r'\cdot', '×': r'\times', '÷': r'\div',
+    '⊙': r'\odot', '⊕': r'\oplus', '⊗': r'\otimes', '⊘': r'\oslash',
+    '⊖': r'\ominus', '⊚': r'\circledcirc', '⊛': r'\circledast',
+    '≤': r'\le', '≥': r'\ge', '≠': r'\neq', '≈': r'\approx',
+    '≃': r'\simeq', '≅': r'\cong', '≡': r'\equiv', '∼': r'\sim',
+    '±': r'\pm', '∞': r'\infty', '∑': r'\sum', '∏': r'\prod',
+    '√': r'\sqrt', '∂': r'\partial', '∇': r'\nabla',
+    '∈': r'\in', '∉': r'\notin', '∋': r'\ni', '∝': r'\propto',
+    '∩': r'\cap', '∪': r'\cup', '⊂': r'\subset', '⊃': r'\supset',
+    '⊆': r'\subseteq', '⊇': r'\supseteq', '∅': r'\emptyset',
+    '∀': r'\forall', '∃': r'\exists',
 }
+MATH_OPERATOR_CHARS = ''.join([
+    '⊙', '⊕', '⊗', '⊘', '⊖', '⊚', '⊛',
+    '≤', '≥', '≠', '≈', '≃', '≅', '≡', '∼',
+    '±', '∞', '∑', '∏', '√', '∂', '∇',
+    '∈', '∉', '∋', '∝', '∩', '∪', '⊂', '⊃',
+    '⊆', '⊇', '∅', '∀', '∃',
+])
+MATH_OPERATOR_CHARS_ESC = re.escape(MATH_OPERATOR_CHARS)
+MATH_VARIABLE_CHARS = 'abcdefghijklmnopqrstuvwxyz'
 SUPERSCRIPT_CHAR_MAP = {
     '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
     '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
@@ -843,6 +860,8 @@ SPECIAL_FORMULA_RUN_RE = re.compile(
     rf'[A-Za-zΑ-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]�?[_^][A-Za-z0-9Α-Ωα-ω]+'
     rf'|'
     rf'[A-Za-zΑ-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+[{re.escape(UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)}]+'
+    rf'|'
+    rf'[{MATH_OPERATOR_CHARS_ESC}]'
     rf')'
 )
 CAPTION_CORE_RE = re.compile(
@@ -864,6 +883,24 @@ SCRIPTED_FORMULA_TOKEN_RE = re.compile(
 )
 FORMULA_COMMAND_TOKEN_RE = re.compile(
     rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*(?:{FORMULA_SUBSUP_PATTERN})*'
+)
+SIMPLE_FORMULA_ATOM_PATTERN = (
+    rf'(?:'
+    rf'\\[A-Za-z]+(?:{FORMULA_BRACE_EXPR})*'
+    rf'|[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+'
+    rf'|[{MATH_OPERATOR_CHARS_ESC}]'
+    rf'|[{MATH_VARIABLE_CHARS}](?:[_^](?:{FORMULA_BRACE_EXPR}|[A-Za-z0-9]+))?'
+    rf'|\d+(?:\.\d+)?'
+    rf')'
+)
+INLINE_EQUATION_RUN_RE = re.compile(
+    rf'(?<![A-Za-z0-9_])'
+    rf'{SIMPLE_FORMULA_ATOM_PATTERN}'
+    rf'(?:\s*(?:=|<|>|/|\+|\-|\*|·|×|÷|\\cdot|[{MATH_OPERATOR_CHARS_ESC}])\s*{SIMPLE_FORMULA_ATOM_PATTERN})+'
+    rf'(?![A-Za-z0-9_])'
+)
+STANDALONE_MATH_SYMBOL_RE = re.compile(
+    rf'(?<![A-Za-z0-9_])(?:[{MATH_VARIABLE_CHARS}]|[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+|[{MATH_OPERATOR_CHARS_ESC}])(?![A-Za-z0-9_])'
 )
 
 LIST_ENUMERATOR_ONLY_RE = re.compile(r'^[（(]?[0-9]+[）).、]?$')
@@ -1121,6 +1158,9 @@ def looks_like_formula_text(text: str) -> bool:
     if any(ch in normalized for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
         return True
 
+    if any(ch in normalized for ch in MATH_OPERATOR_CHARS):
+        return True
+
     has_letter = bool(re.search(r'[A-Za-zΑ-Ωα-ω]', normalized))
     operator_count = sum(ch in normalized for ch in "=<>^_+-*/\\")
     brace_count = normalized.count('{') + normalized.count('}')
@@ -1288,7 +1328,17 @@ def should_auto_render_formula(candidate: str) -> bool:
         return False
 
     normalized = collapse_spaced_math_braces(normalize_formula_spacing(stripped))
+    normalized_latex = normalize_math_unicode_to_latex(normalized)
+
+    if INLINE_EQUATION_RUN_RE.fullmatch(normalized):
+        return True
     if SCRIPTED_FORMULA_TOKEN_RE.search(normalized) or FORMULA_COMMAND_TOKEN_RE.search(normalized):
+        return True
+    if any(ch in normalized for ch in MATH_OPERATOR_CHARS):
+        return True
+    if re.fullmatch(rf'[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+', normalized):
+        return True
+    if re.fullmatch(rf'[{MATH_VARIABLE_CHARS}]', normalized):
         return True
 
     if '�' in stripped or any(ch in stripped for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
@@ -1297,7 +1347,34 @@ def should_auto_render_formula(candidate: str) -> bool:
         return False
     if re.fullmatch(r'[A-Za-z]{2,}', stripped):
         return False
-    return looks_like_formula_text(stripped)
+    return looks_like_formula_text(normalized_latex)
+
+
+def has_inline_math_context(working: str, start: int, end: int) -> bool:
+    token = working[start:end].strip()
+    if not token:
+        return False
+    if any(ch in token for ch in MATH_OPERATOR_CHARS):
+        return True
+    if re.fullmatch(rf'[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+', token):
+        return True
+
+    around = working[max(0, start - 18):min(len(working), end + 18)]
+    if re.search(r'[=+\-*/<>_^{}]|\\cdot|' + rf'[{MATH_OPERATOR_CHARS_ESC}]', around):
+        return True
+    if re.search(r'[\u4e00-\u9fff]', around):
+        return True
+    return False
+
+
+def find_standalone_math_symbol_match(working: str, start_pos: int):
+    match = STANDALONE_MATH_SYMBOL_RE.search(working, start_pos)
+    while match:
+        if has_inline_math_context(working, match.start(), match.end()):
+            return match
+        match = STANDALONE_MATH_SYMBOL_RE.search(working, match.start() + 1)
+    return None
+
 
 def find_parenthetical_formula_match(working: str, start_pos: int):
     match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
@@ -1312,16 +1389,25 @@ def find_parenthetical_formula_match(working: str, start_pos: int):
 
 def collect_formula_candidate_matches(working: str, cursor: int):
     candidate_matches = []
-    for pattern in (SCRIPTED_FORMULA_TOKEN_RE, AUTO_FORMULA_RUN_RE, SPECIAL_FORMULA_RUN_RE):
+    for pattern in (
+        INLINE_EQUATION_RUN_RE,
+        SCRIPTED_FORMULA_TOKEN_RE,
+        AUTO_FORMULA_RUN_RE,
+        SPECIAL_FORMULA_RUN_RE,
+    ):
         match = pattern.search(working, cursor)
         if match:
             candidate_matches.append(match)
+
+    standalone_match = find_standalone_math_symbol_match(working, cursor)
+    if standalone_match:
+        candidate_matches.append(standalone_match)
 
     paren_match = find_parenthetical_formula_match(working, cursor)
     if paren_match:
         candidate_matches.append(paren_match)
     return candidate_matches
-    
+
 def wrap_plain_text_for_paragraph(
     text: str,
     asset_ctx: Optional[Dict[str, Any]] = None,
