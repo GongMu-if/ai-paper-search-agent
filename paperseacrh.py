@@ -4,16 +4,40 @@
 import re
 import os
 import time
+import html
 import base64
 import hashlib
+import tempfile
 import unicodedata
 import json
+from io import BytesIO
 from typing import Any, Dict, List, Tuple, Optional
 import datetime
 import requests
 import streamlit as st
 from openai import OpenAI
 from streamlit_autorefresh import st_autorefresh
+# 服务器端 PDF 排版依赖
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (
+    BaseDocTemplate,
+    PageTemplate,
+    Frame,
+    Paragraph,
+    Spacer,
+    Image as RLImage,
+    Table,
+    TableStyle,
+    KeepTogether,
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
 
 st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout="wide")
 
@@ -44,6 +68,29 @@ CORE_SECTION_SPECS = [
     "## 6. 局限性与未解决问题",
 ]
 RESEARCH_SECTION_SPEC = "## 7. 面向后续研究的可执行创新路线"
+
+# PDF 页面与版式参数
+PDF_LAYOUT = {
+    "page_size": A4,
+    "margin_top": 16 * mm,
+    "margin_right": 16 * mm,
+    "margin_bottom": 15 * mm,
+    "margin_left": 16 * mm,
+    "body_font_size": 12.0,
+    "body_leading": 20,
+    "title_font_size": 24,
+    "h2_font_size": 18.5,
+    "h3_font_size": 15.0,
+    "caption_font_size": 10.2,
+    "paragraph_space_after": 8,
+    "section_space_before": 10,
+    "section_space_after": 10,
+    "image_max_width_ratio": 0.82,
+    "wide_image_max_width_ratio": 0.92,
+    "tall_image_max_width_ratio": 0.66,
+    "image_max_height": 155 * mm,
+    "table_image_max_height": 220 * mm,
+}
 
 
 # ==========================================
@@ -700,6 +747,37 @@ def generate_full_report(md_content: str, text_report: str, vision_summaries: st
     return report
 
 
+# ==========================================
+# 模块 9：PDF 字体与样式
+# ==========================================
+def register_pdf_fonts():
+    """
+    注册 PDF 字体：
+    - STSong-Light：中文主字体
+    - DejaVuSans / DejaVuSans-Bold：公式、符号与西文加粗回退
+    - DejaVuSansMono：代码与等宽文本
+    """
+    try:
+        pdfmetrics.getFont("STSong-Light")
+    except KeyError:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+
+    font_candidates = {
+        "DejaVuSans": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "DejaVuSansMono": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    }
+    registered = set(pdfmetrics.getRegisteredFontNames())
+    for name, path in font_candidates.items():
+        if name in registered or not os.path.exists(path):
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont(name, path))
+        except Exception:
+            continue
+
+
+
 TABLE_TITLE_LINE_RE = re.compile(
     r'^(?:表|table)\s*(?:\d+|[IVXLCDM]+|[一二三四五六七八九十百千万]+)(?:\s*[：:.-]|(?:\s+[-–—]\s+)|\s+).+',
     flags=re.I,
@@ -964,6 +1042,7 @@ def normalize_math_unicode_to_latex(text: str) -> str:
     return value
 
 
+
 def is_list_enumerator_text(text: str) -> bool:
     candidate = extract_formula_text(text)
     if not candidate:
@@ -1158,6 +1237,280 @@ def sanitize_formula_for_render(text: str) -> str:
     return expr
 
 
+def create_formula_asset_context(formula_dir: str) -> Dict[str, Any]:
+    return {
+        'formula_dir': formula_dir,
+        'formula_cache': {},
+    }
+
+
+def render_formula_image(
+    formula_text: str,
+    asset_ctx: Dict[str, Any],
+    font_size: float = 12.0,
+    display: bool = False,
+) -> Optional[Dict[str, Any]]:
+    expr = sanitize_formula_for_render(formula_text)
+    if not expr:
+        return None
+
+    cache_key = hashlib.sha256(
+        f"{font_size:.2f}|{int(display)}|{expr}".encode('utf-8')
+    ).hexdigest()
+    cached = asset_ctx['formula_cache'].get(cache_key)
+    if cached and os.path.exists(cached['path']):
+        return cached
+
+    try:
+        os.makedirs(asset_ctx['formula_dir'], exist_ok=True)
+        mpl_config_dir = os.path.join(asset_ctx['formula_dir'], 'mplconfig')
+        os.makedirs(mpl_config_dir, exist_ok=True)
+        os.environ['MPLCONFIGDIR'] = mpl_config_dir
+
+        import matplotlib
+        matplotlib.use('Agg')
+        from matplotlib import rcParams
+        from matplotlib.font_manager import FontProperties
+        from matplotlib.mathtext import math_to_image
+
+        rcParams['mathtext.fontset'] = 'dejavusans'
+        rcParams['font.family'] = 'DejaVu Sans'
+
+        output_path = os.path.join(asset_ctx['formula_dir'], f'formula_{cache_key}.png')
+        prop = FontProperties(family='DejaVu Sans', size=font_size + (2 if display else 0))
+        math_to_image(f'${expr}$', output_path, prop=prop, dpi=220, format='png', color='black')
+
+        reader = ImageReader(output_path)
+        width_px, height_px = reader.getSize()
+        asset = {
+            'path': output_path,
+            'width': width_px * 72.0 / 220.0,
+            'height': height_px * 72.0 / 220.0,
+        }
+        asset_ctx['formula_cache'][cache_key] = asset
+        return asset
+    except Exception:
+        return None
+
+def wrap_plain_text_basic(text: str, bold: bool = False) -> str:
+    """
+    将普通文本转换为 ReportLab Paragraph 可识别的安全行内标记。
+
+    设计原则：
+    - 常规英数字使用 Times-Roman / Times-Bold，确保英文加粗真正生效；
+    - 中文与其他非 ASCII 文本默认走 STSong-Light；
+    - 对中文加粗场景，不再嵌套 <font> 到 <b> 内，避免被解析成普通字重或触发字体映射异常。
+    """
+    escaped = html.escape(text)
+    if not escaped:
+        return ''
+
+    parts = []
+    ascii_font = 'Times-Bold' if bold else 'Times-Roman'
+    for chunk in ASCII_TEXT_RE.split(escaped):
+        if not chunk:
+            continue
+        if ASCII_TEXT_RE.fullmatch(chunk):
+            parts.append(f'<font name="{ascii_font}">{chunk}</font>')
+        else:
+            if bold:
+                parts.append(f'<b>{chunk}</b>')
+            else:
+                parts.append(f'<font name="STSong-Light">{chunk}</font>')
+    return ''.join(parts)
+
+
+def should_auto_render_formula(candidate: str) -> bool:
+    stripped = extract_formula_text(candidate)
+    if not stripped:
+        return False
+    if is_list_enumerator_text(stripped):
+        return False
+
+    normalized = collapse_spaced_math_braces(normalize_formula_spacing(stripped))
+    normalized_latex = normalize_math_unicode_to_latex(normalized)
+
+    if INLINE_EQUATION_RUN_RE.fullmatch(normalized):
+        return True
+    if SCRIPTED_FORMULA_TOKEN_RE.search(normalized) or FORMULA_COMMAND_TOKEN_RE.search(normalized):
+        return True
+    if any(ch in normalized for ch in MATH_OPERATOR_CHARS):
+        return True
+    if re.fullmatch(rf'[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+', normalized):
+        return True
+    if re.fullmatch(rf'[{MATH_VARIABLE_CHARS}]', normalized):
+        return True
+
+    if '�' in stripped or any(ch in stripped for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS):
+        return True
+    if re.fullmatch(r'[A-Z]{2,}(?:-[A-Z]{2,})*', stripped):
+        return False
+    if re.fullmatch(r'[A-Za-z]{2,}', stripped):
+        return False
+    return looks_like_formula_text(normalized_latex)
+
+
+def has_inline_math_context(working: str, start: int, end: int) -> bool:
+    token = working[start:end].strip()
+    if not token:
+        return False
+    if any(ch in token for ch in MATH_OPERATOR_CHARS):
+        return True
+    if re.fullmatch(rf'[Α-Ωα-ωℒμµ{MATH_UNICODE_RANGE}]+', token):
+        return True
+
+    around = working[max(0, start - 18):min(len(working), end + 18)]
+    if re.search(r'[=+\-*/<>_^{}]|\\cdot|' + rf'[{MATH_OPERATOR_CHARS_ESC}]', around):
+        return True
+    if re.search(r'[\u4e00-\u9fff]', around):
+        return True
+    return False
+
+
+def find_standalone_math_symbol_match(working: str, start_pos: int):
+    match = STANDALONE_MATH_SYMBOL_RE.search(working, start_pos)
+    while match:
+        if has_inline_math_context(working, match.start(), match.end()):
+            return match
+        match = STANDALONE_MATH_SYMBOL_RE.search(working, match.start() + 1)
+    return None
+
+
+def find_parenthetical_formula_match(working: str, start_pos: int):
+    match = PAREN_FORMULA_CANDIDATE_RE.search(working, start_pos)
+    while match:
+        candidate = match.group(0).strip()
+        inner = candidate[1:-1].strip()
+        if should_auto_render_formula(inner):
+            return match
+        match = PAREN_FORMULA_CANDIDATE_RE.search(working, match.start() + 1)
+    return None
+
+
+def collect_formula_candidate_matches(working: str, cursor: int):
+    candidate_matches = []
+    for pattern in (
+        INLINE_EQUATION_RUN_RE,
+        SCRIPTED_FORMULA_TOKEN_RE,
+        AUTO_FORMULA_RUN_RE,
+        SPECIAL_FORMULA_RUN_RE,
+    ):
+        match = pattern.search(working, cursor)
+        if match:
+            candidate_matches.append(match)
+
+    standalone_match = find_standalone_math_symbol_match(working, cursor)
+    if standalone_match:
+        candidate_matches.append(standalone_match)
+
+    paren_match = find_parenthetical_formula_match(working, cursor)
+    if paren_match:
+        candidate_matches.append(paren_match)
+    return candidate_matches
+
+def wrap_plain_text_for_paragraph(
+    text: str,
+    asset_ctx: Optional[Dict[str, Any]] = None,
+    bold: bool = False,
+) -> str:
+    if not text:
+        return ''
+
+    if asset_ctx is None:
+        return wrap_plain_text_basic(text, bold=bold)
+
+    working = collapse_spaced_math_braces(normalize_formula_spacing(text))
+    parts: List[str] = []
+    cursor = 0
+
+    while cursor < len(working):
+        candidate_matches = collect_formula_candidate_matches(working, cursor)
+        if not candidate_matches:
+            parts.append(wrap_plain_text_basic(working[cursor:], bold=bold))
+            break
+
+        match = min(candidate_matches, key=lambda m: (m.start(), -(m.end() - m.start())))
+        start, end = match.span()
+        candidate = match.group(0).strip()
+
+        if start > cursor:
+            parts.append(wrap_plain_text_basic(working[cursor:start], bold=bold))
+
+        if (
+            not is_list_enumerator_text(candidate)
+            and (
+                should_auto_render_formula(candidate)
+                or '�' in candidate
+                or any(ch in candidate for ch in UNICODE_SUPERSCRIPT_CHARS + UNICODE_SUBSCRIPT_CHARS)
+                or candidate[:1] in {'(', '（'}
+            )
+        ):
+            parts.append(inline_math_markup(candidate, asset_ctx))
+        else:
+            parts.append(wrap_plain_text_basic(candidate, bold=bold))
+
+        cursor = end
+
+    return ''.join(parts)
+
+
+def inline_math_markup(formula_text: str, asset_ctx: Dict[str, Any], font_size: float = 12.0) -> str:
+    asset = render_formula_image(formula_text, asset_ctx, font_size=font_size, display=False)
+    if not asset:
+        fallback = extract_formula_text(formula_text)
+        return wrap_plain_text_basic(fallback)
+
+    return (
+        f'<img src="{html.escape(asset["path"], quote=True)}" '
+        f'width="{asset["width"]:.2f}" height="{asset["height"]:.2f}" valign="middle"/>'
+    )
+
+def mixed_inline_markup(text: str, asset_ctx: Optional[Dict[str, Any]] = None, bold: bool = False) -> str:
+    """
+    渲染 ReportLab Paragraph 可识别的行内富文本：
+    - 普通文本保留中英文字体切换
+    - **bold** / __bold__ 会转为真正的加粗样式
+    - $...$ / \\(...\\) / `公式` 会优先渲染为公式图片
+    - 非公式代码使用标准 Courier / Courier-Bold，避免依赖环境字体导致崩溃
+    """
+    value = text or ''
+    if not value:
+        return ''
+
+    if asset_ctx is None:
+        asset_ctx = create_formula_asset_context(tempfile.gettempdir())
+
+    parts = []
+    start = 0
+    for match in INLINE_MARKUP_TOKEN_RE.finditer(value):
+        if match.start() > start:
+            parts.append(wrap_plain_text_for_paragraph(value[start:match.start()], asset_ctx=asset_ctx, bold=bold))
+
+        token = match.group(0)
+        if token.startswith('**') and token.endswith('**'):
+            parts.append(mixed_inline_markup(token[2:-2], asset_ctx, bold=True))
+        elif token.startswith('__') and token.endswith('__'):
+            parts.append(mixed_inline_markup(token[2:-2], asset_ctx, bold=True))
+        elif token.startswith('$') and token.endswith('$'):
+            parts.append(inline_math_markup(token[1:-1], asset_ctx))
+        elif token.startswith(r'\(') and token.endswith(r'\)'):
+            parts.append(inline_math_markup(token[2:-2], asset_ctx))
+        elif token.startswith(r'\[') and token.endswith(r'\]'):
+            parts.append(inline_math_markup(token[2:-2], asset_ctx))
+        elif token.startswith('`') and token.endswith('`'):
+            inner = token[1:-1]
+            if should_auto_render_formula(inner):
+                parts.append(inline_math_markup(inner, asset_ctx))
+            else:
+                code_font = 'Courier-Bold' if bold else 'Courier'
+                parts.append(f'<font name="{code_font}">{html.escape(inner)}</font>')
+        start = match.end()
+
+    if start < len(value):
+        parts.append(wrap_plain_text_for_paragraph(value[start:], asset_ctx=asset_ctx, bold=bold))
+
+    return ''.join(parts)
+
 def formula_inline_markdown(formula_text: str, display: bool = False) -> str:
     expr = sanitize_formula_for_render(formula_text)
     if not expr:
@@ -1246,6 +1599,93 @@ def convert_inline_formula_markup_to_markdown(text: str) -> str:
     return ''.join(parts)
 
 
+def build_pdf_styles():
+    """构造 PDF 所有样式，标题字号明显大于正文，并启用 keepWithNext。"""
+    register_pdf_fonts()
+
+    title_style = ParagraphStyle(
+        "DocTitle",
+        fontName="STSong-Light",
+        fontSize=PDF_LAYOUT["title_font_size"],
+        leading=30,
+        alignment=TA_CENTER,
+        spaceAfter=16,
+        keepWithNext=True,
+    )
+
+    h2_style = ParagraphStyle(
+        "H2",
+        fontName="STSong-Light",
+        fontSize=PDF_LAYOUT["h2_font_size"],
+        leading=25,
+        alignment=TA_LEFT,
+        spaceBefore=PDF_LAYOUT["section_space_before"],
+        spaceAfter=PDF_LAYOUT["section_space_after"],
+        keepWithNext=True,
+    )
+
+    h3_style = ParagraphStyle(
+        "H3",
+        fontName="STSong-Light",
+        fontSize=PDF_LAYOUT["h3_font_size"],
+        leading=21,
+        alignment=TA_LEFT,
+        spaceBefore=10,
+        spaceAfter=6,
+        keepWithNext=True,
+    )
+
+    body_style = ParagraphStyle(
+        "Body",
+        fontName="STSong-Light",
+        fontSize=PDF_LAYOUT["body_font_size"],
+        leading=PDF_LAYOUT["body_leading"],
+        alignment=TA_JUSTIFY,
+        firstLineIndent=2 * PDF_LAYOUT["body_font_size"],
+        spaceAfter=PDF_LAYOUT["paragraph_space_after"],
+    )
+
+    list_item_style = ParagraphStyle(
+        "ListItem",
+        parent=body_style,
+        firstLineIndent=0,
+        leftIndent=12,
+        spaceAfter=4,
+    )
+
+    caption_style = ParagraphStyle(
+        "Caption",
+        fontName="STSong-Light",
+        fontSize=PDF_LAYOUT["caption_font_size"],
+        leading=14,
+        alignment=TA_CENTER,
+        spaceBefore=2,
+        spaceAfter=8,
+    )
+
+    table_title_style = ParagraphStyle(
+        "TableTitle",
+        fontName="STSong-Light",
+        fontSize=11.0,
+        leading=16,
+        alignment=TA_CENTER,
+        spaceBefore=6,
+        spaceAfter=6,
+        keepWithNext=True,
+    )
+
+    return {
+        "title": title_style,
+        "h2": h2_style,
+        "h3": h3_style,
+        "body": body_style,
+        "list_item": list_item_style,
+        "caption": caption_style,
+        "table_title": table_title_style,
+    }
+
+
+# ==========================================
 # 模块 10：Markdown 自定义块解析
 # ==========================================
 def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
@@ -1461,6 +1901,21 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
     flush_paragraph()
     return blocks
 
+def parse_md_table(table_lines: List[str]) -> List[List[str]]:
+    """解析最常见的 Markdown 表格格式。"""
+    rows = []
+    for idx, line in enumerate(table_lines):
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if idx == 1 and all(re.fullmatch(r'[:\- ]+', c) for c in cells):
+            continue
+        rows.append(cells)
+
+    if not rows:
+        return []
+
+    width = max(len(r) for r in rows)
+    return [r + [""] * (width - len(r)) for r in rows]
+
 
 def split_title_and_body(md_text: str) -> Tuple[str, str]:
     """从完整 markdown 中拆出文档主标题和正文。"""
@@ -1674,6 +2129,96 @@ def postprocess_generated_report_markdown(md_text: str) -> str:
 
     cleaned_blocks = deduplicate_report_image_blocks(cleaned_blocks)
     return serialize_report_blocks(cleaned_blocks, doc_title)
+def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
+    """根据图片宽高比选择更合适的显示尺寸。"""
+    iw, ih = img_reader.getSize()
+    page_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
+    ratio = iw / max(ih, 1)
+
+    if ratio > 1.8:
+        max_w = page_width * PDF_LAYOUT["wide_image_max_width_ratio"]
+        max_h = PDF_LAYOUT["table_image_max_height"]
+    elif ratio < 0.72:
+        max_w = page_width * PDF_LAYOUT["tall_image_max_width_ratio"]
+        max_h = PDF_LAYOUT["image_max_height"]
+    else:
+        max_w = page_width * PDF_LAYOUT["image_max_width_ratio"]
+        max_h = PDF_LAYOUT["image_max_height"]
+
+    scale = min(max_w / iw, max_h / ih, 1.0)
+    return iw * scale, ih * scale
+
+
+def image_flowable(
+    caption: str,
+    key: str,
+    images_dict: Dict[str, str],
+    styles,
+    asset_ctx: Dict[str, Any],
+    suppress_caption: bool = False,
+) -> Optional[KeepTogether]:
+    """构造图片块（图片 + 图注）。"""
+    matched_b64 = None
+    for img_name, b64 in images_dict.items():
+        if key == img_name or key in img_name or img_name in key:
+            matched_b64 = b64
+            break
+
+    display_caption = (caption or key).strip()
+    if not matched_b64:
+        if suppress_caption:
+            return KeepTogether([Spacer(1, 4)])
+        return KeepTogether([
+            Paragraph(mixed_inline_markup(f"[未匹配到图片] {display_caption}", asset_ctx), styles["caption"]),
+            Spacer(1, 4),
+        ])
+
+    try:
+        img_bytes = BytesIO(base64.b64decode(matched_b64))
+        reader = ImageReader(img_bytes)
+        w, h = classify_image_size(reader)
+        rl_img = RLImage(img_bytes, width=w, height=h)
+
+        items = [Spacer(1, 4), rl_img]
+        if display_caption and not suppress_caption:
+            items.append(Paragraph(mixed_inline_markup(display_caption, asset_ctx), styles["caption"]))
+        items.append(Spacer(1, 4))
+        return KeepTogether(items)
+    except Exception:
+        if suppress_caption:
+            return KeepTogether([Spacer(1, 4)])
+        return KeepTogether([
+            Paragraph(mixed_inline_markup(f"[图片加载失败] {display_caption}", asset_ctx), styles["caption"]),
+            Spacer(1, 4),
+        ])
+
+
+def markdown_table_flowable(table_lines: List[str], styles, asset_ctx: Dict[str, Any]):
+    """构造 Markdown 表格的 Flowable。"""
+    data = parse_md_table(table_lines)
+    if not data:
+        return None
+
+    usable_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
+    cols = max(len(r) for r in data)
+    col_width = usable_width / max(cols, 1)
+
+    wrapped = []
+    for row in data:
+        wrapped.append([Paragraph(mixed_inline_markup(cell, asset_ctx), styles["body"]) for cell in row])
+
+    tbl = Table(wrapped, colWidths=[col_width] * cols, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return tbl
+
 
 def captions_equivalent(left: str, right: str) -> bool:
     norm_left = normalize_caption_core_text(left) or normalize_compare_text(left)
@@ -1682,6 +2227,188 @@ def captions_equivalent(left: str, right: str) -> bool:
         return False
     return norm_left == norm_right or norm_left in norm_right or norm_right in norm_left
 
+
+def math_block_flowable(formula_text: str, asset_ctx: Dict[str, Any]) -> Optional[KeepTogether]:
+    """将块级公式渲染为独立图片，避免在 PDF 中显示为代码或乱码。"""
+    asset = render_formula_image(formula_text, asset_ctx, font_size=14.5, display=True)
+    if not asset:
+        fallback_text = extract_formula_text(formula_text)
+        if not fallback_text:
+            return None
+        fallback_style = ParagraphStyle(
+            'MathFallback',
+            fontName='STSong-Light',
+            fontSize=11.5,
+            leading=16,
+            alignment=TA_CENTER,
+            spaceBefore=4,
+            spaceAfter=8,
+        )
+        return KeepTogether([
+            Paragraph(html.escape(fallback_text), fallback_style),
+            Spacer(1, 6),
+        ])
+
+    max_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
+    width = asset["width"]
+    height = asset["height"]
+    if width > max_width * 0.92:
+        scale = (max_width * 0.92) / width
+        width *= scale
+        height *= scale
+
+    eq_img = RLImage(asset["path"], width=width, height=height)
+    eq_img.hAlign = 'CENTER'
+    return KeepTogether([
+        Spacer(1, 4),
+        eq_img,
+        Spacer(1, 8),
+    ])
+
+def build_story_from_markdown(md_text: str, images_dict: Dict[str, str], asset_ctx: Dict[str, Any]) -> List:
+    """
+    将最终 markdown 报告转换为 ReportLab story。
+
+    关键处理：
+    - 标题使用专门样式，不与正文同字号。
+    - 标题 keepWithNext，尽量避免标题掉到页末单独一行。
+    - 自定义块解析器确保段落按空行正确分段。
+    - 行内 bold / 公式 / 代码会在 PDF 中被正确渲染。
+    - 表题与图表 caption 做去重，避免重复显示。
+    """
+    styles = build_pdf_styles()
+    doc_title, body = split_title_and_body(md_text)
+    blocks = split_markdown_blocks(body)
+
+    story = [
+        Paragraph(mixed_inline_markup(doc_title, asset_ctx), styles["title"]),
+        Spacer(1, 8),
+    ]
+
+    pending_table_title: Optional[str] = None
+
+    def emit_pending_table_title():
+        nonlocal pending_table_title
+        if pending_table_title:
+            story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
+            pending_table_title = None
+
+    for block_type, payload in blocks:
+        if block_type == "h2":
+            emit_pending_table_title()
+            story.append(Paragraph(mixed_inline_markup(str(payload), asset_ctx), styles["h2"]))
+
+        elif block_type == "h3":
+            emit_pending_table_title()
+            story.append(Paragraph(mixed_inline_markup(str(payload), asset_ctx), styles["h3"]))
+
+        elif block_type == "table_title":
+            pending_table_title = str(payload)
+
+        elif block_type == "paragraph":
+            paragraph_text = str(payload)
+            if pending_table_title and captions_equivalent(paragraph_text, pending_table_title):
+                continue
+            story.append(Paragraph(mixed_inline_markup(paragraph_text, asset_ctx), styles["body"]))
+
+        elif block_type == "list_item":
+            emit_pending_table_title()
+            story.append(Paragraph(mixed_inline_markup(str(payload), asset_ctx), styles["list_item"]))
+
+        elif block_type == "math_block":
+            emit_pending_table_title()
+            formula_block = math_block_flowable(str(payload), asset_ctx)
+            if formula_block is not None:
+                story.append(formula_block)
+
+        elif block_type == "image":
+            caption, key = payload
+            suppress_caption = False
+            if pending_table_title:
+                story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
+                suppress_caption = True
+                pending_table_title = None
+            img_block = image_flowable(
+                caption=caption,
+                key=key,
+                images_dict=images_dict,
+                styles=styles,
+                asset_ctx=asset_ctx,
+                suppress_caption=suppress_caption,
+            )
+            if img_block:
+                story.append(img_block)
+
+        elif block_type == "md_table":
+            if pending_table_title:
+                story.append(Paragraph(mixed_inline_markup(pending_table_title, asset_ctx), styles["table_title"]))
+                pending_table_title = None
+            tbl = markdown_table_flowable(payload, styles, asset_ctx)
+            if tbl is not None:
+                story.append(KeepTogether([tbl, Spacer(1, 6)]))
+
+    emit_pending_table_title()
+    return story
+
+
+# ==========================================
+# 模块 12：PDF 文档模板
+# ==========================================
+class StableDocTemplate(BaseDocTemplate):
+    """
+    自定义 DocTemplate：
+    使用单个 Frame 实现稳定分页，并加页码。
+    """
+    def __init__(self, filename, **kwargs):
+        super().__init__(filename, **kwargs)
+        frame = Frame(
+            self.leftMargin,
+            self.bottomMargin,
+            self.width,
+            self.height,
+            id="normal",
+            showBoundary=0,
+        )
+        template = PageTemplate(id="main", frames=[frame], onPage=self._draw_page_number)
+        self.addPageTemplates([template])
+
+    def _draw_page_number(self, canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Times-Roman", 9)
+        canvas.drawCentredString(A4[0] / 2.0, 8 * mm, f"{doc.page}")
+        canvas.restoreState()
+
+
+def build_pdf_bytes_from_markdown(md_text: str, images_dict: Dict[str, str]) -> bytes:
+    """
+    服务器端生成高清 PDF：
+    - 文字为真实矢量文本，不是截图
+    - 段落、标题、图片、表格按 story 排版
+    - 分页由 ReportLab 控制，避免 html2canvas 裁字
+    - 公式与加粗会在这一层被正确渲染
+    """
+    register_pdf_fonts()
+    buffer = BytesIO()
+
+    doc = StableDocTemplate(
+        buffer,
+        pagesize=PDF_LAYOUT["page_size"],
+        leftMargin=PDF_LAYOUT["margin_left"],
+        rightMargin=PDF_LAYOUT["margin_right"],
+        topMargin=PDF_LAYOUT["margin_top"],
+        bottomMargin=PDF_LAYOUT["margin_bottom"],
+        title="论文全维度深度透视报告",
+        author="AI 论文检索 Agent",
+    )
+
+    with tempfile.TemporaryDirectory(prefix='paper_report_formula_') as formula_dir:
+        asset_ctx = create_formula_asset_context(formula_dir)
+        story = build_story_from_markdown(md_text, images_dict, asset_ctx)
+        doc.build(story)
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
 
 # ==========================================
 # 模块 13：用户账户与历史报告持久化
@@ -2526,6 +3253,7 @@ def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
     return value[: max_len - 1] + "…"
 
 
+
 def format_report_history_label(meta: Dict[str, Any]) -> str:
     if not meta:
         return "当前工作区"
@@ -2538,6 +3266,7 @@ def format_report_history_label(meta: Dict[str, Any]) -> str:
         return f"{short_name}｜解析失败"
     timestamp = (meta.get("updated_at") or meta.get("created_at") or "")[:16]
     return f"{short_name}｜{timestamp}" if timestamp else short_name
+
 
 
 def render_auth_ui():
@@ -2581,6 +3310,7 @@ def render_auth_ui():
     st.stop()
 
 
+
 def render_history_sidebar(username: str):
     history = load_user_report_index(username)
     selector_key = get_history_selector_key(username)
@@ -2617,6 +3347,7 @@ def render_history_sidebar(username: str):
 def get_pdf_cache_key(pdf_bytes: bytes) -> str:
     """为每篇论文生成稳定缓存键，支持多文件分别缓存。"""
     return hashlib.sha256(ANALYSIS_CACHE_VERSION.encode('utf-8') + pdf_bytes).hexdigest()
+
 
 
 def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
@@ -2701,6 +3432,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
     }
 
 
+
 def get_or_create_analysis_result(pdf_bytes: bytes, source_name: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
     """读取、提交或轮询单篇论文分析结果。"""
     cache_key = get_pdf_cache_key(pdf_bytes)
@@ -2750,6 +3482,14 @@ def get_or_create_analysis_result(pdf_bytes: bytes, source_name: str) -> Tuple[s
         return cache_key, None, "failed"
 
 
+
+def build_export_filename(source_name: str, suffix: str) -> str:
+    base_name = re.sub(r'(?i)\.pdf$', '', (source_name or '').strip())
+    base_name = re.sub(r'[\/:*?"<>|]+', '_', base_name).strip() or '论文'
+    return f"{base_name}{suffix}"
+
+
+
 def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
     entries: List[Tuple[str, bytes]] = []
 
@@ -2788,6 +3528,7 @@ def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
     return entries
 
 
+
 def render_single_analysis_result(
     analysis_result: Dict[str, Any],
     cache_key: str,
@@ -2801,6 +3542,18 @@ def render_single_analysis_result(
     display_report_md = prepare_report_markdown_for_display(analysis_result.get("main_report", ""))
     st.success(status_text)
     render_report_with_images(display_report_md, analysis_result["images"])
+
+    st.divider()
+    st.markdown("### 导出")
+    st.download_button(
+        label="下载报告原文（Markdown）",
+        data=display_report_md,
+        file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
+        mime="text/markdown",
+        use_container_width=True,
+        key=f"download_md_{cache_key}",
+    )
+
 
 
 def render_saved_history_report(username: str, report_id: str):
@@ -2841,6 +3594,7 @@ def render_saved_history_report(username: str, report_id: str):
     )
 
 
+
 def render_batch_status_overview(batch_rows: List[Dict[str, Any]]):
     st.markdown("### 批量解析进度")
     for row in batch_rows:
@@ -2858,6 +3612,7 @@ def render_batch_status_overview(batch_rows: List[Dict[str, Any]]):
             icon = "❌"
             text = progress_text or "解析失败"
         st.markdown(f"**{icon} 第 {idx} 篇《{source_name}》：** {text}")
+
 
 
 def render_analysis_ui(pdf_inputs):
