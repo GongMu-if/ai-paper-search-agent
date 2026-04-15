@@ -4,10 +4,8 @@
 import re
 import os
 import time
-import html
 import base64
 import hashlib
-import tempfile
 import unicodedata
 import json
 from io import BytesIO
@@ -17,7 +15,6 @@ import requests
 import streamlit as st
 from openai import OpenAI
 from streamlit_autorefresh import st_autorefresh
-
 st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout="wide")
 
 
@@ -47,7 +44,6 @@ CORE_SECTION_SPECS = [
     "## 6. 局限性与未解决问题",
 ]
 RESEARCH_SECTION_SPEC = "## 7. 面向后续研究的可执行创新路线"
-
 
 # ==========================================
 # 模块 3：核心 Prompt
@@ -626,8 +622,9 @@ def normalize_report_markdown(md_text: str) -> str:
 def get_adaptive_web_image_width(image_bytes: bytes) -> Optional[int]:
     """网页报告图片按原始像素自适应显示：小图不放大，大图按类型设上限。"""
     try:
-        reader = ImageReader(BytesIO(image_bytes))
-        iw, ih = reader.getSize()
+        from PIL import Image
+        with Image.open(BytesIO(image_bytes)) as img:
+            iw, ih = img.size
     except Exception:
         return None
 
@@ -954,9 +951,6 @@ def generate_full_report(md_content: str, text_report: str, vision_summaries: st
     return report
 
 
-# ==========================================
-# 模块 9：PDF 字体与样式
-# ==========================================
 TABLE_TITLE_LINE_RE = re.compile(
     r'^(?:表|table)\s*(?:\d+|[IVXLCDM]+|[一二三四五六七八九十百千万]+)(?:\s*[：:.-]|(?:\s+[-–—]\s+)|\s+).+',
     flags=re.I,
@@ -1223,7 +1217,6 @@ def normalize_math_unicode_to_latex(text: str) -> str:
     for raw, latex in GREEK_LATEX_MAP.items():
         value = value.replace(raw, latex)
     return value
-
 
 
 def is_list_enumerator_text(text: str) -> bool:
@@ -2118,7 +2111,6 @@ def deduplicate_report_image_blocks(blocks: List[Tuple[str, object]]) -> List[Tu
     return deduped
 
 
-
 REPORT_IMAGE_LINE_RE = re.compile(r'^!\[(?P<caption>.*?)\]\((?P<key>.*?)\)\s*$')
 REPORT_FIG_TABLE_LABEL_RE = re.compile(r'(图|表)\s*([0-9一二三四五六七八九十百千万]+)')
 REPORT_EN_LABEL_RE = re.compile(r'\b(Figure|Fig\.?|Table)\s*([0-9]+)\b', flags=re.I)
@@ -2479,95 +2471,6 @@ def postprocess_generated_report_markdown(
     cleaned_blocks = deduplicate_report_image_blocks(cleaned_blocks)
     serialized = serialize_report_blocks(cleaned_blocks, doc_title)
     return reconcile_report_figure_table_references(serialized, image_ids=image_ids, vision_summaries=vision_summaries)
-def classify_image_size(img_reader: ImageReader) -> Tuple[float, float]:
-    """根据图片宽高比选择更合适的显示尺寸。"""
-    iw, ih = img_reader.getSize()
-    page_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
-    ratio = iw / max(ih, 1)
-
-    if ratio > 1.8:
-        max_w = page_width * PDF_LAYOUT["wide_image_max_width_ratio"]
-        max_h = PDF_LAYOUT["table_image_max_height"]
-    elif ratio < 0.72:
-        max_w = page_width * PDF_LAYOUT["tall_image_max_width_ratio"]
-        max_h = PDF_LAYOUT["image_max_height"]
-    else:
-        max_w = page_width * PDF_LAYOUT["image_max_width_ratio"]
-        max_h = PDF_LAYOUT["image_max_height"]
-
-    scale = min(max_w / iw, max_h / ih, 1.0)
-    return iw * scale, ih * scale
-
-
-def image_flowable(
-    caption: str,
-    key: str,
-    images_dict: Dict[str, str],
-    styles,
-    asset_ctx: Dict[str, Any],
-    suppress_caption: bool = False,
-) -> Optional[KeepTogether]:
-    """构造图片块（图片 + 图注）。"""
-    matched_b64 = None
-    for img_name, b64 in images_dict.items():
-        if key == img_name or key in img_name or img_name in key:
-            matched_b64 = b64
-            break
-
-    display_caption = (caption or key).strip()
-    if not matched_b64:
-        if suppress_caption:
-            return KeepTogether([Spacer(1, 4)])
-        return KeepTogether([
-            Paragraph(mixed_inline_markup(f"[未匹配到图片] {display_caption}", asset_ctx), styles["caption"]),
-            Spacer(1, 4),
-        ])
-
-    try:
-        img_bytes = BytesIO(base64.b64decode(matched_b64))
-        reader = ImageReader(img_bytes)
-        w, h = classify_image_size(reader)
-        rl_img = RLImage(img_bytes, width=w, height=h)
-
-        items = [Spacer(1, 4), rl_img]
-        if display_caption and not suppress_caption:
-            items.append(Paragraph(mixed_inline_markup(display_caption, asset_ctx), styles["caption"]))
-        items.append(Spacer(1, 4))
-        return KeepTogether(items)
-    except Exception:
-        if suppress_caption:
-            return KeepTogether([Spacer(1, 4)])
-        return KeepTogether([
-            Paragraph(mixed_inline_markup(f"[图片加载失败] {display_caption}", asset_ctx), styles["caption"]),
-            Spacer(1, 4),
-        ])
-
-
-def markdown_table_flowable(table_lines: List[str], styles, asset_ctx: Dict[str, Any]):
-    """构造 Markdown 表格的 Flowable。"""
-    data = parse_md_table(table_lines)
-    if not data:
-        return None
-
-    usable_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
-    cols = max(len(r) for r in data)
-    col_width = usable_width / max(cols, 1)
-
-    wrapped = []
-    for row in data:
-        wrapped.append([Paragraph(mixed_inline_markup(cell, asset_ctx), styles["body"]) for cell in row])
-
-    tbl = Table(wrapped, colWidths=[col_width] * cols, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    return tbl
 
 
 def captions_equivalent(left: str, right: str) -> bool:
@@ -2578,69 +2481,9 @@ def captions_equivalent(left: str, right: str) -> bool:
     return norm_left == norm_right or norm_left in norm_right or norm_right in norm_left
 
 
-def math_block_flowable(formula_text: str, asset_ctx: Dict[str, Any]) -> Optional[KeepTogether]:
-    """将块级公式渲染为独立图片，避免在 PDF 中显示为代码或乱码。"""
-    asset = render_formula_image(formula_text, asset_ctx, font_size=14.5, display=True)
-    if not asset:
-        fallback_text = extract_formula_text(formula_text)
-        if not fallback_text:
-            return None
-        fallback_style = ParagraphStyle(
-            'MathFallback',
-            fontName='STSong-Light',
-            fontSize=11.5,
-            leading=16,
-            alignment=TA_CENTER,
-            spaceBefore=4,
-            spaceAfter=8,
-        )
-        return KeepTogether([
-            Paragraph(html.escape(fallback_text), fallback_style),
-            Spacer(1, 6),
-        ])
-
-    max_width = A4[0] - PDF_LAYOUT["margin_left"] - PDF_LAYOUT["margin_right"]
-    width = asset["width"]
-    height = asset["height"]
-    if width > max_width * 0.92:
-        scale = (max_width * 0.92) / width
-        width *= scale
-        height *= scale
-
-    eq_img = RLImage(asset["path"], width=width, height=height)
-    eq_img.hAlign = 'CENTER'
-    return KeepTogether([
-        Spacer(1, 4),
-        eq_img,
-        Spacer(1, 8),
-    ])
-
 # ==========================================
 # 模块 12：PDF 文档模板
 # ==========================================
-class StableDocTemplate(BaseDocTemplate):
-    """
-    自定义 DocTemplate：
-    使用单个 Frame 实现稳定分页，并加页码。
-    """
-    def __init__(self, filename, **kwargs):
-        super().__init__(filename, **kwargs)
-        frame = Frame(
-            self.leftMargin,
-            self.bottomMargin,
-            self.width,
-            self.height,
-            id="normal",
-            showBoundary=0,
-        )
-        template = PageTemplate(id="main", frames=[frame], onPage=self._draw_page_number)
-        self.addPageTemplates([template])
-
-    def _draw_page_number(self, canvas, doc):
-        canvas.saveState()
-        canvas.setFont("Times-Roman", 9)
-        canvas.drawCentredString(A4[0] / 2.0, 8 * mm, f"{doc.page}")
-        canvas.restoreState()
 
 
 # ==========================================
@@ -3486,7 +3329,6 @@ def shorten_sidebar_label(text: str, max_len: int = 20) -> str:
     return value[: max_len - 1] + "…"
 
 
-
 def format_report_history_label(meta: Dict[str, Any]) -> str:
     if not meta:
         return "当前工作区"
@@ -3499,7 +3341,6 @@ def format_report_history_label(meta: Dict[str, Any]) -> str:
         return f"{short_name}｜解析失败"
     timestamp = (meta.get("updated_at") or meta.get("created_at") or "")[:16]
     return f"{short_name}｜{timestamp}" if timestamp else short_name
-
 
 
 def render_auth_ui():
@@ -3543,7 +3384,6 @@ def render_auth_ui():
     st.stop()
 
 
-
 def render_history_sidebar(username: str):
     history = load_user_report_index(username)
     selector_key = get_history_selector_key(username)
@@ -3580,7 +3420,6 @@ def render_history_sidebar(username: str):
 def get_pdf_cache_key(pdf_bytes: bytes) -> str:
     """为每篇论文生成稳定缓存键，支持多文件分别缓存。"""
     return hashlib.sha256(ANALYSIS_CACHE_VERSION.encode('utf-8') + pdf_bytes).hexdigest()
-
 
 
 def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
@@ -3666,7 +3505,6 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
     }
 
 
-
 def get_or_create_analysis_result(pdf_bytes: bytes, source_name: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
     """读取、提交或轮询单篇论文分析结果。"""
     cache_key = get_pdf_cache_key(pdf_bytes)
@@ -3716,12 +3554,10 @@ def get_or_create_analysis_result(pdf_bytes: bytes, source_name: str) -> Tuple[s
         return cache_key, None, "failed"
 
 
-
 def build_export_filename(source_name: str, suffix: str) -> str:
     base_name = re.sub(r'(?i)\.pdf$', '', (source_name or '').strip())
     base_name = re.sub(r'[\/:*?"<>|]+', '_', base_name).strip() or '论文'
     return f"{base_name}{suffix}"
-
 
 
 def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
@@ -3762,7 +3598,6 @@ def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
     return entries
 
 
-
 def render_single_analysis_result(
     analysis_result: Dict[str, Any],
     cache_key: str,
@@ -3783,6 +3618,14 @@ def render_single_analysis_result(
 
     st.divider()
     st.markdown("### 导出")
+    st.download_button(
+        label="下载报告原文（Markdown）",
+        data=display_report_md,
+        file_name=build_export_filename(source_name, "_论文全维度深度透视报告.md"),
+        mime="text/markdown",
+        use_container_width=True,
+        key=f"download_md_{cache_key}",
+    )
 
 
 def render_saved_history_report(username: str, report_id: str):
@@ -3823,7 +3666,6 @@ def render_saved_history_report(username: str, report_id: str):
     )
 
 
-
 def render_batch_status_overview(batch_rows: List[Dict[str, Any]]):
     st.markdown("### 批量解析进度")
     for row in batch_rows:
@@ -3841,7 +3683,6 @@ def render_batch_status_overview(batch_rows: List[Dict[str, Any]]):
             icon = "❌"
             text = progress_text or "解析失败"
         st.markdown(f"**{icon} 第 {idx} 篇《{source_name}》：** {text}")
-
 
 
 def render_analysis_ui(pdf_inputs):
