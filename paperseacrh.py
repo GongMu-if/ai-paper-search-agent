@@ -759,7 +759,7 @@ class LLMClient:
     - 自动重试
     - 显式设置 max_tokens，降低长响应被默认截断的概率
     """
-    def __init__(self, sys_prompt, model="deepseek-chat", api_key="", base_url="", max_tokens=10000):
+    def __init__(self, sys_prompt, model="deepseek-chat", api_key="", base_url="", max_tokens=8000):
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.sys_prompt = sys_prompt
@@ -889,21 +889,21 @@ def generate_full_report(md_content: str, text_report: str, vision_summaries: st
         sys_prompt=MAIN_AGENT_PROMPT,
         api_key=DEEPSEEK_API_KEY,
         base_url=DEEPSEEK_BASE_URL,
-        max_tokens=10000,
+        max_tokens=8000,
     )
 
     research_agent = LLMClient(
         sys_prompt=RESEARCH_AGENT_PROMPT,
         api_key=DEEPSEEK_API_KEY,
         base_url=DEEPSEEK_BASE_URL,
-        max_tokens=10000,
+        max_tokens=8000,
     )
 
     auditor = LLMClient(
         sys_prompt=REPORT_AUDITOR_PROMPT,
         api_key=DEEPSEEK_API_KEY,
         base_url=DEEPSEEK_BASE_URL,
-        max_tokens=7000,
+        max_tokens=8000,
     )
 
     sections = ["# 论文全维度深度透视报告"]
@@ -4066,7 +4066,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
             sys_prompt=TEXT_AGENT_PROMPT,
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
-            max_tokens=10000,
+            max_tokens=8000,
         )
         text_report = text_agent.generate([f"请详尽解析此论文：\n{md_content}"])
 
@@ -4078,7 +4078,7 @@ def build_analysis_result(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
                 model="qwen3.6-plus-2026-04-02",
                 api_key=QWEN_API_KEY,
                 base_url=QWEN_BASE_URL,
-                max_tokens=6000,
+                max_tokens=8000,
             )
             cards = []
             for name, b64 in ordered_images:
@@ -4561,7 +4561,7 @@ if start_button:
             model="deepseek-chat",
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
-            max_tokens=10000,
+            max_tokens=8000,
         )
         st.session_state.prompt_history = [f"用户请求: {user_topic}"]
         st.session_state.app_state = "RUNNING"
