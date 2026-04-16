@@ -1911,6 +1911,22 @@ def _execute_bootstrap_statements(db_url: str):
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_analysis_reports_user_id ON public.analysis_reports(user_id)",
+        """
+        CREATE TABLE IF NOT EXISTS public.analysis_agent_logs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            job_id UUID NOT NULL REFERENCES public.analysis_jobs(id) ON DELETE CASCADE,
+            step_no INTEGER NOT NULL,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            reason TEXT,
+            instructions TEXT,
+            expected_output TEXT,
+            status TEXT NOT NULL DEFAULT 'finished',
+            details JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_analysis_agent_logs_job_step ON public.analysis_agent_logs(job_id, step_no)",
     ]
 
     conn = _open_db_connection(db_url)
@@ -2545,6 +2561,84 @@ def submit_analysis_job_to_modal(job_id: str, source_name: str, cache_key: str, 
         raise RuntimeError(payload.get("message") or "后台任务未被接受。")
 
 
+@st.cache_data(show_spinner=False, ttl=5)
+def _load_agent_logs_cached(username: str, report_id: str) -> List[Dict[str, Any]]:
+    """从数据库读取指定任务的多 Agent 动作轨迹。"""
+    try:
+        return db_fetch_all(
+            """
+            SELECT
+                l.step_no,
+                l.actor,
+                l.action,
+                l.reason,
+                l.instructions,
+                l.expected_output,
+                l.status,
+                l.details,
+                l.created_at
+            FROM public.analysis_agent_logs l
+            JOIN public.analysis_jobs j ON j.id = l.job_id
+            JOIN public.users u ON u.id = j.user_id
+            WHERE LOWER(u.username) = LOWER(%s)
+              AND j.id = %s
+            ORDER BY l.step_no ASC, l.created_at ASC
+            """,
+            (username, report_id),
+        )
+    except Exception:
+        return []
+
+
+def load_agent_logs(username: str, report_id: str) -> List[Dict[str, Any]]:
+    """读取多 Agent 动作轨迹；用户名或任务为空时返回空列表。"""
+    username = normalize_username(username)
+    report_id = (report_id or "").strip()
+    if not username or not report_id:
+        return []
+    ensure_app_storage()
+    return _load_agent_logs_cached(username, report_id)
+
+
+def format_agent_log_details(details: Any) -> str:
+    """把日志 details 字段格式化为可读 JSON 文本。"""
+    data = normalize_json_field(details, {}) if not isinstance(details, dict) else details
+    if not data:
+        return ""
+    try:
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(data)
+
+
+def render_agent_action_logs(username: str, report_id: str, expanded: bool = False):
+    """在前端展示完整的多 Agent / 工具动作轨迹。"""
+    logs = load_agent_logs(username, report_id)
+    if not logs:
+        st.caption("暂无完整 Agent 动作轨迹。新任务启动后会逐步写入这里。")
+        return
+
+    st.markdown("#### 多 Agent 动作轨迹")
+    with st.expander("查看完整动作轨迹", expanded=expanded):
+        for row in logs:
+            step_no = row.get("step_no") or ""
+            actor = row.get("actor") or "未知执行者"
+            action = row.get("action") or "未知动作"
+            status = row.get("status") or ""
+            created_at = format_db_timestamp(row.get("created_at"))
+            st.markdown(f"**{step_no}. {actor}｜{action}｜{status}**  {created_at}")
+            if row.get("reason"):
+                st.markdown(f"- **原因：** {row.get('reason')}")
+            if row.get("instructions"):
+                st.markdown(f"- **指令：** {row.get('instructions')}")
+            if row.get("expected_output"):
+                st.markdown(f"- **预期输出：** {row.get('expected_output')}")
+            details_text = format_agent_log_details(row.get("details"))
+            if details_text:
+                st.code(details_text, language="json")
+            st.divider()
+
+
 def render_pending_job_notice(job_meta: Dict[str, Any], show_title: bool = False):
     source_name = job_meta.get("source_name") or job_meta.get("report_title") or "未命名论文"
     if show_title:
@@ -2558,6 +2652,9 @@ def render_pending_job_notice(job_meta: Dict[str, Any], show_title: bool = False
 
     display_text = progress_text or "后台任务正在运行中。"
     st.info(f"《{source_name}》当前状态：{display_text}")
+    report_id = job_meta.get("report_id") or job_meta.get("job_id") or ""
+    if report_id:
+        render_agent_action_logs(st.session_state.get("current_user", ""), report_id, expanded=False)
     st.caption("该任务已提交到后台 Modal。您现在可以直接关闭页面，稍后重新登录查看状态或结果。")
 
 
@@ -2902,6 +2999,7 @@ def render_saved_history_report(username: str, report_id: str):
     timestamp = meta.get("updated_at") or meta.get("created_at") or "未知时间"
 
     st.info(f"已载入历史报告：{source_name}（保存时间：{timestamp}）。")
+    render_agent_action_logs(username, report_id, expanded=False)
     render_single_analysis_result(
         analysis_result=analysis_result,
         cache_key=meta.get("cache_key", report_id),
@@ -2972,6 +3070,7 @@ def render_analysis_ui(pdf_inputs):
         else:
             if job_meta:
                 row.update({
+                    "report_id": job_meta.get("report_id") or job_meta.get("job_id") or "",
                     "status": job_meta.get("status") or "processing",
                     "progress_text": job_meta.get("progress_text") or row["progress_text"],
                 })
