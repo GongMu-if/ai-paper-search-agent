@@ -1833,7 +1833,7 @@ except Exception:
 SUPABASE_DB_URL = (st.secrets.get("SUPABASE_DB_URL", "") or "").strip()
 ASYNC_MODAL_API_URL = (st.secrets.get("ASYNC_MODAL_API_URL", "") or st.secrets.get("MODAL_JOB_API_URL", "") or "").strip()
 PASSWORD_HASH_ROUNDS = 120000
-JOB_STATUS_REFRESH_INTERVAL_MS = 4000
+JOB_STATUS_REFRESH_INTERVAL_MS = 300000
 DB_READ_CACHE_TTL_SECONDS = 6
 
 
@@ -3395,7 +3395,7 @@ elif st.session_state.app_state == "WAITING_FEEDBACK":
         if remaining_time <= 0:
             st.session_state.app_state = "COMPLETED"
             st.rerun()
-        st_autorefresh(interval=10000, key="feedback_timer")
+        st_autorefresh(interval=180000, key="feedback_timer")
         mins_left = int(remaining_time // 60)
         st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
 
