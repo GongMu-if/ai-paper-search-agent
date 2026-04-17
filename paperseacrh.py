@@ -1359,11 +1359,9 @@ def prepare_report_markdown_for_display(
     images_dict: Optional[Dict[str, str]] = None,
     vision_summaries: str = '',
 ) -> str:
-    # 后端已经根据 Director Agent 的动态 section_schema 完成章节生成与后处理。
-    # 前端不能再用旧的固定章节模板重排报告，否则会把动态标题章节误删。
-    normalized_sections = normalize_report_markdown(md_text)
-    image_ids = list((images_dict or {}).keys())
-    return postprocess_generated_report_markdown(normalized_sections, image_ids=image_ids, vision_summaries=vision_summaries)
+    # 后端已经根据 Director Agent 的动态 section_schema 完成章节生成与最终图表后处理。
+    # 前端只做最轻量的规范化，避免再次重排图表、再次改 caption、再次删补图片，导致显示结果与后端最终报告不一致。
+    return normalize_report_markdown(md_text)
 
 def convert_inline_formulas_in_table_line(line: str) -> str:
     stripped = (line or '').strip()
