@@ -330,6 +330,16 @@ SPECIAL_FORMULA_CHAR_MAP = {
     '⊆': r'\subseteq', '⊇': r'\supseteq', '∅': r'\emptyset',
     '∀': r'\forall', '∃': r'\exists',
 }
+
+LATEX_COMMAND_SPLIT_CANDIDATES = [
+    'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'theta', 'lambda', 'mu', 'sigma', 'omega',
+    'pi', 'eta', 'tau', 'phi', 'psi', 'rho', 'nu', 'kappa', 'xi',
+    'Delta', 'Gamma', 'Lambda', 'Sigma', 'Pi', 'Omega', 'Phi', 'Psi',
+    'partial', 'nabla', 'cdot', 'times', 'div', 'sum', 'prod', 'sqrt', 'hat', 'tilde', 'bar',
+]
+LATEX_COMMAND_SPLIT_RE = re.compile(
+    r'(\\(?:' + '|'.join(sorted(LATEX_COMMAND_SPLIT_CANDIDATES, key=len, reverse=True)) + r'))(?=[A-Za-zΑ-Ωα-ωℒμµ])'
+)
 MATH_OPERATOR_CHARS = ''.join([
     '⊙', '⊕', '⊗', '⊘', '⊖', '⊚', '⊛',
     '≤', '≥', '≠', '≈', '≃', '≅', '≡', '∼',
@@ -518,8 +528,34 @@ def repair_broken_formula_glyphs(text: str) -> str:
     return value
 
 
+
+def split_joined_latex_commands(text: str) -> str:
+    value = text or ''
+    return LATEX_COMMAND_SPLIT_RE.sub(r'\1 ', value)
+
+
+def normalize_broken_formula_plain_text(text: str) -> str:
+    value = text or ''
+    if not value:
+        return ''
+
+    value = value.replace('$$', ' ')
+    value = re.sub(r'\([A-Za-z]+)\$', lambda m: '\\' + m.group(1) + ' ', value)
+    value = re.sub(r'\$\([A-Za-z]+)', lambda m: ' \\' + m.group(1), value)
+    value = re.sub(
+        r'([A-Za-z0-9Α-Ωα-ωℒμµ{}\]\)])\$(?=[A-Za-z0-9Α-Ωα-ωℒμµ\{\[(])',
+        lambda m: m.group(1) + ' ',
+        value,
+    )
+    value = re.sub(r'(?<=[\A-Za-z0-9Α-Ωα-ωℒμµ{}\]\)])\$(?=\s|[，。；：,.;:）\]\)])', ' ', value)
+    value = split_joined_latex_commands(value)
+    value = re.sub(r'\s{2,}', ' ', value)
+    return value
+
+
 def normalize_math_unicode_to_latex(text: str) -> str:
     value = repair_broken_formula_glyphs(text)
+    value = split_joined_latex_commands(value)
     value = value.replace('（', '(').replace('）', ')').replace('，', ',').replace('：', ':')
     value = convert_unicode_scripts_to_tex(value)
     for raw, latex in SPECIAL_FORMULA_CHAR_MAP.items():
@@ -809,7 +845,9 @@ def sanitize_formula_for_render(text: str) -> str:
     if not expr:
         return ''
 
+    expr = normalize_broken_formula_plain_text(expr)
     expr = repair_broken_formula_glyphs(expr)
+    expr = split_joined_latex_commands(expr)
     expr = expr.replace('$', ' ')
     expr = normalize_formula_spacing(expr)
     expr = collapse_spaced_math_braces(expr)
@@ -959,7 +997,9 @@ def wrap_plain_text_for_markdown(text: str) -> str:
     if not text:
         return ''
 
-    working = collapse_spaced_math_braces(normalize_formula_spacing(text))
+    working = normalize_broken_formula_plain_text(text)
+    working = collapse_spaced_math_braces(normalize_formula_spacing(working))
+    working = split_joined_latex_commands(working)
     working = working.replace('$', ' ')
     parts: List[str] = []
     cursor = 0
@@ -1359,11 +1399,14 @@ def prepare_report_markdown_for_display(
     images_dict: Optional[Dict[str, str]] = None,
     vision_summaries: str = '',
 ) -> str:
-    # 恢复到之前这份前端的工作状态：前端显示前会执行既有的报告后处理。
-    # 这里只恢复这一处，不改动其他任何逻辑。
+    # 前端只做公式与块级轻量修复，避免再次改图、补图、重排图表顺序。
     normalized_sections = normalize_report_markdown(md_text)
-    image_ids = list((images_dict or {}).keys())
-    return postprocess_generated_report_markdown(normalized_sections, image_ids=image_ids, vision_summaries=vision_summaries)
+    try:
+        doc_title, body = split_title_and_body(normalized_sections)
+        blocks = split_markdown_blocks(body)
+        return serialize_report_blocks(blocks, doc_title)
+    except Exception:
+        return normalized_sections
 
 def convert_inline_formulas_in_table_line(line: str) -> str:
     stripped = (line or '').strip()
