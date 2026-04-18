@@ -1359,15 +1359,11 @@ def prepare_report_markdown_for_display(
     images_dict: Optional[Dict[str, str]] = None,
     vision_summaries: str = '',
 ) -> str:
-    # 仅恢复前端“公式显示修复”这一层，不再在前端二次改图、补图、重排编号。
-    # 也就是说：前端只做块级解析与公式/表格中的数学表达规范化；图表相关后处理仍完全以后端结果为准。
-    normalized = normalize_report_markdown(md_text)
-    try:
-        doc_title, body = split_title_and_body(normalized)
-        blocks = split_markdown_blocks(body)
-        return serialize_report_blocks(blocks, doc_title)
-    except Exception:
-        return normalized
+    # 恢复到之前这份前端的工作状态：前端显示前会执行既有的报告后处理。
+    # 这里只恢复这一处，不改动其他任何逻辑。
+    normalized_sections = normalize_report_markdown(md_text)
+    image_ids = list((images_dict or {}).keys())
+    return postprocess_generated_report_markdown(normalized_sections, image_ids=image_ids, vision_summaries=vision_summaries)
 
 def convert_inline_formulas_in_table_line(line: str) -> str:
     stripped = (line or '').strip()
