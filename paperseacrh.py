@@ -3110,7 +3110,16 @@ def render_comparative_section_summary(analysis_result: Dict[str, Any]):
     director_plan = agent_state.get("director_plan", {}) or {}
     comparative_pack = agent_state.get("comparative_memory_pack", {}) or {}
     selected_reports = comparative_pack.get("selected_reports", []) or []
-
+    judge_outputs = comparative_pack.get("problem_judge_outputs", []) or []
+    if judge_outputs:
+        st.markdown("**同问题审查 Agent 判定结果：**")
+        for idx, item in enumerate(judge_outputs, start=1):
+            title = item.get("paper_title") or item.get("report_id") or f"候选 {idx}"
+            flag = "通过" if item.get("same_problem") else "不通过"
+            conf = item.get("confidence") or "low"
+            reason = item.get("reason") or ""
+            st.markdown(f"{idx}. {title}｜{flag}｜置信度：{conf}｜理由：{reason}")
+            
     comparative_enabled = bool(director_plan.get("comparative_section_enabled")) or bool(comparative_pack.get("enabled"))
     comparative_context = str(director_plan.get("comparative_context") or "").strip()
 
