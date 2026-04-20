@@ -1319,6 +1319,7 @@ CURRENT_REPORT_SECTION_TITLES = [
     "关键模块逐层机制剖析",
     "实验设计、关键证据与论点验证",
     "局限性与未解决问题",
+    "同问题方法比较与综合分析",
     "面向后续研究的可执行创新路线",
 ]
 REMOVED_REPORT_SECTION_TITLES = {"复现要点与方法适用边界"}
@@ -1329,6 +1330,20 @@ def canonicalize_report_section_core(title: str) -> str:
     raw = re.sub(r'^#+\s*', '', raw)
     raw = re.sub(r'^\d+\s*[.．、:：\-]?\s*', '', raw)
     normalized = normalize_compare_text(raw)
+
+    alias_map = {
+        "同问题方法比较与综合分析": [
+            "同问题方法比较与综合分析",
+            "同问题论文比较与综合分析",
+            "同问题比较与综合分析",
+            "相关方法比较与综合分析",
+            "历史论文比较与综合分析",
+        ]
+    }
+
+    for canonical_title, aliases in alias_map.items():
+        if any(normalize_compare_text(alias) == normalized for alias in aliases):
+            return canonical_title
 
     for candidate in CURRENT_REPORT_SECTION_TITLES + list(REMOVED_REPORT_SECTION_TITLES):
         if normalize_compare_text(candidate) == normalized:
@@ -2983,6 +2998,38 @@ def collect_pdf_entries(pdf_inputs) -> List[Tuple[str, bytes]]:
 
     return entries
 
+def render_comparative_section_summary(analysis_result: Dict[str, Any]):
+    agent_state = analysis_result.get("agent_state", {}) or {}
+    director_plan = agent_state.get("director_plan", {}) or {}
+    comparative_pack = agent_state.get("comparative_memory_pack", {}) or {}
+    selected_reports = comparative_pack.get("selected_reports", []) or []
+
+    comparative_enabled = bool(director_plan.get("comparative_section_enabled")) or bool(comparative_pack.get("enabled"))
+    comparative_context = str(director_plan.get("comparative_context") or "").strip()
+
+    if not comparative_enabled and not selected_reports:
+        return
+
+    with st.expander("查看同问题比较章节来源", expanded=False):
+        if comparative_enabled:
+            st.success("本次报告已启用“同问题方法比较与综合分析”章节。")
+        else:
+            st.info("检测到同问题历史论文候选，但本次未正式启用比较章节。")
+
+        if selected_reports:
+            st.markdown("**参与候选的历史论文：**")
+            for idx, item in enumerate(selected_reports, start=1):
+                title = item.get("paper_title") or "未命名历史论文"
+                sim = item.get("report_similarity")
+                if sim is not None:
+                    st.markdown(f"{idx}. {title}（相似度：{float(sim):.3f}）")
+                else:
+                    st.markdown(f"{idx}. {title}")
+
+        if comparative_context:
+            st.markdown("**比较章节使用的摘要材料：**")
+            st.code(comparative_context[:4000], language="text")
+
 
 def render_single_analysis_result(
     analysis_result: Dict[str, Any],
@@ -2994,13 +3041,16 @@ def render_single_analysis_result(
     if show_paper_title:
         st.markdown(f"### {source_name}")
 
+    st.success(status_text)
+
+    render_comparative_section_summary(analysis_result)
+
     display_report_md = prepare_report_markdown_for_display(
         analysis_result.get("main_report", ""),
-        images_dict=analysis_result.get("images", {}),
-        vision_summaries=analysis_result.get("vision_summaries", ""),
+        images_dict=analysis_result.get("images", {}) or {},
+        vision_summaries=analysis_result.get("vision_summaries", "") or "",
     )
-    st.success(status_text)
-    render_report_with_images(display_report_md, analysis_result["images"])
+    render_report_with_images(display_report_md, analysis_result.get("images", {}) or {})
 
     st.divider()
     st.markdown("### 导出")
@@ -3012,7 +3062,6 @@ def render_single_analysis_result(
         use_container_width=True,
         key=f"download_md_{cache_key}",
     )
-
 
 def render_saved_history_report(username: str, report_id: str):
     job_meta = get_user_job_state(username, report_id)
