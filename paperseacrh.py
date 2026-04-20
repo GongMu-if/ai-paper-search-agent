@@ -1624,9 +1624,17 @@ def replace_report_label_aliases(text: str, aliases: Dict[str, str]) -> str:
     for old_label, new_label in sorted((aliases or {}).items(), key=lambda item: -len(item[0])):
         if not old_label or not new_label or old_label == new_label:
             continue
-        kind, number = old_label[0], re.escape(old_label[1:])
-        pattern = re.compile(rf'{kind}\s*{number}(?![0-9一二三四五六七八九十百千万])')
-        value = pattern.sub(new_label, value)
+
+        kind = old_label[0]
+        number = re.escape(old_label[1:])
+
+        if kind == '表':
+            value = re.sub(rf'\b(?:Table)\s*{number}\b', new_label, value, flags=re.I)
+            value = re.sub(rf'表\s*{number}(?![0-9一二三四五六七八九十百千万])', new_label, value)
+        else:
+            value = re.sub(rf'\b(?:Figure|Fig\.?)\s*{number}\b', new_label, value, flags=re.I)
+            value = re.sub(rf'图\s*{number}(?![0-9一二三四五六七八九十百千万])', new_label, value)
+
     return value
 
 
@@ -1738,6 +1746,43 @@ def build_report_image_markdown(label: str, key: str, label_to_caption: Dict[str
     caption = f"{label}：{caption_core}" if caption_core else label
     return f"![{caption}]({key})"
 
+def build_report_order_maps_from_image_blocks(
+    filtered_lines: List[str],
+    key_to_label: Dict[str, str],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    按最终报告里图片块的真实出现顺序重新连续编号。
+    返回：
+    1. old_label -> new_label
+    2. norm_key -> new_label
+    """
+    label_aliases: Dict[str, str] = {}
+    key_new_labels: Dict[str, str] = {}
+    counters = {'图': 1, '表': 1}
+
+    for line in filtered_lines:
+        match = REPORT_IMAGE_LINE_RE.match(line.strip())
+        if not match:
+            continue
+
+        key = match.group('key').strip()
+        norm_key = normalize_report_image_key(key)
+        old_label = key_to_label.get(norm_key)
+
+        if not old_label:
+            caption_label = extract_report_label(match.group('caption').strip())
+            old_label = normalize_report_label(*caption_label) if caption_label else ''
+
+        kind = old_label[0] if old_label and old_label[0] in counters else '图'
+        new_label = normalize_report_label(kind, str(counters[kind]))
+        counters[kind] += 1
+
+        key_new_labels[norm_key] = new_label
+        if old_label and old_label not in label_aliases:
+            label_aliases[old_label] = new_label
+
+    return label_aliases, key_new_labels
+
 
 def reconcile_report_figure_table_references(
     report_md: str,
@@ -1749,7 +1794,11 @@ def reconcile_report_figure_table_references(
         return text
 
     available_keys = list(image_ids or [])
-    key_to_label, label_to_key, label_to_caption, aliases = build_report_asset_maps(text, available_keys, vision_summaries)
+    key_to_label, label_to_key, label_to_caption, aliases = build_report_asset_maps(
+        text,
+        available_keys,
+        vision_summaries,
+    )
     known_keys = available_keys + list(label_to_key.values())
 
     cleaned_lines: List[str] = []
@@ -1794,7 +1843,15 @@ def reconcile_report_figure_table_references(
         else:
             continue
 
-    missing_labels = [label for label in sorted(cited_labels, key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 10**9, x)) if label in label_to_key and label not in inserted_labels]
+    missing_labels = [
+        label
+        for label in sorted(
+            cited_labels,
+            key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 10**9, x)
+        )
+        if label in label_to_key and label not in inserted_labels
+    ]
+
     for label in missing_labels:
         image_line = build_report_image_markdown(label, label_to_key[label], label_to_caption)
         inserted = False
@@ -1810,7 +1867,39 @@ def reconcile_report_figure_table_references(
             filtered_lines.append('')
             filtered_lines.append(image_line)
 
-    return normalize_report_markdown('\n'.join(filtered_lines))
+    # 关键新增：
+    # 按最终图片块出现顺序重新编号，并把正文里的“图4/表4”同步改成新的“图2/表2”。
+    order_aliases, key_new_labels = build_report_order_maps_from_image_blocks(filtered_lines, key_to_label)
+
+    final_lines: List[str] = []
+    for line in filtered_lines:
+        stripped = line.strip()
+        img_match = REPORT_IMAGE_LINE_RE.match(stripped)
+
+        if not img_match:
+            final_lines.append(replace_report_label_aliases(line, order_aliases))
+            continue
+
+        key = img_match.group('key').strip()
+        norm_key = normalize_report_image_key(key)
+        old_label = key_to_label.get(norm_key)
+
+        if not old_label:
+            caption_label = extract_report_label(img_match.group('caption').strip())
+            old_label = normalize_report_label(*caption_label) if caption_label else ''
+
+        new_label = key_new_labels.get(norm_key, order_aliases.get(old_label, old_label))
+
+        caption_core = strip_label_prefix(label_to_caption.get(old_label, '')).strip()
+        if not caption_core:
+            caption_core = strip_label_prefix(
+                strip_internal_asset_references(img_match.group('caption').strip(), known_keys)
+            ).strip()
+
+        new_caption = f"{new_label}：{caption_core}" if (new_label and caption_core) else (new_label or img_match.group('caption').strip())
+        final_lines.append(f"![{new_caption}]({key})")
+
+    return normalize_report_markdown('\n'.join(final_lines))
 
 def postprocess_generated_report_markdown(
     md_text: str,
