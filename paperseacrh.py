@@ -1414,8 +1414,26 @@ def prepare_report_markdown_for_display(
     images_dict: Optional[Dict[str, str]] = None,
     vision_summaries: str = '',
 ) -> str:
-    # 前端只做公式与块级轻量修复，避免再次改图、补图、重排图表顺序。
+    """
+    前端展示前也执行一次完整报告后处理：
+    1. 修正正文中的图表引用
+    2. 同步最终图片 caption 编号
+    3. 兼容旧缓存/旧历史报告中“正文编号没跟着改”的情况
+    4. 最后再做块级与公式序列化，保证页面渲染稳定
+    """
     normalized_sections = normalize_report_markdown(md_text)
+    image_ids = list((images_dict or {}).keys())
+
+    try:
+        normalized_sections = postprocess_generated_report_markdown(
+            normalized_sections,
+            image_ids=image_ids,
+            vision_summaries=vision_summaries or '',
+        )
+    except Exception:
+        # 展示层兜底：后处理失败时至少不阻塞页面显示
+        pass
+
     try:
         doc_title, body = split_title_and_body(normalized_sections)
         blocks = split_markdown_blocks(body)
