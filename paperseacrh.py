@@ -1287,21 +1287,6 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
     flush_paragraph()
     return blocks
 
-def parse_md_table(table_lines: List[str]) -> List[List[str]]:
-    """解析最常见的 Markdown 表格格式。"""
-    rows = []
-    for idx, line in enumerate(table_lines):
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if idx == 1 and all(re.fullmatch(r'[:\- ]+', c) for c in cells):
-            continue
-        rows.append(cells)
-
-    if not rows:
-        return []
-
-    width = max(len(r) for r in rows)
-    return [r + [""] * (width - len(r)) for r in rows]
-
 
 def split_title_and_body(md_text: str) -> Tuple[str, str]:
     """从完整 markdown 中拆出文档主标题和正文。"""
@@ -1350,63 +1335,6 @@ def canonicalize_report_section_core(title: str) -> str:
             return candidate
     return raw
 
-
-def normalize_report_sections_to_current_schema(md_text: str) -> str:
-    doc_title, body = split_title_and_body(md_text)
-    lines = normalize_report_markdown(body).split("\n") if body else []
-
-    prelude_lines: List[str] = []
-    section_blocks: List[Tuple[str, List[str]]] = []
-    current_header: Optional[str] = None
-    current_lines: List[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            if current_header is not None:
-                section_blocks.append((current_header, current_lines))
-            current_header = stripped[3:].strip()
-            current_lines = []
-        else:
-            if current_header is None:
-                prelude_lines.append(line)
-            else:
-                current_lines.append(line)
-
-    if current_header is not None:
-        section_blocks.append((current_header, current_lines))
-
-    merged_sections: Dict[str, List[str]] = {}
-    for header, content_lines in section_blocks:
-        core_title = canonicalize_report_section_core(header)
-        if core_title in REMOVED_REPORT_SECTION_TITLES:
-            continue
-        if core_title not in CURRENT_REPORT_SECTION_TITLES:
-            continue
-
-        cleaned_content = list(content_lines)
-        if core_title not in merged_sections:
-            merged_sections[core_title] = cleaned_content
-        else:
-            existing_content = normalize_report_markdown("\n".join(merged_sections[core_title]))
-            incoming_content = normalize_report_markdown("\n".join(cleaned_content))
-            if incoming_content and incoming_content != existing_content:
-                if merged_sections[core_title] and merged_sections[core_title][-1].strip():
-                    merged_sections[core_title].append("")
-                merged_sections[core_title].extend(cleaned_content)
-
-    rebuilt_lines: List[str] = [f"# {doc_title}"]
-    prelude_text = normalize_report_markdown("\n".join(prelude_lines))
-    if prelude_text:
-        rebuilt_lines.extend(["", prelude_text])
-
-    for idx, section_title in enumerate(CURRENT_REPORT_SECTION_TITLES, start=1):
-        if section_title not in merged_sections:
-            continue
-        rebuilt_lines.extend(["", f"## {idx}. {section_title}"])
-        rebuilt_lines.extend(merged_sections[section_title])
-
-    return normalize_report_markdown("\n".join(rebuilt_lines))
 
 
 def prepare_report_markdown_for_display(
@@ -2407,19 +2335,6 @@ def get_user_space_dir(username: str) -> str:
     return canonical_username(username)
 
 
-def ensure_user_space(username: str) -> str:
-    ensure_app_storage()
-    return get_user_space_dir(username)
-
-
-def get_user_report_index_path(username: str) -> str:
-    return canonical_username(username)
-
-
-def get_user_report_file_path(username: str, report_id: str) -> str:
-    return f"{canonical_username(username)}:{report_id}"
-
-
 def build_report_meta_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "report_id": row.get("report_id") or row.get("job_id") or "",
@@ -2485,128 +2400,6 @@ def get_next_task_no(user_id: str) -> int:
         (user_id,),
     )
     return int((row or {}).get("next_task_no") or 1)
-
-
-def save_user_report_record(
-    username: str,
-    source_name: str,
-    cache_key: str,
-    analysis_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    ensure_app_storage()
-    username = normalize_username(username)
-    user_record = get_user_record(username)
-    if not user_record:
-        raise RuntimeError("当前账号不存在，无法保存历史报告。")
-
-    user_id = user_record["id"]
-    source_name = (source_name or "").strip() or "未命名论文"
-    report_title, _ = split_title_and_body(analysis_result.get("main_report", ""))
-    report_title = (report_title or source_name or "论文全维度深度透视报告").strip()
-    report_payload = get_persistable_analysis_result(analysis_result)
-    images_manifest_text = json.dumps(report_payload.get("images", {}), ensure_ascii=False)
-
-    existing_job = db_fetch_one(
-        """
-        SELECT id AS job_id, task_no, created_at, updated_at
-        FROM public.analysis_jobs
-        WHERE user_id = %s AND cache_key = %s
-        LIMIT 1
-        """,
-        (user_id, cache_key),
-    )
-
-    if existing_job:
-        job_id = existing_job["job_id"]
-        task_no = int(existing_job.get("task_no") or 1)
-        created_at_value = existing_job.get("created_at")
-        db_execute(
-            """
-            UPDATE public.analysis_jobs
-            SET title = %s,
-                pdf_name = %s,
-                status = 'finished',
-                progress_text = '解析完成',
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (report_title, source_name, job_id),
-        )
-    else:
-        task_no = get_next_task_no(user_id)
-        job_id = str(uuid.uuid4())
-        created_at_value = datetime.datetime.now()
-        db_execute(
-            """
-            INSERT INTO public.analysis_jobs (
-                id, user_id, task_no, title, pdf_name, pdf_path, cache_key,
-                status, progress_text, created_at, updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'finished', '解析完成', NOW(), NOW())
-            """,
-            (job_id, user_id, task_no, report_title, source_name, "", cache_key),
-        )
-
-    existing_report = db_fetch_one(
-        "SELECT id, created_at FROM public.analysis_reports WHERE job_id = %s LIMIT 1",
-        (job_id,),
-    )
-
-    if existing_report:
-        db_execute(
-            """
-            UPDATE public.analysis_reports
-            SET user_id = %s,
-                report_markdown = %s,
-                parsed_markdown = %s,
-                text_agent_output = %s,
-                vision_output = %s,
-                images_manifest = %s::jsonb
-            WHERE job_id = %s
-            """,
-            (
-                user_id,
-                report_payload.get("main_report", ""),
-                report_payload.get("source_markdown", ""),
-                report_payload.get("text_report", ""),
-                report_payload.get("vision_summaries", ""),
-                images_manifest_text,
-                job_id,
-            ),
-        )
-    else:
-        db_execute(
-            """
-            INSERT INTO public.analysis_reports (
-                id, job_id, user_id, report_markdown, parsed_markdown,
-                text_agent_output, vision_output, images_manifest, created_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
-            """,
-            (
-                str(uuid.uuid4()),
-                job_id,
-                user_id,
-                report_payload.get("main_report", ""),
-                report_payload.get("source_markdown", ""),
-                report_payload.get("text_report", ""),
-                report_payload.get("vision_summaries", ""),
-                images_manifest_text,
-            ),
-        )
-
-    return {
-        "report_id": job_id,
-        "cache_key": cache_key,
-        "source_name": source_name,
-        "report_title": report_title,
-        "created_at": format_db_timestamp(created_at_value),
-        "updated_at": format_db_timestamp(datetime.datetime.now()),
-        "task_no": task_no,
-        "status": "finished",
-        "progress_text": "解析完成",
-        "has_report": True,
-    }
 
 
 @st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
