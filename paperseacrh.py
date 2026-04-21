@@ -1639,19 +1639,50 @@ def strip_internal_asset_references(text: str, known_image_keys: Optional[List[s
 
 def replace_report_label_aliases(text: str, aliases: Dict[str, str]) -> str:
     value = text or ''
-    for old_label, new_label in sorted((aliases or {}).items(), key=lambda item: -len(item[0])):
-        if not old_label or not new_label or old_label == new_label:
-            continue
+    if not value or not aliases:
+        return value
 
+    sorted_items = [
+        (old_label, new_label)
+        for old_label, new_label in sorted(
+            (aliases or {}).items(),
+            key=lambda item: (-len(item[0]), item[0])
+        )
+        if old_label and new_label and old_label != new_label
+    ]
+    if not sorted_items:
+        return value
+
+    placeholder_to_new_label: Dict[str, str] = {}
+
+    def _build_patterns(old_label: str) -> List[re.Pattern]:
         kind = old_label[0]
-        number = re.escape(old_label[1:])
+        old_number = old_label[1:].strip()
+        variants = report_number_variants(old_number) or [old_number]
+        patterns: List[re.Pattern] = []
 
-        if kind == '表':
-            value = re.sub(rf'\b(?:Table)\s*{number}\b', new_label, value, flags=re.I)
-            value = re.sub(rf'表\s*{number}(?![0-9一二三四五六七八九十百千万])', new_label, value)
-        else:
-            value = re.sub(rf'\b(?:Figure|Fig\.?)\s*{number}\b', new_label, value, flags=re.I)
-            value = re.sub(rf'图\s*{number}(?![0-9一二三四五六七八九十百千万])', new_label, value)
+        for variant in sorted(set(variants), key=len, reverse=True):
+            escaped = re.escape(variant)
+            if kind == '表':
+                patterns.append(re.compile(rf'\b(?:Table)\s*{escaped}\b', flags=re.I))
+                patterns.append(re.compile(
+                    rf'表\s*{escaped}(?![0-9A-Za-z一二三四五六七八九十百千万零〇两])'
+                ))
+            else:
+                patterns.append(re.compile(rf'\b(?:Figure|Fig\.?)\s*{escaped}\b', flags=re.I))
+                patterns.append(re.compile(
+                    rf'图\s*{escaped}(?![0-9A-Za-z一二三四五六七八九十百千万零〇两])'
+                ))
+        return patterns
+
+    for idx, (old_label, new_label) in enumerate(sorted_items):
+        placeholder = f"__REPORT_LABEL_SWAP_{idx}__"
+        placeholder_to_new_label[placeholder] = new_label
+        for pattern in _build_patterns(old_label):
+            value = pattern.sub(placeholder, value)
+
+    for placeholder, new_label in placeholder_to_new_label.items():
+        value = value.replace(placeholder, new_label)
 
     return value
 
@@ -1770,13 +1801,37 @@ def build_report_order_maps_from_image_blocks(
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     按最终报告里图片块的真实出现顺序重新连续编号。
+    关键要求：
+    1. 先整体建立 old_label -> new_label 的映射
+    2. 同一主图下的子图后缀必须保留，如 图4A -> 图2A、图4B -> 图2B
+    3. 同一主图编号只在第一次出现时推进一次主计数
     返回：
     1. old_label -> new_label
     2. norm_key -> new_label
     """
+
+    def _split_label(label: str) -> Tuple[str, str, str]:
+        value = (label or '').strip()
+        if not value:
+            return '图', '', ''
+        kind = value[0] if value[0] in {'图', '表'} else '图'
+        body = value[1:].strip()
+
+        m = re.fullmatch(
+            r'([0-9IVXLCDM一二三四五六七八九十百千万零〇两]+)([A-Za-z]?)',
+            body,
+            flags=re.I,
+        )
+        if not m:
+            return kind, body, ''
+        main_number = m.group(1)
+        suffix = (m.group(2) or '').upper()
+        return kind, main_number, suffix
+
     label_aliases: Dict[str, str] = {}
     key_new_labels: Dict[str, str] = {}
     counters = {'图': 1, '表': 1}
+    main_number_aliases: Dict[Tuple[str, str], str] = {}
 
     for line in filtered_lines:
         match = REPORT_IMAGE_LINE_RE.match(line.strip())
@@ -1785,22 +1840,33 @@ def build_report_order_maps_from_image_blocks(
 
         key = match.group('key').strip()
         norm_key = normalize_report_image_key(key)
-        old_label = key_to_label.get(norm_key)
 
+        old_label = key_to_label.get(norm_key)
         if not old_label:
             caption_label = extract_report_label(match.group('caption').strip())
             old_label = normalize_report_label(*caption_label) if caption_label else ''
 
-        kind = old_label[0] if old_label and old_label[0] in counters else '图'
-        new_label = normalize_report_label(kind, str(counters[kind]))
-        counters[kind] += 1
+        if not old_label:
+            continue
+
+        kind, old_main_number, suffix = _split_label(old_label)
+        if kind not in counters:
+            kind = '图'
+
+        main_key = (kind, old_main_number)
+        if main_key not in main_number_aliases:
+            main_number_aliases[main_key] = str(counters[kind])
+            counters[kind] += 1
+
+        new_main_number = main_number_aliases[main_key]
+        new_number = f"{new_main_number}{suffix}" if suffix else new_main_number
+        new_label = normalize_report_label(kind, new_number)
 
         key_new_labels[norm_key] = new_label
         if old_label and old_label not in label_aliases:
             label_aliases[old_label] = new_label
 
     return label_aliases, key_new_labels
-
 
 def reconcile_report_figure_table_references(
     report_md: str,
