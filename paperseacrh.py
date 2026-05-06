@@ -14,13 +14,17 @@ import datetime
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-st.set_page_config(page_title="AI 论文检索 Agent", page_icon="📚", layout="wide")
+st.set_page_config(page_title="学术文献智能工作台", page_icon="📚", layout="wide")
 
 
 # ==========================================
 # 模块 2：全局变量与 API 配置
 # ==========================================
 ANALYSIS_CACHE_VERSION = "20260412_history_single_image_v5"
+
+# 页面状态仍按原有固定间隔自动刷新；当前页面打开时，额外用轻量监听更快发现后台结果已完成。
+RESULT_READY_WATCH_INTERVAL_SECONDS = 5
+RESULT_READY_WATCH_MAX_SECONDS = 30
 
 # 论文搜索与论文精读报告均由后端统一执行；前端仅负责提交任务、状态展示与结果渲染。
 
@@ -2635,7 +2639,7 @@ def create_paper_search_job(
             feedback, previous_result, status, progress_text,
             created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', '论文搜索任务已提交，等待后台启动', NOW(), NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', '后台检索任务已创建，等待调度执行', NOW(), NOW())
         """,
         (
             job_id,
@@ -2685,7 +2689,7 @@ def submit_paper_search_to_modal(search_job_id: str):
 
     response = requests.post(submit_url, data=data, timeout=120)
     if response.status_code != 200:
-        raise RuntimeError(f"后端论文检索提交失败：HTTP {response.status_code}")
+        raise RuntimeError(f"后台文献检索提交失败：HTTP {response.status_code}")
 
     try:
         payload = response.json()
@@ -2731,7 +2735,7 @@ def mark_paper_search_job_superseded(search_job_id: str, superseded_by: str):
         UPDATE public.paper_search_jobs
         SET superseded_by = %s,
             is_final = FALSE,
-            progress_text = '该轮结果已被后续反馈检索替代，未写入最终论文去重库',
+            progress_text = '该轮结果已由后续修正任务替代，未写入最终论文去重库',
             updated_at = NOW()
         WHERE id = %s AND is_final = FALSE
         """,
@@ -2754,18 +2758,18 @@ def build_search_ui_logs(search_logs: List[Dict[str, Any]]) -> List[Dict[str, st
         observation = item.get("observation", "") or ""
         content_parts = []
         if thought_action:
-            content_parts.append(f"**Agent 思考与决策：**\n```text\n{thought_action}\n```")
+            content_parts.append(f"**检索决策：**\n```text\n{thought_action}\n```")
         if observation:
-            content_parts.append(f"**工具返回 / Observation：**\n```text\n{observation}\n```")
+            content_parts.append(f"**检索工具返回：**\n```text\n{observation}\n```")
         ui_logs.append({
-            "title": f"后端 Paper Search Agent 运行日志（第 {step} 步）",
+            "title": f"文献检索 Agent 执行记录（第 {step} 步）",
             "content": "\n\n".join(content_parts) or "无详细日志。",
         })
     return ui_logs
 
 def format_search_history_label(meta: Dict[str, Any]) -> str:
     if not meta:
-        return "不打开历史检索"
+        return "不打开检索记录"
     topic = shorten_sidebar_label(meta.get("topic") or "论文检索", max_len=18)
     status = (meta.get("status") or "").lower()
     if status in {"queued", "processing"}:
@@ -2781,18 +2785,18 @@ def format_search_history_label(meta: Dict[str, Any]) -> str:
 def render_pending_search_notice(search_meta: Dict[str, Any]):
     topic = search_meta.get("topic") or "论文检索"
     status = (search_meta.get("status") or "").lower()
-    progress_text = search_meta.get("progress_text") or "后台论文搜索任务正在运行中。"
+    progress_text = search_meta.get("progress_text") or "后台文献检索任务正在运行。"
     if status == "failed":
         st.error(progress_text or f"《{topic}》检索失败。")
         return
     st.info(f"《{topic}》当前状态：{progress_text}")
-    st.caption("该论文搜索任务已提交到后台 Modal。您可以直接关闭页面，稍后重新登录查看状态或结果。")
+    st.caption("该检索任务已由后台接管。您可以保持页面打开等待自动呈现，也可以关闭页面后稍后重新登录查看结果。")
 
 
 def render_saved_search_record(username: str, search_job_id: str):
     record = load_user_search_record(username, search_job_id)
     if not record:
-        st.error("未找到该历史检索记录，可能已被删除。")
+        st.error("未找到该文献检索档案，可能已被删除。")
         return
     meta = record.get("meta", {}) or {}
     status = (meta.get("status") or "").lower()
@@ -2814,17 +2818,17 @@ def render_saved_search_record(username: str, search_job_id: str):
         st.session_state.app_state = "WAITING_FEEDBACK"
         st.rerun()
 
-    st.markdown(f"### 历史检索：{meta.get('topic') or '论文检索'}")
+    st.markdown(f"### 文献检索档案：{meta.get('topic') or '论文检索'}")
     if meta.get("requirements"):
-        with st.expander("查看本次筛选要求", expanded=False):
+        with st.expander("查看筛选约束", expanded=False):
             st.markdown(meta.get("requirements") or "")
     logs = build_search_ui_logs(record.get("agent_logs", []) or [])
     if logs:
-        st.markdown("#### Agent 检索执行轨迹")
+        st.markdown("#### 检索 Agent 执行轨迹")
         for log in logs:
             with st.expander(log["title"], expanded=False):
                 st.markdown(log["content"])
-    st.markdown("#### Top 6 核心论文推荐")
+    st.markdown("#### 六篇候选文献")
     with st.container(border=True):
         st.markdown(record.get("result_markdown") or "该历史检索暂无结果。")
 
@@ -2849,6 +2853,43 @@ def poll_active_paper_search_job(username: str, search_job_id: str) -> Optional[
         st.session_state.app_state = "IDLE"
         st.session_state.active_search_job_id = ""
     return {"meta": meta}
+
+
+def watch_active_search_until_ready(username: str, search_job_id: str) -> bool:
+    """当前页面保持打开时，轻量监听后台检索是否已完成；完成后立即触发页面刷新。
+
+    这不改变原有固定自动刷新间隔，只是在用户停留于等待页时额外检查结果是否已经落库，
+    避免结果已生成但页面仍要等到下一次固定刷新才显示。
+    """
+    username = normalize_username(username)
+    search_job_id = (search_job_id or "").strip()
+    if not username or not search_job_id:
+        return False
+
+    checks = max(1, int(RESULT_READY_WATCH_MAX_SECONDS / max(1, RESULT_READY_WATCH_INTERVAL_SECONDS)))
+    placeholder = st.empty()
+    for _ in range(checks):
+        time.sleep(RESULT_READY_WATCH_INTERVAL_SECONDS)
+        try:
+            _get_user_search_job_state_cached.clear()
+            _load_user_search_record_cached.clear()
+        except Exception:
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+        meta = get_user_search_job_state(username, search_job_id)
+        if not meta:
+            continue
+        status = (meta.get("status") or "").lower()
+        if status in {"finished", "failed"}:
+            placeholder.empty()
+            poll_active_paper_search_job(username, search_job_id)
+            return True
+        progress = meta.get("progress_text") or "后台文献检索任务正在运行。"
+        placeholder.caption(f"实时监听：{progress}")
+    placeholder.empty()
+    return False
 
 
 def _load_agent_logs_cached(username: str, report_id: str) -> List[Dict[str, Any]]:
@@ -2944,7 +2985,7 @@ def render_pending_job_notice(job_meta: Dict[str, Any], show_title: bool = False
     report_id = job_meta.get("report_id") or job_meta.get("job_id") or ""
     if report_id:
         render_agent_action_logs(st.session_state.get("current_user", ""), report_id, expanded=False)
-    st.caption("该任务已提交到后台 Modal。您现在可以直接关闭页面，稍后重新登录查看状态或结果。")
+    st.caption("该解析任务已由后台接管。您可以关闭页面，稍后重新登录查看状态或结果；保持页面打开时系统会自动更新进度。")
 
 
 @st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
@@ -3058,8 +3099,8 @@ def format_report_history_label(meta: Dict[str, Any]) -> str:
 
 
 def render_auth_ui():
-    st.title("AI 智能论文检索 Agent")
-    st.markdown("请先登录或注册账号。登录后，系统会为每个账号自动保存历史论文解析报告，下一次登录可直接查看，无需重新解析。")
+    st.title("学术文献智能工作台")
+    st.markdown("请登录研究工作区。系统会为每个账号独立保存文献检索记录与论文精读报告，便于跨会话连续使用。")
 
     login_tab, register_tab = st.tabs(["登录", "注册"])
 
@@ -3072,7 +3113,7 @@ def render_auth_ui():
                 ok, result = authenticate_user(login_username, login_password)
                 if ok:
                     st.session_state.current_user = result
-                    focus_latest_user_job(result)
+                    reset_user_workspace_view(result)
                     st.rerun()
                 else:
                     st.error(result)
@@ -3113,9 +3154,9 @@ def render_history_sidebar(username: str):
         st.session_state[selector_key] = "__workspace__"
         st.session_state[reset_flag_key] = False
 
-    st.header("历史报告记录")
+    st.header("精读报告档案")
     selected_id = st.radio(
-        "历史报告记录",
+        "精读报告档案",
         options=options,
         format_func=lambda option_id: "当前工作区" if option_id == "__workspace__" else format_report_history_label(meta_map.get(option_id, {})),
         key=selector_key,
@@ -3124,9 +3165,9 @@ def render_history_sidebar(username: str):
     st.session_state.selected_history_report_id = None if selected_id == "__workspace__" else selected_id
 
     if history:
-        st.caption("重新登录后也可在这里直接打开历史报告。")
+        st.caption("历史报告会长期保留，可在重新登录后继续查看。")
     else:
-        st.caption("当前账号还没有历史报告。")
+        st.caption("当前账号暂无精读报告档案。")
 
     st.divider()
     search_history = load_user_search_index(username)
@@ -3137,11 +3178,11 @@ def render_history_sidebar(username: str):
         st.session_state[search_selector_key] = "__none__"
     if search_selector_key not in st.session_state or st.session_state[search_selector_key] not in search_options:
         st.session_state[search_selector_key] = "__none__"
-    st.header("历史检索记录")
+    st.header("文献检索档案")
     selected_search_id = st.radio(
-        "历史检索记录",
+        "文献检索档案",
         options=search_options,
-        format_func=lambda option_id: "不打开历史检索" if option_id == "__none__" else format_search_history_label(search_meta_map.get(option_id, {})),
+        format_func=lambda option_id: "不打开检索记录" if option_id == "__none__" else format_search_history_label(search_meta_map.get(option_id, {})),
         key=search_selector_key,
         label_visibility="collapsed",
     )
@@ -3149,9 +3190,9 @@ def render_history_sidebar(username: str):
     if selected_search_id != "__none__":
         st.session_state.selected_history_report_id = None
     if search_history:
-        st.caption("重新登录后也可在这里查看历史检索结果。")
+        st.caption("已确认或仍在运行的检索任务会保留在这里，重新登录后可继续查看。")
     else:
-        st.caption("当前账号还没有历史检索。")
+        st.caption("当前账号暂无文献检索档案。")
 
 # ==========================================
 # 模块 14：论文精读主流程
@@ -3330,7 +3371,7 @@ def render_single_analysis_result(
 def render_saved_history_report(username: str, report_id: str):
     job_meta = get_user_job_state(username, report_id)
     if not job_meta:
-        st.warning("未找到这条历史报告记录，请重新解析论文。")
+        st.warning("未找到这条精读报告档案，请重新解析论文。")
         return
 
     status = (job_meta.get("status") or "").lower()
@@ -3390,7 +3431,7 @@ def render_analysis_ui(pdf_inputs):
     上传论文后的主工作流：
     - 支持单篇 PDF 分析
     - 支持多篇 PDF 同时上传，并分别生成各自报告
-    - 任务会立即写入 analysis_jobs，并交给新的后台 Modal 继续运行
+    - 任务会立即写入 analysis_jobs，并交由后台解析工作流继续执行
     - 多篇 PDF 场景下，全部完成后再统一展示所有报告
     """
     entries = collect_pdf_entries(pdf_inputs)
@@ -3498,7 +3539,7 @@ def render_analysis_ui(pdf_inputs):
                 st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会自动刷新状态。")
 
     st.divider()
-    if st.button("开始全新探索", type="primary", key="start_fresh_workspace_after_analysis"):
+    if st.button("返回当前工作区", type="primary", key="start_fresh_workspace_after_analysis"):
         start_fresh_workspace(st.session_state.get("current_user", ""))
         st.rerun()
 
@@ -3550,8 +3591,8 @@ if not st.session_state.current_user:
 # ==========================================
 # 模块 16：前端 UI
 # ==========================================
-st.title("AI 智能论文检索 Agent")
-st.markdown("基于大模型的多轮深度挖掘，为您精准匹配 Top 6 核心前沿文献，并为每个账号自动保留历史解析报告。")
+st.title("学术文献智能工作台")
+st.markdown("面向学术选题、文献筛选与论文精读的统一多 Agent 工作区。系统支持后台检索、离线任务续跑、历史档案留存与结构化精读报告生成。")
 
 with st.sidebar:
     st.success(f"当前账号：{st.session_state.current_user}")
@@ -3563,37 +3604,37 @@ with st.sidebar:
     render_history_sidebar(st.session_state.current_user)
 
     st.divider()
-    st.header("检索配置")
+    st.header("研究检索配置")
 
-    user_topic = st.text_input("研究方向", value="")
+    user_topic = st.text_input("研究主题", value="")
 
     user_requirements = st.text_area(
-        "具体筛选要求",
+        "筛选约束与偏好",
         value="",
-        placeholder="建议分点填写",
-        help="要求越具体，Agent 挖掘的文献越精准。",
+        placeholder="例如：限定任务类型、方法路线、应用场景、数据集、发表渠道或排除条件。",
+        help="约束越清晰，后端检索 Agent 越容易稳定筛选出高相关文献。",
     )
 
     allow_preprint = st.radio(
-        "文献收录标准",
+        "收录范围",
         ("排除预印本 (仅限正规期刊/会议)", "接受预印本 (如 arXiv)"),
     )
 
-    start_button = st.button("开始智能检索", type="primary", use_container_width=True)
+    start_button = st.button("启动文献检索任务", type="primary", use_container_width=True)
 
     st.divider()
 
-    st.header("文献直读")
+    st.header("论文精读入口")
     sidebar_pdf = st.file_uploader(
-        "上传本地 PDF 进行结构化解析",
+        "上传 PDF 进行结构化精读",
         type="pdf",
         key="sb_pdf",
-        help="跳过检索步骤，直接对已有文献生成精读报告，并保存到当前账号的历史记录",
+        help="跳过检索流程，直接为已有论文生成结构化精读报告，并写入当前账号档案。",
         accept_multiple_files=True,
     )
 
     start_analyze_button = st.button(
-        "开始解读",
+        "启动深度解析",
         type="primary",
         key="start_analyze_btn",
         use_container_width=True,
@@ -3613,7 +3654,7 @@ if start_analyze_button and sidebar_pdf:
 
 if start_button:
     if not user_topic:
-        st.warning("请填写研究方向！")
+        st.warning("请填写研究主题！")
     else:
         reset_user_workspace_view(st.session_state.current_user)
         st.session_state.sidebar_direct_entries = []
@@ -3626,7 +3667,7 @@ if start_button:
         st.session_state.has_provided_feedback = False
         st.session_state.feedback_start_time = None
         search_submitted = False
-        with st.spinner("正在创建离线论文搜索任务，并提交给后端 Director……"):
+        with st.spinner("正在创建后台检索任务，并交由统一 Director 调度……"):
             try:
                 search_job = create_paper_search_job(
                     username=st.session_state.current_user,
@@ -3635,20 +3676,20 @@ if start_button:
                     preprint_rule=allow_preprint,
                 )
                 submit_paper_search_to_modal(search_job.get("search_job_id", ""))
-                update_paper_search_job_status(search_job.get("search_job_id", ""), "processing", "后台任务已提交，等待 Paper Search Agent 完成")
+                update_paper_search_job_status(search_job.get("search_job_id", ""), "processing", "后台检索任务已提交，等待 Agent 完成候选文献筛选")
                 st.session_state.active_search_job_id = search_job.get("search_job_id", "")
                 st.session_state.current_search_job_id = search_job.get("search_job_id", "")
                 st.session_state.app_state = "SEARCH_RUNNING"
                 search_submitted = True
             except Exception as e:
                 st.session_state.app_state = "IDLE"
-                st.error(f"后端论文检索提交失败：{str(e)}")
+                st.error(f"后台文献检索提交失败：{str(e)}")
         if search_submitted:
             st.rerun()
 
 if st.session_state.sidebar_direct_entries:
     st.markdown("---")
-    st.info("正在启动【直接解析模式】，开始解构文献……")
+    st.info("已进入论文精读流程，正在启动结构化解析任务……")
     render_analysis_ui(st.session_state.sidebar_direct_entries)
     st.stop()
 
@@ -3657,6 +3698,8 @@ if st.session_state.app_state == "SEARCH_RUNNING" and st.session_state.active_se
     current_search_state = poll_active_paper_search_job(st.session_state.current_user, st.session_state.active_search_job_id)
     if current_search_state and st.session_state.app_state == "SEARCH_RUNNING":
         render_pending_search_notice(current_search_state.get("meta", {}) or {})
+        if watch_active_search_until_ready(st.session_state.current_user, st.session_state.active_search_job_id):
+            st.rerun()
         st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"active_search_refresh_{st.session_state.active_search_job_id}")
         st.stop()
     st.rerun()
@@ -3681,29 +3724,25 @@ if (
 
 if st.session_state.app_state == "IDLE":
     st.markdown("""
-### 系统使用指南
+### 当前工作区
 
-欢迎使用 AI 智能论文检索 Agent。本系统旨在通过深度信息挖掘与多轮交互，为您精准匹配最具参考价值的前沿文献。每个账号都会自动拥有独立的历史报告空间，重新登录后可直接查看之前的解析结果。为获得最佳体验，请参考以下操作规范：
+这里是你的统一学术文献工作区。左侧可以启动两类任务：一类是基于研究主题的后台文献检索，另一类是针对已有 PDF 的结构化精读。所有任务都绑定当前账号，支持退出后继续查看。
 
-**一、 智能文献检索**
+**文献检索**
 
-1. **精准配置检索条件**
-   请在左侧边栏填写宏观的“研究方向”。为进一步提升检索精度，建议在“具体筛选要求”中分点详细说明：研究的特定子领域、目标应用场景、核心算法要求或其他限制条件。您还可以根据严谨性需求，勾选是否排除预印本（如 arXiv）文献。
+在左侧填写研究主题与筛选约束后，系统会将任务提交给后端 Director，由 Paper Search Agent 调用检索工具完成多轮筛选。检索完成后，页面会进入确认环节：只有当你确认当前结果时，六篇论文才会写入最终去重库；如果继续修正，本轮结果只作为过程记录，不会参与后续去重。
 
-2. **人机协同与动态纠偏**
-   首次检索完成后，系统将输出初步筛选的 6 篇高相关性候选文献。本系统支持动态调优：若结果偏离预期，您无需重新开始，只需在反馈对话框中指出理解偏差或追加新的约束条件，Agent 将据此进行下一轮定向纠偏与深度检索。
+**论文精读**
 
-3. **会话时效管理**
-   为保障系统底层计算资源的有效流转，系统在等待用户反馈时设有 30 分钟的静默超时机制。若超过此时限未收到新指令，当前检索任务将自动归档结束。
+如果你已经有目标论文，可以直接上传 PDF。系统会进入结构化解析流程，提取文本、图表、caption 与上下文，并生成可复查、可导出的精读报告。
 
-**二、 既有文献直读**
+**历史档案**
 
-* **本地 PDF 深度解析**
-  若您已有确定的目标文献，可跳过检索环节。直接通过左侧边栏底部的“上传 PDF 立即深度解读”入口提交文件，系统将自动提取文本并生成结构化的文献精读分析报告，同时写入当前账号的历史报告记录，便于下次登录直接查看。
+左侧的“精读报告档案”和“文献检索档案”用于跨会话恢复历史任务。每次登录默认回到当前工作区，不会自动跳转到某个历史报告或检索结果。
 """)
 
 if st.session_state.app_state != "IDLE":
-    st.markdown("### Agent 检索执行轨迹")
+    st.markdown("### 检索 Agent 执行轨迹")
     for log in st.session_state.ui_logs:
         with st.expander(log["title"], expanded=False):
             st.markdown(log["content"])
@@ -3718,38 +3757,38 @@ if st.session_state.app_state == "WAITING_FEEDBACK":
             try:
                 finalize_paper_search_via_modal(st.session_state.current_search_job_id)
             except Exception as e:
-                st.warning(f"自动确认入库失败：{str(e)}")
+                st.warning(f"自动确认归档失败：{str(e)}")
             st.session_state.app_state = "COMPLETED"
             st.rerun()
         st_autorefresh(interval=180000, key="feedback_timer")
         mins_left = int(remaining_time // 60)
-        st.caption(f"系统将在 {mins_left} 分钟后自动确认结果并结束任务。")
+        st.caption(f"若无进一步操作，系统将在 {mins_left} 分钟后自动确认当前结果并归档。")
 
-    st.markdown("### 阶段性检索结果展示")
-    st.write("请审阅 Agent 挑选出的文献，判断是否符合您的要求：")
+    st.markdown("### 候选文献组合")
+    st.write("请审阅当前候选文献组合。确认后，本轮结果才会写入最终去重库；若继续修正，本轮结果不会作为最终推荐保存。")
 
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
 
     st.divider()
-    st.markdown("#### 您对当前的文献组合满意吗？")
+    st.markdown("#### 是否确认当前候选组合？")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("满意，结束检索", use_container_width=True):
+        if st.button("确认当前结果并归档", use_container_width=True):
             try:
                 finalize_paper_search_via_modal(st.session_state.current_search_job_id)
                 st.session_state.app_state = "COMPLETED"
                 st.rerun()
             except Exception as e:
-                st.error(f"最终确认入库失败：{str(e)}")
+                st.error(f"结果确认归档失败：{str(e)}")
 
     with col2:
-        with st.popover("不满意，修改要求", use_container_width=True):
-            new_req = st.text_area("请指出不符合要求的地方：")
-            if st.button("提交新要求并继续"):
+        with st.popover("继续修正检索条件", use_container_width=True):
+            new_req = st.text_area("请说明需要修正的方向或需要排除的结果：")
+            if st.button("提交修正要求并重新检索"):
                 if new_req.strip():
-                    with st.spinner("正在创建反馈后的离线论文搜索任务……"):
+                    with st.spinner("正在创建修正后的后台检索任务……"):
                         try:
                             previous_search_job_id = st.session_state.current_search_job_id
                             search_job = create_paper_search_job(
@@ -3762,33 +3801,33 @@ if st.session_state.app_state == "WAITING_FEEDBACK":
                             )
                             mark_paper_search_job_superseded(previous_search_job_id, search_job.get("search_job_id", ""))
                             submit_paper_search_to_modal(search_job.get("search_job_id", ""))
-                            update_paper_search_job_status(search_job.get("search_job_id", ""), "processing", "后台反馈检索任务已提交，等待 Paper Search Agent 完成")
+                            update_paper_search_job_status(search_job.get("search_job_id", ""), "processing", "修正检索任务已提交，等待 Agent 完成新一轮筛选")
                             st.session_state.active_search_job_id = search_job.get("search_job_id", "")
                             st.session_state.current_search_job_id = search_job.get("search_job_id", "")
                             st.session_state.has_provided_feedback = True
                             st.session_state.app_state = "SEARCH_RUNNING"
                             st.session_state.feedback_start_time = None
                         except Exception as e:
-                            st.error(f"后端论文检索反馈处理失败：{str(e)}")
+                            st.error(f"修正检索提交失败：{str(e)}")
                     st.rerun()
 
 elif st.session_state.app_state == "COMPLETED":
-    st.success("文献检索任务已完成！")
+    st.success("文献检索任务已确认归档。")
     if st.session_state.has_provided_feedback == False and st.session_state.feedback_start_time:
         elapsed = time.time() - st.session_state.feedback_start_time
         if elapsed > 1800:
             st.warning("提示：由于超过 30 分钟未响应，系统已为您自动确认最终结果。")
-    st.markdown("### 最终确认的 Top 6 核心论文推荐")
+    st.markdown("### 最终确认的六篇候选文献")
     with st.container(border=True):
         st.markdown(st.session_state.final_result)
 
     st.divider()
-    st.header("开启深度解读工作流")
-    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 7 节精读报告，并自动存入当前账号的历史报告记录。")
+    st.header("论文精读工作流")
+    st.info("从上方选定并下载任意一篇或多篇论文的 PDF，在此上传，系统将分别生成完整 7 节精读报告，并自动存入当前账号的精读报告档案。")
 
-    uploaded_pdf = st.file_uploader("上传 PDF 文件以获取精读报告", type="pdf", key="bottom_pdf", accept_multiple_files=True)
+    uploaded_pdf = st.file_uploader("上传 PDF 生成精读报告", type="pdf", key="bottom_pdf", accept_multiple_files=True)
     bottom_start_btn = st.button(
-        "开始深度解读",
+        "启动深度解析",
         type="primary",
         disabled=not uploaded_pdf,
         use_container_width=True,
@@ -3802,7 +3841,7 @@ elif st.session_state.app_state == "COMPLETED":
         st.markdown("---")
         render_analysis_ui(st.session_state.bottom_direct_entries)
 
-    if st.button("开启全新检索轮次", type="primary"):
+    if st.button("返回工作区并开启新任务", type="primary"):
         current_user = st.session_state.get("current_user", "")
         st.session_state.clear()
         if current_user:
