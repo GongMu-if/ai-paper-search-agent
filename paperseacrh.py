@@ -23,7 +23,7 @@ st.set_page_config(page_title="学术文献智能工作台", page_icon="📚", l
 ANALYSIS_CACHE_VERSION = "20260412_history_single_image_v5"
 
 # 论文搜索与论文精读报告均由后端统一执行；前端仅负责提交任务、状态展示与结果渲染。
-# 页面状态仍按原有固定 5 分钟间隔自动刷新；论文搜索 30 分钟默认确认由后端独立计时完成。
+# 页面状态统一按固定 3 分钟间隔自动刷新；论文搜索 30 分钟默认确认由后端独立计时完成。
 
 # ==========================================
 # 模块 4：通用展示函数
@@ -1818,10 +1818,7 @@ except Exception:
 SUPABASE_DB_URL = (st.secrets.get("SUPABASE_DB_URL", "") or "").strip()
 ASYNC_MODAL_API_URL = (st.secrets.get("ASYNC_MODAL_API_URL", "") or st.secrets.get("MODAL_JOB_API_URL", "") or "").strip()
 PASSWORD_HASH_ROUNDS = 120000
-JOB_STATUS_REFRESH_INTERVAL_MS = 300000
-# 轻量状态变化监听：不再使用 time.sleep 阻塞页面；页面运行时用短周期 rerun 读取最新状态，
-# 一旦后端 status / progress_text / updated_at 变化，本轮渲染就会直接显示新状态。
-STATUS_CHANGE_WATCH_INTERVAL_MS = 15000
+JOB_STATUS_REFRESH_INTERVAL_MS = 180000
 DB_READ_CACHE_TTL_SECONDS = 6
 
 
@@ -2790,39 +2787,8 @@ def render_pending_search_notice(search_meta: Dict[str, Any]):
         st.error(progress_text or f"《{topic}》检索失败。")
         return
     st.info(f"《{topic}》当前状态：{progress_text}")
-    st.caption("该检索任务已由后台接管。页面打开时会监听状态变化并自动更新；关闭页面后仍可稍后重新登录查看结果。")
+    st.caption("该检索任务已由后台接管。页面每 3 分钟自动刷新一次；关闭页面后仍可稍后重新登录查看结果。")
 
-
-def build_job_status_signature(meta: Dict[str, Any]) -> str:
-    """构造任务状态签名，用于判断后端状态是否发生变化。"""
-    if not meta:
-        return ""
-    return "|".join([
-        str(meta.get("status") or ""),
-        str(meta.get("progress_text") or ""),
-        str(meta.get("updated_at") or ""),
-        str(meta.get("is_final") or ""),
-        str(meta.get("finalized_at") or ""),
-    ])
-
-
-def remember_job_status_signature(key: str, meta: Dict[str, Any]) -> bool:
-    """记录当前任务状态签名；返回本次渲染相对上一次是否发生变化。"""
-    signature = build_job_status_signature(meta)
-    if not signature:
-        return False
-    store_key = f"job_status_signature_{key}"
-    previous = st.session_state.get(store_key, "")
-    st.session_state[store_key] = signature
-    return bool(previous and previous != signature)
-
-
-def schedule_status_change_watch(key: str):
-    """页面打开时启用非阻塞状态监听；保留 5 分钟固定刷新作为兜底。"""
-    st_autorefresh(
-        interval=STATUS_CHANGE_WATCH_INTERVAL_MS,
-        key=f"status_change_watch_{key}",
-    )
 
 
 def render_saved_search_record(username: str, search_job_id: str):
@@ -2834,8 +2800,6 @@ def render_saved_search_record(username: str, search_job_id: str):
     status = (meta.get("status") or "").lower()
     if status in {"queued", "processing"}:
         render_pending_search_notice(meta)
-        remember_job_status_signature(f"search_history_{search_job_id}", meta)
-        schedule_status_change_watch(f"search_history_{search_job_id}")
         st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"search_history_refresh_{search_job_id}")
         return
     if status == "failed":
@@ -3489,12 +3453,8 @@ def render_analysis_ui(pdf_inputs):
             if finished_count:
                 st.info("已有部分论文解析完成。为避免界面混乱，系统会在全部任务完成后统一展示所有 PDF 的解析报告。")
             if should_poll:
-                for row in batch_rows:
-                    if (row.get("status") or "").lower() in {"queued", "processing"}:
-                        remember_job_status_signature(f"analysis_{row.get('job_id') or row.get('cache_key') or row.get('index')}", row)
-                schedule_status_change_watch("pending_analysis_batch")
                 st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key="pending_analysis_refresh")
-                st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会在状态变化时更新，并保留固定间隔刷新兜底。")
+                st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会每 3 分钟自动刷新一次。")
         else:
             st.divider()
             st.markdown("### 全部 PDF 解析结果")
@@ -3536,10 +3496,8 @@ def render_analysis_ui(pdf_inputs):
         else:
             render_pending_job_notice(row, show_title=False)
             if should_poll:
-                remember_job_status_signature(f"analysis_{row.get('job_id') or row.get('cache_key') or row.get('index')}", row)
-                schedule_status_change_watch("pending_analysis_single")
                 st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key="pending_analysis_refresh")
-                st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会在状态变化时更新，并保留固定间隔刷新兜底。")
+                st.caption("后台任务正在继续运行。您可以关闭页面，稍后重新登录查看；若保持当前页面打开，系统会每 3 分钟自动刷新一次。")
 
     st.divider()
     if st.button("返回当前工作区", type="primary", key="start_fresh_workspace_after_analysis"):
@@ -3702,8 +3660,6 @@ if st.session_state.app_state == "SEARCH_RUNNING" and st.session_state.active_se
     if current_search_state and st.session_state.app_state == "SEARCH_RUNNING":
         active_search_meta = current_search_state.get("meta", {}) or {}
         render_pending_search_notice(active_search_meta)
-        remember_job_status_signature(f"active_search_{st.session_state.active_search_job_id}", active_search_meta)
-        schedule_status_change_watch(f"active_search_{st.session_state.active_search_job_id}")
         st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"active_search_refresh_{st.session_state.active_search_job_id}")
         st.stop()
     st.rerun()
@@ -3757,9 +3713,6 @@ if st.session_state.app_state == "WAITING_FEEDBACK":
     if st.session_state.current_search_job_id:
         try:
             current_meta = get_user_search_job_state(st.session_state.current_user, st.session_state.current_search_job_id)
-            if current_meta:
-                remember_job_status_signature(f"feedback_{st.session_state.current_search_job_id}", current_meta)
-                schedule_status_change_watch(f"feedback_{st.session_state.current_search_job_id}")
             if current_meta and current_meta.get("is_final"):
                 st.session_state.app_state = "COMPLETED"
                 st.session_state.feedback_start_time = None
@@ -3778,7 +3731,7 @@ if st.session_state.app_state == "WAITING_FEEDBACK":
                 st.warning(f"自动确认归档失败：{str(e)}")
             st.session_state.app_state = "COMPLETED"
             st.rerun()
-        st_autorefresh(interval=180000, key="feedback_timer")
+        st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key="feedback_timer")
         mins_left = int(remaining_time // 60)
         st.caption(f"若无进一步操作，后端将在约 {mins_left} 分钟后自动确认当前结果并归档；关闭页面不会影响该计时。")
 
