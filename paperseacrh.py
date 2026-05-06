@@ -1852,6 +1852,7 @@ def _rows_to_dicts(cursor, rows):
 
 def _execute_bootstrap_statements(db_url: str):
     statements = [
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
         """
         CREATE TABLE IF NOT EXISTS public.users (
             id UUID PRIMARY KEY,
@@ -1910,6 +1911,56 @@ def _execute_bootstrap_statements(db_url: str):
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_analysis_agent_logs_job_step ON public.analysis_agent_logs(job_id, step_no)",
+        """
+        CREATE TABLE IF NOT EXISTS public.paper_search_jobs (
+            id UUID PRIMARY KEY,
+            user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+            topic TEXT NOT NULL DEFAULT '',
+            requirements TEXT NOT NULL DEFAULT '',
+            preprint_rule TEXT NOT NULL DEFAULT '',
+            feedback TEXT NOT NULL DEFAULT '',
+            previous_result TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'queued',
+            progress_text TEXT NOT NULL DEFAULT '',
+            result_markdown TEXT NOT NULL DEFAULT '',
+            agent_logs JSONB NOT NULL DEFAULT '[]'::jsonb,
+            raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            is_final BOOLEAN NOT NULL DEFAULT FALSE,
+            finalized_at TIMESTAMPTZ,
+            superseded_by UUID,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_jobs_user_created ON public.paper_search_jobs(user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_jobs_status ON public.paper_search_jobs(status)",
+        "ALTER TABLE public.paper_search_jobs ADD COLUMN IF NOT EXISTS is_final BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE public.paper_search_jobs ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ",
+        "ALTER TABLE public.paper_search_jobs ADD COLUMN IF NOT EXISTS superseded_by UUID",
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_jobs_user_final ON public.paper_search_jobs(user_id, is_final, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_jobs_superseded ON public.paper_search_jobs(superseded_by)",
+        """
+        CREATE TABLE IF NOT EXISTS public.paper_search_selected_papers (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            search_job_id UUID NOT NULL REFERENCES public.paper_search_jobs(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+            rank_no INTEGER NOT NULL CHECK (rank_no BETWEEN 1 AND 6),
+            title TEXT NOT NULL,
+            venue TEXT NOT NULL DEFAULT '',
+            doi TEXT NOT NULL DEFAULT '',
+            s2_id TEXT NOT NULL DEFAULT '',
+            abstract TEXT NOT NULL DEFAULT '',
+            recommendation_reason TEXT NOT NULL DEFAULT '',
+            dedupe_key TEXT NOT NULL,
+            raw_item JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_search_selected_job_rank ON public.paper_search_selected_papers(search_job_id, rank_no)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_search_selected_user_dedupe ON public.paper_search_selected_papers(user_id, dedupe_key)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_selected_user_created ON public.paper_search_selected_papers(user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_selected_user_doi ON public.paper_search_selected_papers(user_id, doi) WHERE doi <> ''",
+        "CREATE INDEX IF NOT EXISTS idx_paper_search_selected_user_s2 ON public.paper_search_selected_papers(user_id, s2_id) WHERE s2_id <> ''",
     ]
 
     conn = _open_db_connection(db_url)
@@ -2002,6 +2053,14 @@ def clear_db_read_caches():
     _get_user_job_by_cache_key_cached.clear()
     _load_user_report_record_cached.clear()
     _get_user_cached_report_cached.clear()
+    for cache_func_name in [
+        '_load_user_search_index_cached',
+        '_get_user_search_job_state_cached',
+        '_load_user_search_record_cached',
+    ]:
+        cache_func = globals().get(cache_func_name)
+        if cache_func is not None and hasattr(cache_func, 'clear'):
+            cache_func.clear()
 
 
 def db_execute(query: str, params: Optional[Tuple[Any, ...]] = None):
@@ -2136,6 +2195,7 @@ def reset_user_workspace_view(username: Optional[str] = None):
     reset_flag_key = get_history_reset_flag_key(username)
     st.session_state[reset_flag_key] = True
     st.session_state.selected_history_report_id = None
+    st.session_state.selected_history_search_id = None
 
 
 def start_fresh_workspace(username: Optional[str] = None):
@@ -2146,6 +2206,7 @@ def start_fresh_workspace(username: Optional[str] = None):
     st.session_state.has_provided_feedback = False
     st.session_state.ui_logs = []
     st.session_state.feedback_start_time = None
+    st.session_state.active_search_job_id = ""
     st.session_state.search_topic = ""
     st.session_state.search_requirements = ""
     st.session_state.search_preprint_rule = "排除预印本 (仅限正规期刊/会议)"
@@ -2409,30 +2470,220 @@ def submit_analysis_job_to_modal(job_id: str, source_name: str, cache_key: str, 
         raise RuntimeError(payload.get("message") or "后台任务未被接受。")
 
 
-@st.cache_data(show_spinner=False, ttl=5)
+def build_search_meta_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "search_job_id": str(row.get("search_job_id") or row.get("id") or ""),
+        "topic": row.get("topic") or "论文检索",
+        "requirements": row.get("requirements") or "",
+        "preprint_rule": row.get("preprint_rule") or "",
+        "feedback": row.get("feedback") or "",
+        "status": row.get("status") or "queued",
+        "progress_text": row.get("progress_text") or "",
+        "is_final": bool(row.get("is_final")),
+        "finalized_at": format_db_timestamp(row.get("finalized_at")),
+        "superseded_by": str(row.get("superseded_by") or ""),
+        "created_at": format_db_timestamp(row.get("created_at")),
+        "updated_at": format_db_timestamp(row.get("updated_at")),
+        "has_result": bool(row.get("result_markdown")),
+    }
 
-def submit_paper_search_to_modal(
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _load_user_search_index_cached(username: str) -> List[Dict[str, Any]]:
+    rows = db_fetch_all(
+        """
+        SELECT
+            s.id AS search_job_id,
+            s.topic,
+            s.requirements,
+            s.preprint_rule,
+            s.feedback,
+            s.status,
+            s.progress_text,
+            s.result_markdown,
+            s.is_final,
+            s.finalized_at,
+            s.superseded_by,
+            s.created_at,
+            s.updated_at
+        FROM public.paper_search_jobs s
+        JOIN public.users u ON u.id = s.user_id
+        WHERE LOWER(u.username) = LOWER(%s)
+          AND s.superseded_by IS NULL
+          AND (s.is_final = TRUE OR s.status IN ('queued', 'processing', 'finished', 'failed'))
+        ORDER BY COALESCE(s.finalized_at, s.updated_at, s.created_at) DESC
+        """,
+        (username,),
+    )
+    return [build_search_meta_from_row(row) for row in rows]
+
+
+def load_user_search_index(username: str) -> List[Dict[str, Any]]:
+    username = normalize_username(username)
+    if not username:
+        return []
+    ensure_app_storage()
+    return _load_user_search_index_cached(username)
+
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _get_user_search_job_state_cached(username: str, search_job_id: str) -> Optional[Dict[str, Any]]:
+    row = db_fetch_one(
+        """
+        SELECT
+            s.id AS search_job_id,
+            s.topic,
+            s.requirements,
+            s.preprint_rule,
+            s.feedback,
+            s.status,
+            s.progress_text,
+            s.result_markdown,
+            s.is_final,
+            s.finalized_at,
+            s.superseded_by,
+            s.created_at,
+            s.updated_at
+        FROM public.paper_search_jobs s
+        JOIN public.users u ON u.id = s.user_id
+        WHERE LOWER(u.username) = LOWER(%s) AND s.id = %s
+        LIMIT 1
+        """,
+        (username, search_job_id),
+    )
+    if not row:
+        return None
+    return build_search_meta_from_row(row)
+
+
+def get_user_search_job_state(username: str, search_job_id: str) -> Optional[Dict[str, Any]]:
+    username = normalize_username(username)
+    search_job_id = (search_job_id or "").strip()
+    if not username or not search_job_id:
+        return None
+    ensure_app_storage()
+    return _get_user_search_job_state_cached(username, search_job_id)
+
+
+@st.cache_data(show_spinner=False, ttl=DB_READ_CACHE_TTL_SECONDS)
+def _load_user_search_record_cached(username: str, search_job_id: str) -> Optional[Dict[str, Any]]:
+    row = db_fetch_one(
+        """
+        SELECT
+            s.id AS search_job_id,
+            s.topic,
+            s.requirements,
+            s.preprint_rule,
+            s.feedback,
+            s.previous_result,
+            s.status,
+            s.progress_text,
+            s.result_markdown,
+            s.agent_logs,
+            s.raw_payload,
+            s.is_final,
+            s.finalized_at,
+            s.superseded_by,
+            s.created_at,
+            s.updated_at
+        FROM public.paper_search_jobs s
+        JOIN public.users u ON u.id = s.user_id
+        WHERE LOWER(u.username) = LOWER(%s) AND s.id = %s
+        LIMIT 1
+        """,
+        (username, search_job_id),
+    )
+    if not row:
+        return None
+    meta = build_search_meta_from_row(row)
+    return {
+        "meta": meta,
+        "result_markdown": row.get("result_markdown") or "",
+        "agent_logs": normalize_json_field(row.get("agent_logs"), []),
+        "raw_payload": normalize_json_field(row.get("raw_payload"), {}),
+    }
+
+
+def load_user_search_record(username: str, search_job_id: str) -> Optional[Dict[str, Any]]:
+    username = normalize_username(username)
+    search_job_id = (search_job_id or "").strip()
+    if not username or not search_job_id:
+        return None
+    ensure_app_storage()
+    return _load_user_search_record_cached(username, search_job_id)
+
+
+def create_paper_search_job(
+    username: str,
     user_topic: str,
     user_requirements: str,
     preprint_rule: str,
     feedback: str = "",
     previous_result: str = "",
 ) -> Dict[str, Any]:
-    """把论文检索任务提交给后端统一 Director，由后端完成 Paper Search Agent 和工具调用。"""
+    ensure_app_storage()
+    username = normalize_username(username)
+    user_record = get_user_record(username)
+    if not user_record:
+        raise RuntimeError("当前账号不存在，无法创建论文检索任务。")
+
+    job_id = str(uuid.uuid4())
+    db_execute(
+        """
+        INSERT INTO public.paper_search_jobs (
+            id, user_id, topic, requirements, preprint_rule,
+            feedback, previous_result, status, progress_text,
+            created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', '论文搜索任务已提交，等待后台启动', NOW(), NOW())
+        """,
+        (
+            job_id,
+            user_record["id"],
+            user_topic or "",
+            user_requirements or "",
+            preprint_rule or "排除预印本 (仅限正规期刊/会议)",
+            feedback or "",
+            previous_result or "",
+        ),
+    )
+    created_job = get_user_search_job_state(username, job_id)
+    if not created_job:
+        raise RuntimeError("论文搜索任务创建成功，但未能回读任务记录。")
+    return created_job
+
+
+def update_paper_search_job_status(search_job_id: str, status: str, progress_text: str):
+    search_job_id = (search_job_id or "").strip()
+    if not search_job_id:
+        return
+    safe_status = (status or "").strip().lower()
+    if safe_status not in {"queued", "processing", "finished", "failed"}:
+        safe_status = "processing"
+    db_execute(
+        """
+        UPDATE public.paper_search_jobs
+        SET status = %s,
+            progress_text = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (safe_status, (progress_text or "").strip()[:1000], search_job_id),
+    )
+
+
+def submit_paper_search_to_modal(search_job_id: str):
+    """把已创建的论文检索任务提交给后端统一 Director，由后端离线执行 Paper Search Agent。"""
     submit_url = (ASYNC_MODAL_API_URL or "").strip()
     if not submit_url:
         raise RuntimeError("未在 Streamlit secrets 中配置 ASYNC_MODAL_API_URL。")
 
     data = {
-        "task_type": "auto",
-        "user_topic": user_topic or "",
-        "user_requirements": user_requirements or "",
-        "preprint_rule": preprint_rule or "排除预印本 (仅限正规期刊/会议)",
-        "feedback": feedback or "",
-        "previous_result": previous_result or "",
+        "task_type": "paper_search",
+        "job_id": search_job_id or "",
     }
 
-    response = requests.post(submit_url, data=data, timeout=300)
+    response = requests.post(submit_url, data=data, timeout=120)
     if response.status_code != 200:
         raise RuntimeError(f"后端论文检索提交失败：HTTP {response.status_code}")
 
@@ -2441,10 +2692,57 @@ def submit_paper_search_to_modal(
     except Exception as e:
         raise RuntimeError(f"后端论文检索返回了无法解析的响应：{str(e)}")
 
-    if payload.get("status") not in {"finished", "accepted", "queued", "processing"}:
-        raise RuntimeError(payload.get("message") or payload.get("error") or "后端论文检索任务失败。")
+    if payload.get("status") not in {"accepted", "queued", "processing"}:
+        raise RuntimeError(payload.get("message") or payload.get("error") or "后端论文检索任务未被接受。")
 
     return payload
+
+
+def finalize_paper_search_via_modal(search_job_id: str):
+    """用户最终满意后，通知后端把当前 job 的六篇论文写入最终去重库。"""
+    submit_url = (ASYNC_MODAL_API_URL or "").strip()
+    if not submit_url:
+        raise RuntimeError("未在 Streamlit secrets 中配置 ASYNC_MODAL_API_URL。")
+    data = {"task_type": "paper_search_finalize", "job_id": search_job_id or ""}
+    response = requests.post(submit_url, data=data, timeout=120)
+    if response.status_code != 200:
+        raise RuntimeError(f"后端最终确认失败：HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except Exception as e:
+        raise RuntimeError(f"后端最终确认返回了无法解析的响应：{str(e)}")
+    if payload.get("status") != "finished":
+        raise RuntimeError(payload.get("message") or payload.get("error") or "后端未能最终确认论文搜索结果。")
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    return payload
+
+
+def mark_paper_search_job_superseded(search_job_id: str, superseded_by: str):
+    """用户不满意并创建新一轮反馈检索后，把上一轮标记为已被替代，避免作为最终历史记录展示。"""
+    search_job_id = (search_job_id or "").strip()
+    superseded_by = (superseded_by or "").strip()
+    if not search_job_id or not superseded_by or search_job_id == superseded_by:
+        return
+    db_execute(
+        """
+        UPDATE public.paper_search_jobs
+        SET superseded_by = %s,
+            is_final = FALSE,
+            progress_text = '该轮结果已被后续反馈检索替代，未写入最终论文去重库',
+            updated_at = NOW()
+        WHERE id = %s AND is_final = FALSE
+        """,
+        (superseded_by, search_job_id),
+    )
+    db_execute("DELETE FROM public.paper_search_selected_papers WHERE search_job_id = %s", (search_job_id,))
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
 
 
 def build_search_ui_logs(search_logs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -2464,6 +2762,94 @@ def build_search_ui_logs(search_logs: List[Dict[str, Any]]) -> List[Dict[str, st
             "content": "\n\n".join(content_parts) or "无详细日志。",
         })
     return ui_logs
+
+def format_search_history_label(meta: Dict[str, Any]) -> str:
+    if not meta:
+        return "不打开历史检索"
+    topic = shorten_sidebar_label(meta.get("topic") or "论文检索", max_len=18)
+    status = (meta.get("status") or "").lower()
+    if status in {"queued", "processing"}:
+        return f"{topic}｜检索中"
+    if status == "failed":
+        return f"{topic}｜检索失败"
+    if status == "finished" and not meta.get("is_final"):
+        return f"{topic}｜待最终确认"
+    timestamp = (meta.get("finalized_at") or meta.get("updated_at") or meta.get("created_at") or "")[:16]
+    return f"{topic}｜{timestamp}" if timestamp else topic
+
+
+def render_pending_search_notice(search_meta: Dict[str, Any]):
+    topic = search_meta.get("topic") or "论文检索"
+    status = (search_meta.get("status") or "").lower()
+    progress_text = search_meta.get("progress_text") or "后台论文搜索任务正在运行中。"
+    if status == "failed":
+        st.error(progress_text or f"《{topic}》检索失败。")
+        return
+    st.info(f"《{topic}》当前状态：{progress_text}")
+    st.caption("该论文搜索任务已提交到后台 Modal。您可以直接关闭页面，稍后重新登录查看状态或结果。")
+
+
+def render_saved_search_record(username: str, search_job_id: str):
+    record = load_user_search_record(username, search_job_id)
+    if not record:
+        st.error("未找到该历史检索记录，可能已被删除。")
+        return
+    meta = record.get("meta", {}) or {}
+    status = (meta.get("status") or "").lower()
+    if status in {"queued", "processing"}:
+        render_pending_search_notice(meta)
+        st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"search_history_refresh_{search_job_id}")
+        return
+    if status == "failed":
+        st.error(meta.get("progress_text") or "该论文检索任务失败。")
+        return
+    if status == "finished" and not meta.get("is_final"):
+        st.session_state.final_result = record.get("result_markdown", "") or "该检索任务暂无结果。"
+        st.session_state.ui_logs = build_search_ui_logs(record.get("agent_logs", []) or [])
+        st.session_state.current_search_job_id = search_job_id
+        st.session_state.search_topic = meta.get("topic") or ""
+        st.session_state.search_requirements = meta.get("requirements") or ""
+        st.session_state.search_preprint_rule = meta.get("preprint_rule") or "排除预印本 (仅限正规期刊/会议)"
+        st.session_state.feedback_start_time = time.time()
+        st.session_state.app_state = "WAITING_FEEDBACK"
+        st.rerun()
+
+    st.markdown(f"### 历史检索：{meta.get('topic') or '论文检索'}")
+    if meta.get("requirements"):
+        with st.expander("查看本次筛选要求", expanded=False):
+            st.markdown(meta.get("requirements") or "")
+    logs = build_search_ui_logs(record.get("agent_logs", []) or [])
+    if logs:
+        st.markdown("#### Agent 检索执行轨迹")
+        for log in logs:
+            with st.expander(log["title"], expanded=False):
+                st.markdown(log["content"])
+    st.markdown("#### Top 6 核心论文推荐")
+    with st.container(border=True):
+        st.markdown(record.get("result_markdown") or "该历史检索暂无结果。")
+
+
+def poll_active_paper_search_job(username: str, search_job_id: str) -> Optional[Dict[str, Any]]:
+    """轮询当前后台论文搜索任务。"""
+    meta = get_user_search_job_state(username, search_job_id)
+    if not meta:
+        return None
+    status = (meta.get("status") or "").lower()
+    if status == "finished":
+        record = load_user_search_record(username, search_job_id)
+        if record:
+            st.session_state.final_result = record.get("result_markdown", "") or "后端未返回有效检索结果。"
+            st.session_state.ui_logs = build_search_ui_logs(record.get("agent_logs", []) or [])
+            st.session_state.app_state = "WAITING_FEEDBACK"
+            st.session_state.feedback_start_time = time.time()
+            st.session_state.current_search_job_id = search_job_id
+            st.session_state.active_search_job_id = ""
+            return record
+    elif status == "failed":
+        st.session_state.app_state = "IDLE"
+        st.session_state.active_search_job_id = ""
+    return {"meta": meta}
+
 
 def _load_agent_logs_cached(username: str, report_id: str) -> List[Dict[str, Any]]:
     """从数据库读取指定任务的多 Agent 动作轨迹。"""
@@ -2741,6 +3127,31 @@ def render_history_sidebar(username: str):
         st.caption("重新登录后也可在这里直接打开历史报告。")
     else:
         st.caption("当前账号还没有历史报告。")
+
+    st.divider()
+    search_history = load_user_search_index(username)
+    search_options = ["__none__"] + [item.get("search_job_id", "") for item in search_history if item.get("search_job_id")]
+    search_meta_map = {item.get("search_job_id", ""): item for item in search_history if item.get("search_job_id")}
+    search_selector_key = f"search_history_selector_{canonical_username(username)}"
+    if selected_id != "__workspace__":
+        st.session_state[search_selector_key] = "__none__"
+    if search_selector_key not in st.session_state or st.session_state[search_selector_key] not in search_options:
+        st.session_state[search_selector_key] = "__none__"
+    st.header("历史检索记录")
+    selected_search_id = st.radio(
+        "历史检索记录",
+        options=search_options,
+        format_func=lambda option_id: "不打开历史检索" if option_id == "__none__" else format_search_history_label(search_meta_map.get(option_id, {})),
+        key=search_selector_key,
+        label_visibility="collapsed",
+    )
+    st.session_state.selected_history_search_id = None if selected_search_id == "__none__" else selected_search_id
+    if selected_search_id != "__none__":
+        st.session_state.selected_history_report_id = None
+    if search_history:
+        st.caption("重新登录后也可在这里查看历史检索结果。")
+    else:
+        st.caption("当前账号还没有历史检索。")
 
 # ==========================================
 # 模块 14：论文精读主流程
@@ -3105,6 +3516,10 @@ if "current_user" not in st.session_state:
     st.session_state.current_user = ""
 if "selected_history_report_id" not in st.session_state:
     st.session_state.selected_history_report_id = None
+if "selected_history_search_id" not in st.session_state:
+    st.session_state.selected_history_search_id = None
+if "active_search_job_id" not in st.session_state:
+    st.session_state.active_search_job_id = ""
 if "app_state" not in st.session_state:
     st.session_state.app_state = "IDLE"
 if "final_result" not in st.session_state:
@@ -3211,21 +3626,23 @@ if start_button:
         st.session_state.has_provided_feedback = False
         st.session_state.feedback_start_time = None
         search_submitted = False
-        with st.spinner("后端 Director 正在路由到论文搜索线路，并调用 Paper Search Agent 检索文献……"):
+        with st.spinner("正在创建离线论文搜索任务，并提交给后端 Director……"):
             try:
-                payload = submit_paper_search_to_modal(
+                search_job = create_paper_search_job(
+                    username=st.session_state.current_user,
                     user_topic=user_topic,
                     user_requirements=user_requirements,
                     preprint_rule=allow_preprint,
                 )
-                st.session_state.final_result = payload.get("final_result", "") or "后端未返回有效检索结果。"
-                st.session_state.ui_logs = build_search_ui_logs(payload.get("logs", []))
-                st.session_state.app_state = "WAITING_FEEDBACK"
-                st.session_state.feedback_start_time = time.time()
+                submit_paper_search_to_modal(search_job.get("search_job_id", ""))
+                update_paper_search_job_status(search_job.get("search_job_id", ""), "processing", "后台任务已提交，等待 Paper Search Agent 完成")
+                st.session_state.active_search_job_id = search_job.get("search_job_id", "")
+                st.session_state.current_search_job_id = search_job.get("search_job_id", "")
+                st.session_state.app_state = "SEARCH_RUNNING"
                 search_submitted = True
             except Exception as e:
                 st.session_state.app_state = "IDLE"
-                st.error(f"后端论文检索失败：{str(e)}")
+                st.error(f"后端论文检索提交失败：{str(e)}")
         if search_submitted:
             st.rerun()
 
@@ -3233,6 +3650,24 @@ if st.session_state.sidebar_direct_entries:
     st.markdown("---")
     st.info("正在启动【直接解析模式】，开始解构文献……")
     render_analysis_ui(st.session_state.sidebar_direct_entries)
+    st.stop()
+
+if st.session_state.app_state == "SEARCH_RUNNING" and st.session_state.active_search_job_id:
+    st.markdown("---")
+    current_search_state = poll_active_paper_search_job(st.session_state.current_user, st.session_state.active_search_job_id)
+    if current_search_state and st.session_state.app_state == "SEARCH_RUNNING":
+        render_pending_search_notice(current_search_state.get("meta", {}) or {})
+        st_autorefresh(interval=JOB_STATUS_REFRESH_INTERVAL_MS, key=f"active_search_refresh_{st.session_state.active_search_job_id}")
+        st.stop()
+    st.rerun()
+
+if (
+    st.session_state.selected_history_search_id
+    and st.session_state.app_state == "IDLE"
+    and not st.session_state.bottom_direct_entries
+):
+    st.markdown("---")
+    render_saved_search_record(st.session_state.current_user, st.session_state.selected_history_search_id)
     st.stop()
 
 if (
@@ -3280,6 +3715,10 @@ if st.session_state.app_state == "WAITING_FEEDBACK":
         remaining_time = 1800 - elapsed_time
 
         if remaining_time <= 0:
+            try:
+                finalize_paper_search_via_modal(st.session_state.current_search_job_id)
+            except Exception as e:
+                st.warning(f"自动确认入库失败：{str(e)}")
             st.session_state.app_state = "COMPLETED"
             st.rerun()
         st_autorefresh(interval=180000, key="feedback_timer")
@@ -3298,28 +3737,37 @@ if st.session_state.app_state == "WAITING_FEEDBACK":
     col1, col2 = st.columns(2)
     with col1:
         if st.button("满意，结束检索", use_container_width=True):
-            st.session_state.app_state = "COMPLETED"
-            st.rerun()
+            try:
+                finalize_paper_search_via_modal(st.session_state.current_search_job_id)
+                st.session_state.app_state = "COMPLETED"
+                st.rerun()
+            except Exception as e:
+                st.error(f"最终确认入库失败：{str(e)}")
 
     with col2:
         with st.popover("不满意，修改要求", use_container_width=True):
             new_req = st.text_area("请指出不符合要求的地方：")
             if st.button("提交新要求并继续"):
                 if new_req.strip():
-                    with st.spinner("后端 Paper Search Agent 正在根据反馈重新筛选 Top 6……"):
+                    with st.spinner("正在创建反馈后的离线论文搜索任务……"):
                         try:
-                            payload = submit_paper_search_to_modal(
+                            previous_search_job_id = st.session_state.current_search_job_id
+                            search_job = create_paper_search_job(
+                                username=st.session_state.current_user,
                                 user_topic=st.session_state.search_topic,
                                 user_requirements=st.session_state.search_requirements,
                                 preprint_rule=st.session_state.search_preprint_rule,
                                 feedback=new_req.strip(),
                                 previous_result=st.session_state.final_result,
                             )
-                            st.session_state.final_result = payload.get("final_result", "") or "后端未返回有效检索结果。"
-                            st.session_state.ui_logs = build_search_ui_logs(payload.get("logs", []))
+                            mark_paper_search_job_superseded(previous_search_job_id, search_job.get("search_job_id", ""))
+                            submit_paper_search_to_modal(search_job.get("search_job_id", ""))
+                            update_paper_search_job_status(search_job.get("search_job_id", ""), "processing", "后台反馈检索任务已提交，等待 Paper Search Agent 完成")
+                            st.session_state.active_search_job_id = search_job.get("search_job_id", "")
+                            st.session_state.current_search_job_id = search_job.get("search_job_id", "")
                             st.session_state.has_provided_feedback = True
-                            st.session_state.app_state = "WAITING_FEEDBACK"
-                            st.session_state.feedback_start_time = time.time()
+                            st.session_state.app_state = "SEARCH_RUNNING"
+                            st.session_state.feedback_start_time = None
                         except Exception as e:
                             st.error(f"后端论文检索反馈处理失败：{str(e)}")
                     st.rerun()
