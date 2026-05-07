@@ -685,7 +685,6 @@ def sanitize_formula_for_render(text: str) -> str:
     expr = expr.replace(r'\displaystyle', '')
     expr = expr.replace('−', '-').replace('–', '-').replace('—', '-')
     expr = re.sub(r'\\label\{.*?\}', '', expr)
-    expr = re.sub(r'\\tag\{.*?\}', '', expr)
     expr = re.sub(r'\\nonumber\b', '', expr)
     expr = re.sub(r'(?<=\d)\s+(?=\d)', '', expr)
     expr = re.sub(
@@ -1031,7 +1030,7 @@ def split_markdown_blocks(md_text: str) -> List[Tuple[str, object]]:
                 if fence_lang in {"math", "latex", "tex"} or looks_like_formula_text(block_text):
                     blocks.append(("math_block", block_text))
                 else:
-                    blocks.append(("paragraph", " ".join([x.strip() for x in fenced_lines if x.strip()])))
+                    blocks.append(("code_block", (fence_lang or "text", "\n".join(fenced_lines).strip())))
             continue
 
         if re.match(r'^\\begin\{[^{}]+\}$', stripped):
@@ -1222,6 +1221,9 @@ def serialize_report_blocks(blocks: List[Tuple[str, object]], doc_title: str) ->
             lines.extend(['', convert_inline_formula_markup_to_markdown(str(payload))])
         elif block_type == 'math_block':
             lines.extend(['', formula_inline_markdown(str(payload), display=True)])
+        elif block_type == 'code_block':
+            lang, code = payload
+            lines.extend(['', f"```{lang}", str(code), "```"])
         elif block_type == 'image':
             caption, key = payload
             rendered_caption = convert_inline_formula_markup_to_markdown(str(caption)) if caption else ''
